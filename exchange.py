@@ -1,7 +1,9 @@
 from binance.client import Client
 from binance.enums import *
 
+from collections import deque
 import pandas as pd
+import threading
 import time
 import numpy as np
 
@@ -13,6 +15,9 @@ from logger import log_info, log_warning, log_error
 client = Client(config.API_KEY, config.SECRET_KEY)
 _exchange_info_cache = None
 _last_kline_request_at = 0.0
+_public_request_weights = deque()
+_public_request_lock = threading.Lock()
+_kline_cache = {}
 _futures_context_cache = {}
 
 # =========================
@@ -36,12 +41,91 @@ def _throttle_kline_request():
         time.sleep(delay - elapsed)
 
     _last_kline_request_at = time.time()
+    _rate_limit_public_request(getattr(config, "KLINE_REQUEST_WEIGHT", 2))
+
+
+def _rate_limit_public_request(weight=1):
+    max_weight = float(
+        getattr(config, "BINANCE_PUBLIC_WEIGHT_LIMIT_PER_MINUTE", 1800)
+    )
+
+    if max_weight <= 0:
+        return
+
+    window_seconds = max(
+        float(getattr(config, "BINANCE_PUBLIC_RATE_WINDOW_SECONDS", 60)),
+        1.0
+    )
+    weight = max(float(weight or 1), 0.1)
+
+    while True:
+        now = time.time()
+
+        with _public_request_lock:
+            while (
+                _public_request_weights and
+                now - _public_request_weights[0][0] >= window_seconds
+            ):
+                _public_request_weights.popleft()
+
+            used_weight = sum(item[1] for item in _public_request_weights)
+
+            if used_weight + weight <= max_weight:
+                _public_request_weights.append((now, weight))
+                return
+
+            oldest_at = _public_request_weights[0][0]
+            wait_seconds = window_seconds - (now - oldest_at) + 0.05
+
+        time.sleep(min(max(wait_seconds, 0.05), 5.0))
+
+
+def _futures_context_throttle():
+    _rate_limit_public_request(
+        getattr(config, "FUTURES_CONTEXT_REQUEST_WEIGHT", 1)
+    )
+
+
+def _get_cached_kline_df(key):
+    cache_seconds = float(getattr(config, "KLINE_CACHE_SECONDS", 0))
+
+    if cache_seconds <= 0:
+        return None
+
+    cached = _kline_cache.get(key)
+
+    if not cached:
+        return None
+
+    if time.time() - cached["time"] > cache_seconds:
+        _kline_cache.pop(key, None)
+        return None
+
+    return cached["data"].copy(deep=True)
+
+
+def _store_cached_kline_df(key, df):
+    cache_seconds = float(getattr(config, "KLINE_CACHE_SECONDS", 0))
+
+    if cache_seconds <= 0 or df is None:
+        return
+
+    max_items = max(int(getattr(config, "KLINE_CACHE_MAX_ITEMS", 1200)), 1)
+    _kline_cache[key] = {
+        "time": time.time(),
+        "data": df.copy(deep=True)
+    }
+
+    while len(_kline_cache) > max_items:
+        oldest_key = min(_kline_cache, key=lambda item: _kline_cache[item]["time"])
+        _kline_cache.pop(oldest_key, None)
 
 
 def get_exchange_info():
     global _exchange_info_cache
 
     if _exchange_info_cache is None:
+        _rate_limit_public_request(1)
         _exchange_info_cache = client.futures_exchange_info()
 
     return _exchange_info_cache
@@ -143,12 +227,14 @@ def get_futures_participation(symbol):
     }
 
     try:
+        _futures_context_throttle()
         oi_hist = client.futures_open_interest_hist(**params)
         data["oi_change_pct"] = _change_pct(oi_hist, "sumOpenInterest")
     except Exception as e:
         data["errors"].append(f"OI:{e}")
 
     try:
+        _futures_context_throttle()
         taker = _latest_item(_get_taker_longshort_ratio(params))
         data["taker_buy_sell_ratio"] = _to_float(
             taker.get("buySellRatio") if taker else None
@@ -157,6 +243,7 @@ def get_futures_participation(symbol):
         data["errors"].append(f"TAKER:{e}")
 
     try:
+        _futures_context_throttle()
         global_ratio = _latest_item(client.futures_global_longshort_ratio(**params))
         data["global_long_short_ratio"] = _to_float(
             global_ratio.get("longShortRatio") if global_ratio else None
@@ -165,6 +252,7 @@ def get_futures_participation(symbol):
         data["errors"].append(f"GLOBAL_LS:{e}")
 
     try:
+        _futures_context_throttle()
         top_ratio = _latest_item(client.futures_top_longshort_position_ratio(**params))
         data["top_long_short_ratio"] = _to_float(
             top_ratio.get("longShortRatio") if top_ratio else None
@@ -173,6 +261,7 @@ def get_futures_participation(symbol):
         data["errors"].append(f"TOP_LS:{e}")
 
     try:
+        _futures_context_throttle()
         premium = client.futures_mark_price(symbol=symbol)
         data["funding_rate"] = _to_float(premium.get("lastFundingRate"))
     except Exception as e:
@@ -304,6 +393,12 @@ def get_klines(symbol, interval, limit=None):
 
     try:
         limit = limit if limit is not None else config.KLINE_LIMIT
+        cache_key = (symbol, interval, int(limit))
+        cached = _get_cached_kline_df(cache_key)
+
+        if cached is not None:
+            return cached
+
         _throttle_kline_request()
 
         klines = client.futures_klines(
@@ -320,7 +415,8 @@ def get_klines(symbol, interval, limit=None):
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = df[col].astype(float)
 
-        return df
+        _store_cached_kline_df(cache_key, df)
+        return df.copy(deep=True)
 
     except Exception as e:
         log_error(f"{symbol} klines error: {e}")
