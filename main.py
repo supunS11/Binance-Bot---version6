@@ -228,6 +228,23 @@ def get_signal_frames(symbol, btc_trend_df):
     return trend_df, confirm_df, entry_df
 
 
+def get_adverse_reversal_frame(symbol, trend_df):
+    safety_timeframe = str(
+        getattr(config, "ADVERSE_REVERSAL_TIMEFRAME", "1d")
+    ).strip()
+    trend_timeframe = str(config.TREND_TIMEFRAME).strip()
+
+    if not safety_timeframe or safety_timeframe == trend_timeframe:
+        return trend_df
+
+    safety_df = get_klines(symbol, safety_timeframe)
+
+    if safety_df is None or len(safety_df) < 220:
+        return None
+
+    return apply_indicators(safety_df)
+
+
 def check_live_entry_guard(symbol, side, current_price, mark_price=None):
     if not config.LIVE_ENTRY_CONFIRMATION_ENABLED:
         return True, current_price, {"reason": "LIVE_ENTRY_GUARD_DISABLED"}
@@ -2234,10 +2251,20 @@ def execute_entry_candidate(
 
         log_profit_room_ok(symbol, signal, room_info)
 
+        adverse_reversal_df = get_adverse_reversal_frame(symbol, trend_df)
+
+        if adverse_reversal_df is None:
+            reason = (
+                f"ADVERSE REVERSAL {config.ADVERSE_REVERSAL_TIMEFRAME} "
+                "FRAME UNAVAILABLE"
+            )
+            log_warning(f"{symbol} SKIP | {reason}")
+            return position_details, open_positions, False
+
         level_ok, level_info = validate_adverse_zone_level(
             signal,
             current_price,
-            trend_df,
+            adverse_reversal_df,
             confirm_df,
             leverage=config.LEVERAGE
         )
@@ -2248,11 +2275,14 @@ def execute_entry_candidate(
 
         reference_price = level_info["level"]
         adverse_roi = level_info["adverse_roi"]
+        max_adverse_roi = level_info.get("max_adverse_roi")
+        safety_timeframe = level_info.get("safety_timeframe", config.TREND_TIMEFRAME)
         level_label = "SUPPORT" if signal == "BUY" else "RESISTANCE"
 
         log_info(
             f"{symbol} {level_label} SAFETY LEVEL | "
             f"PRICE={reference_price} | ROI={adverse_roi}% | "
+            f"MAX_ROI={max_adverse_roi}% | TF={safety_timeframe} | "
             f"SCORE={level_info['score']} | SRC={level_info['source']}"
         )
 
@@ -2463,6 +2493,8 @@ def execute_entry_candidate(
             f"ENTRY: {entry_price}\n"
             f"{level_label}: {reference_price}\n"
             f"ADVERSE ROI TO LEVEL: {adverse_roi}%\n"
+            f"SAFETY ROI LIMIT: {max_adverse_roi}%\n"
+            f"SAFETY TIMEFRAME: {safety_timeframe}\n"
             f"SL: {'ENABLED' if config.SL_ENABLED else 'DISABLED'}\n"
             f"BALANCE: {balance}\n"
         )

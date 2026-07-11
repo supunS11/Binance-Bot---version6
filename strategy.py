@@ -109,8 +109,126 @@ def _level_tolerance(df):
         get_config_float("LONG_TERM_SR_TOLERANCE_PCT", 1.0) / 100
     )
     atr_tolerance = atr * get_config_float("LONG_TERM_SR_ATR_TOLERANCE", 0.75)
+    max_tolerance = price * (
+        get_config_float("LONG_TERM_SR_MAX_TOLERANCE_PCT", 1.25) / 100
+    )
+    raw_tolerance = max(pct_tolerance, atr_tolerance, price * 0.002)
 
-    return max(pct_tolerance, atr_tolerance, price * 0.002)
+    return min(raw_tolerance, max_tolerance) if max_tolerance > 0 else raw_tolerance
+
+
+def _touch_positions(data, column, level, tolerance):
+    return [
+        index
+        for index, value in enumerate(data[column])
+        if abs(float(value) - level) <= tolerance
+    ]
+
+
+def _distinct_touch_count(positions, min_gap):
+    touches = 0
+    last_pos = None
+
+    for pos in positions:
+        if last_pos is None or pos - last_pos >= min_gap:
+            touches += 1
+            last_pos = pos
+
+    return touches
+
+
+def _level_reaction_score(data, side, level, tolerance):
+    column = "low" if side == "BUY" else "high"
+    reactions = []
+
+    for _, candle in data.iterrows():
+        if abs(float(candle[column]) - level) > tolerance:
+            continue
+
+        high = _safe_float(candle.get("high"))
+        low = _safe_float(candle.get("low"))
+        close = _safe_float(candle.get("close"))
+        open_price = _safe_float(candle.get("open"))
+        candle_range = high - low
+
+        if candle_range <= 0:
+            continue
+
+        if side == "BUY":
+            directional_close = (close - low) / candle_range
+            wick_rejection = (min(open_price, close) - low) / candle_range
+        else:
+            directional_close = (high - close) / candle_range
+            wick_rejection = (high - max(open_price, close)) / candle_range
+
+        reactions.append(max(directional_close, wick_rejection, 0))
+
+    if not reactions:
+        return 0
+
+    reactions = sorted(reactions, reverse=True)[:5]
+    return min(sum(reactions) / len(reactions), 1)
+
+
+def _volume_touch_score(data, column, level, tolerance):
+    if "volume_sma" not in data.columns or "volume" not in data.columns:
+        return 0
+
+    strong_touches = 0
+
+    for _, candle in data.iterrows():
+        if abs(float(candle[column]) - level) > tolerance:
+            continue
+
+        if _safe_float(candle.get("volume")) > _safe_float(candle.get("volume_sma")):
+            strong_touches += 1
+
+    return min(strong_touches / 3, 1)
+
+
+def _recent_break_penalty(data, side, level, tolerance):
+    recent = data.tail(5)
+
+    if side == "BUY":
+        broken = any(float(close) < level - tolerance for close in recent["close"])
+    else:
+        broken = any(float(close) > level + tolerance for close in recent["close"])
+
+    if not broken:
+        return 0
+
+    return get_config_float("LONG_TERM_SR_RECENT_BREAK_PENALTY", 1.5)
+
+
+def _level_strength_score(
+    data,
+    side,
+    column,
+    level,
+    positions,
+    timeframe_weight,
+):
+    min_gap = max(get_config_int("LONG_TERM_SR_TOUCH_MIN_GAP", 5), 1)
+    distinct_touches = _distinct_touch_count(positions, min_gap)
+    recency_score = (max(positions) / len(data)) if positions else 0
+    reaction_score = _level_reaction_score(data, side, level, _level_tolerance(data))
+    volume_score = _volume_touch_score(data, column, level, _level_tolerance(data))
+    penalty = _recent_break_penalty(data, side, level, _level_tolerance(data))
+    score = (
+        distinct_touches * timeframe_weight +
+        recency_score +
+        reaction_score * get_config_float("LONG_TERM_SR_REACTION_BONUS", 1.0) +
+        volume_score * get_config_float("LONG_TERM_SR_VOLUME_BONUS", 0.5) -
+        penalty
+    )
+
+    return {
+        "score": round(max(score, 0), 2),
+        "touches": distinct_touches,
+        "reaction_score": round(float(reaction_score), 2),
+        "volume_score": round(float(volume_score), 2),
+        "recent_break_penalty": round(float(penalty), 2),
+    }
 
 
 def _collect_pivot_levels(df, side, label, timeframe_weight):
@@ -122,14 +240,14 @@ def _collect_pivot_levels(df, side, label, timeframe_weight):
         return []
 
     tolerance = _level_tolerance(data)
-    swing = 3
+    swing = max(get_config_int("LONG_TERM_SR_SWING", 3), 2)
     column = "low" if side == "BUY" else "high"
     levels = []
 
     for pos in range(swing, len(data) - swing):
         candle = data.iloc[pos]
         window = data.iloc[pos - swing:pos + swing + 1]
-        level = candle[column]
+        level = float(candle[column])
 
         if side == "BUY" and level > window["low"].min():
             continue
@@ -137,24 +255,26 @@ def _collect_pivot_levels(df, side, label, timeframe_weight):
         if side == "SELL" and level < window["high"].max():
             continue
 
-        touches = int((abs(data[column] - level) <= tolerance).sum())
+        positions = _touch_positions(data, column, level, tolerance)
+        strength = _level_strength_score(
+            data,
+            side,
+            column,
+            level,
+            positions,
+            timeframe_weight,
+        )
 
-        if touches < min_touches:
+        if strength["touches"] < min_touches:
             continue
 
-        recency_score = pos / len(data)
-        volume_score = 0
-
-        if (
-            "volume_sma" in data.columns
-            and candle["volume"] > candle["volume_sma"]
-        ):
-            volume_score = 0.5
-
         levels.append({
-            "level": float(level),
-            "score": touches * timeframe_weight + recency_score + volume_score,
-            "touches": touches,
+            "level": level,
+            "score": strength["score"],
+            "touches": strength["touches"],
+            "reaction_score": strength["reaction_score"],
+            "volume_score": strength["volume_score"],
+            "recent_break_penalty": strength["recent_break_penalty"],
             "source": f"{label}_pivot",
         })
 
@@ -162,8 +282,12 @@ def _collect_pivot_levels(df, side, label, timeframe_weight):
 
 
 def _collect_ema_levels(df, side, label, timeframe_weight):
-    latest = latest_closed(df)
+    lookback = get_config_int("LONG_TERM_SR_LOOKBACK", 160)
+    data = df.tail(lookback).copy()
+    latest = latest_closed(data)
     levels = []
+    min_respects = max(get_config_int("LONG_TERM_SR_EMA_MIN_RESPECTS", 2), 0)
+    tolerance = _level_tolerance(data)
 
     for ema_name, bonus in (("ema50", 0.75), ("ema200", 1.25)):
         if ema_name not in latest.index:
@@ -178,10 +302,41 @@ def _collect_ema_levels(df, side, label, timeframe_weight):
         if side == "SELL" and level <= close:
             continue
 
+        if side == "BUY":
+            respects = data[
+                (data["low"] <= level + tolerance) &
+                (data["close"] >= level)
+            ]
+            column = "low"
+        else:
+            respects = data[
+                (data["high"] >= level - tolerance) &
+                (data["close"] <= level)
+            ]
+            column = "high"
+
+        if len(respects) < min_respects:
+            continue
+
+        reaction_score = _level_reaction_score(data, side, level, tolerance)
+        volume_score = _volume_touch_score(data, column, level, tolerance)
+        penalty = _recent_break_penalty(data, side, level, tolerance)
+        score = (
+            timeframe_weight +
+            bonus +
+            min(len(respects) * 0.25, 1.25) +
+            reaction_score * 0.50 +
+            volume_score * get_config_float("LONG_TERM_SR_VOLUME_BONUS", 0.5) -
+            penalty
+        )
+
         levels.append({
             "level": level,
-            "score": timeframe_weight + bonus,
-            "touches": 0,
+            "score": round(max(score, 0), 2),
+            "touches": int(len(respects)),
+            "reaction_score": round(float(reaction_score), 2),
+            "volume_score": round(float(volume_score), 2),
+            "recent_break_penalty": round(float(penalty), 2),
             "source": f"{label}_{ema_name}",
         })
 
@@ -205,13 +360,42 @@ def _collect_range_levels(df, side, label, timeframe_weight):
 
         recent = data.tail(window)
         level = recent[column].min() if side == "BUY" else recent[column].max()
-        touches = int((abs(data[column] - level) <= tolerance).sum())
-        score = timeframe_weight + min(window / 100, 1) + (touches * 0.25)
+        positions = _touch_positions(data, column, float(level), tolerance)
+        strength = _level_strength_score(
+            data,
+            side,
+            column,
+            float(level),
+            positions,
+            timeframe_weight,
+        )
+        min_touches = max(get_config_int("LONG_TERM_SR_RANGE_MIN_TOUCHES", 2), 1)
+
+        if strength["touches"] < min_touches:
+            continue
+
+        score = (
+            timeframe_weight +
+            min(window / 100, 1) +
+            strength["touches"] * 0.35 +
+            strength["reaction_score"] * get_config_float(
+                "LONG_TERM_SR_REACTION_BONUS",
+                1.0,
+            ) +
+            strength["volume_score"] * get_config_float(
+                "LONG_TERM_SR_VOLUME_BONUS",
+                0.5,
+            ) -
+            strength["recent_break_penalty"]
+        )
 
         levels.append({
             "level": float(level),
-            "score": round(score, 2),
-            "touches": touches,
+            "score": round(max(score, 0), 2),
+            "touches": strength["touches"],
+            "reaction_score": strength["reaction_score"],
+            "volume_score": strength["volume_score"],
+            "recent_break_penalty": strength["recent_break_penalty"],
             "source": f"{label}_{window}_range",
         })
 
@@ -220,12 +404,34 @@ def _collect_range_levels(df, side, label, timeframe_weight):
 
 def _dedupe_levels(levels, tolerance):
     deduped = []
+    confluence_bonus = get_config_float("LONG_TERM_SR_CONFLUENCE_BONUS", 0.75)
 
     for level in sorted(levels, key=lambda item: item["score"], reverse=True):
-        if any(abs(level["level"] - item["level"]) <= tolerance for item in deduped):
+        match = next(
+            (
+                item for item in deduped
+                if abs(level["level"] - item["level"]) <= tolerance
+            ),
+            None
+        )
+
+        if match:
+            match["score"] = round(
+                match["score"] +
+                min(level["score"] * 0.20, confluence_bonus),
+                2
+            )
+            match["touches"] = max(
+                int(match.get("touches", 0)),
+                int(level.get("touches", 0)),
+            )
+            match["source"] = f"{match['source']}+{level['source']}"
+            match["confluence_count"] = int(match.get("confluence_count", 1)) + 1
             continue
 
-        deduped.append(level)
+        item = level.copy()
+        item["confluence_count"] = 1
+        deduped.append(item)
 
     return deduped
 
@@ -1110,8 +1316,24 @@ def _smc_context_score(side, trend_df, confirm_df, entry_df):
 
 def find_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverage=None):
     leverage_to_use = leverage or config.LEVERAGE
-    max_adverse_roi = abs(get_config_float("LONG_TERM_MAX_ADVERSE_ROI", 50))
+    max_adverse_roi = abs(
+        get_config_float(
+            "ADVERSE_REVERSAL_MAX_ROI",
+            get_config_float("LONG_TERM_MAX_ADVERSE_ROI", 50)
+        )
+    )
+    max_adverse_roi = max(max_adverse_roi, 0.01)
     max_price_move = (max_adverse_roi / max(leverage_to_use, 1)) / 100
+    use_1d_only = bool(getattr(config, "ADVERSE_REVERSAL_USE_1D_ONLY", True))
+    include_range = bool(getattr(config, "ADVERSE_REVERSAL_INCLUDE_RANGE", True))
+    include_ema = bool(getattr(config, "ADVERSE_REVERSAL_INCLUDE_EMA", True))
+    trend_label = str(
+        getattr(
+            config,
+            "ADVERSE_REVERSAL_TIMEFRAME",
+            getattr(config, "TREND_TIMEFRAME", "1d")
+        )
+    )
 
     if side == "BUY":
         zone_min = entry_price * (1 - max_price_move)
@@ -1121,12 +1343,29 @@ def find_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverage=No
         zone_max = entry_price * (1 + max_price_move)
 
     candidates = []
-    candidates.extend(_collect_pivot_levels(trend_df, side, "1d", 2.0))
-    candidates.extend(_collect_pivot_levels(confirm_df, side, "4h", 1.25))
-    candidates.extend(_collect_ema_levels(trend_df, side, "1d", 2.0))
-    candidates.extend(_collect_ema_levels(confirm_df, side, "4h", 1.25))
+    candidates.extend(_collect_pivot_levels(trend_df, side, trend_label, 2.0))
 
-    tolerance = max(_level_tolerance(trend_df), _level_tolerance(confirm_df))
+    if include_range:
+        candidates.extend(_collect_range_levels(trend_df, side, trend_label, 2.0))
+
+    if include_ema:
+        candidates.extend(_collect_ema_levels(trend_df, side, trend_label, 2.0))
+
+    if not use_1d_only and confirm_df is not None:
+        confirm_label = str(getattr(config, "CONFIRMATION_TIMEFRAME", "4h"))
+        candidates.extend(_collect_pivot_levels(confirm_df, side, confirm_label, 1.25))
+
+        if include_range:
+            candidates.extend(_collect_range_levels(confirm_df, side, confirm_label, 1.25))
+
+        if include_ema:
+            candidates.extend(_collect_ema_levels(confirm_df, side, confirm_label, 1.25))
+
+    tolerance = _level_tolerance(trend_df)
+
+    if not use_1d_only and confirm_df is not None:
+        tolerance = max(tolerance, _level_tolerance(confirm_df))
+
     candidates = _dedupe_levels(candidates, tolerance)
     valid = []
 
@@ -1153,6 +1392,8 @@ def find_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverage=No
         item["score"] = round(candidate["score"] + proximity_score, 2)
         item["zone_min"] = zone_min
         item["zone_max"] = zone_max
+        item["max_adverse_roi"] = round(max_adverse_roi, 2)
+        item["safety_timeframe"] = trend_label if use_1d_only else "multi_tf"
         valid.append(item)
 
     if not valid:
@@ -1161,14 +1402,27 @@ def find_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverage=No
     valid.sort(key=lambda item: (item["score"], -abs(item["adverse_roi"])), reverse=True)
     best = valid[0]
 
-    if best["score"] < get_config_float("LONG_TERM_SR_MIN_SCORE", 2.5):
+    min_score = get_config_float(
+        "ADVERSE_REVERSAL_MIN_SCORE",
+        get_config_float("LONG_TERM_SR_MIN_SCORE", 2.5)
+    )
+
+    if best["score"] < min_score:
         return None
 
     return best
 
 
 def validate_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverage=None):
-    if not getattr(config, "LONG_TERM_ADVERSE_ZONE_CHECK_ENABLED", True):
+    enabled = bool(
+        getattr(
+            config,
+            "ADVERSE_REVERSAL_LEVEL_CHECK_ENABLED",
+            getattr(config, "LONG_TERM_ADVERSE_ZONE_CHECK_ENABLED", True)
+        )
+    )
+
+    if not enabled:
         label = "support" if side == "BUY" else "resistance"
         return True, {
             "reason": f"{label.upper()} ADVERSE-ZONE CHECK DISABLED",
@@ -1176,6 +1430,17 @@ def validate_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverag
             "adverse_roi": 0,
             "source": "disabled",
             "score": 0,
+            "max_adverse_roi": get_config_float(
+                "ADVERSE_REVERSAL_MAX_ROI",
+                get_config_float("LONG_TERM_MAX_ADVERSE_ROI", 50)
+            ),
+            "safety_timeframe": str(
+                getattr(
+                    config,
+                    "ADVERSE_REVERSAL_TIMEFRAME",
+                    getattr(config, "TREND_TIMEFRAME", "1d")
+                )
+            ),
             "level_check_disabled": True,
         }
 
@@ -1190,10 +1455,23 @@ def validate_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverag
     if level:
         return True, level
 
-    zone_roi = get_config_float("LONG_TERM_MAX_ADVERSE_ROI", 50)
+    zone_roi = get_config_float(
+        "ADVERSE_REVERSAL_MAX_ROI",
+        get_config_float("LONG_TERM_MAX_ADVERSE_ROI", 50)
+    )
     label = "support" if side == "BUY" else "resistance"
+    timeframe = str(
+        getattr(
+            config,
+            "ADVERSE_REVERSAL_TIMEFRAME",
+            getattr(config, "TREND_TIMEFRAME", "1d")
+        )
+    ).upper()
     return False, {
-        "reason": f"NO STRONG {label.upper()} WITHIN -{zone_roi:.0f}% ROI ZONE"
+        "reason": (
+            f"NO STRONG {timeframe} {label.upper()} "
+            f"WITHIN -{zone_roi:.0f}% ROI SAFETY ZONE"
+        )
     }
 
 
