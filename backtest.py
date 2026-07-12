@@ -1,0 +1,1170 @@
+import argparse
+import csv
+import json
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import requests
+
+import config
+from indicators import apply_indicators
+from strategy import (
+    analyze_signal,
+    validate_adverse_zone_level,
+    validate_dca_continuation_guard,
+    validate_entry_profit_room,
+    validate_structure_take_profit,
+)
+
+
+BINANCE_FAPI_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+KLINE_COLUMNS = [
+    "time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_time",
+    "qav",
+    "trades",
+    "tbbav",
+    "tbqav",
+    "ignore",
+]
+INTERVAL_MS = {
+    "1m": 60_000,
+    "3m": 3 * 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "30m": 30 * 60_000,
+    "1h": 60 * 60_000,
+    "2h": 2 * 60 * 60_000,
+    "4h": 4 * 60 * 60_000,
+    "6h": 6 * 60 * 60_000,
+    "8h": 8 * 60 * 60_000,
+    "12h": 12 * 60 * 60_000,
+    "1d": 24 * 60 * 60_000,
+}
+
+
+@dataclass
+class BacktestData:
+    raw: pd.DataFrame
+    indicators: pd.DataFrame
+
+
+def utc_now_ms():
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def parse_time_ms(value, default=None):
+    if not value:
+        return default if default is not None else utc_now_ms()
+
+    value = str(value).strip()
+
+    if value.isdigit():
+        number = int(value)
+        return number if number > 10_000_000_000 else number * 1000
+
+    if len(value) == 10:
+        value = f"{value}T00:00:00+00:00"
+    elif value.endswith("Z"):
+        value = value.replace("Z", "+00:00")
+
+    dt = datetime.fromisoformat(value)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return int(dt.timestamp() * 1000)
+
+
+def ms_to_iso(value):
+    return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc).isoformat()
+
+
+def interval_to_ms(interval):
+    if interval not in INTERVAL_MS:
+        raise ValueError(f"Unsupported interval: {interval}")
+
+    return INTERVAL_MS[interval]
+
+
+def parse_symbols(value):
+    if not value:
+        symbols = config.BACKTEST_SYMBOLS or config.SYMBOLS
+    elif isinstance(value, str):
+        symbols = [item.strip() for item in value.split(",") if item.strip()]
+    else:
+        symbols = list(value)
+
+    result = []
+
+    for symbol in symbols:
+        symbol = str(symbol).upper().strip()
+
+        if symbol and symbol not in result:
+            result.append(symbol)
+
+    max_symbols = int(getattr(config, "BACKTEST_MAX_SYMBOLS", 10))
+
+    if max_symbols > 0:
+        result = result[:max_symbols]
+
+    return result
+
+
+def data_path(data_dir, symbol, interval):
+    return Path(data_dir) / f"{symbol}_{interval}.csv"
+
+
+def normalise_kline_frame(df, interval):
+    df = df.copy()
+
+    if "open_time" in df.columns and "time" not in df.columns:
+        df.rename(columns={"open_time": "time"}, inplace=True)
+
+    if "time" not in df.columns:
+        raise ValueError("Historical data must contain a time column")
+
+    for column in ("time", "close_time"):
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce").astype("Int64")
+
+    if "close_time" not in df.columns:
+        df["close_time"] = df["time"].astype("int64") + interval_to_ms(interval) - 1
+
+    for column in ("open", "high", "low", "close", "volume"):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    df.dropna(subset=["time", "open", "high", "low", "close", "volume"], inplace=True)
+    df["time"] = df["time"].astype("int64")
+    df["close_time"] = df["close_time"].astype("int64")
+    df.drop_duplicates(subset=["time"], keep="last", inplace=True)
+    df.sort_values("time", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def load_klines_csv(path, interval):
+    df = pd.read_csv(path)
+    return normalise_kline_frame(df, interval)
+
+
+def save_klines_csv(path, df):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = ["time", "open", "high", "low", "close", "volume", "close_time"]
+    df[columns].to_csv(path, index=False)
+
+
+def download_klines(symbol, interval, start_ms, end_ms, sleep_seconds):
+    rows = []
+    cursor = start_ms
+    interval_ms = interval_to_ms(interval)
+
+    while cursor < end_ms:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cursor,
+            "endTime": end_ms,
+            "limit": 1500,
+        }
+        response = requests.get(BINANCE_FAPI_KLINES_URL, params=params, timeout=20)
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"{symbol} {interval} download failed: "
+                f"{response.status_code} {response.text[:200]}"
+            )
+
+        batch = response.json()
+
+        if not batch:
+            break
+
+        rows.extend(batch)
+        last_open_time = int(batch[-1][0])
+        next_cursor = last_open_time + interval_ms
+
+        if next_cursor <= cursor:
+            break
+
+        cursor = next_cursor
+
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    if not rows:
+        return pd.DataFrame(columns=KLINE_COLUMNS)
+
+    df = pd.DataFrame(rows, columns=KLINE_COLUMNS)
+    return normalise_kline_frame(df, interval)
+
+
+def load_or_download(symbol, interval, start_ms, end_ms, args):
+    path = data_path(args.data_dir, symbol, interval)
+
+    if path.exists() and not args.force_download:
+        return load_klines_csv(path, interval)
+
+    if not args.download:
+        raise FileNotFoundError(
+            f"Missing {path}. Re-run with --download or set BACKTEST_DOWNLOAD_DATA=True."
+        )
+
+    warmup_start = start_ms - (
+        interval_to_ms(interval) * int(getattr(config, "BACKTEST_WARMUP_CANDLES", 260))
+    )
+    warmup_start = max(warmup_start, 0)
+    df = download_klines(
+        symbol,
+        interval,
+        warmup_start,
+        end_ms,
+        float(getattr(config, "BACKTEST_DOWNLOAD_SLEEP_SECONDS", 0.2)),
+    )
+    save_klines_csv(path, df)
+    return df
+
+
+def prepare_data(raw_df, interval):
+    raw_df = normalise_kline_frame(raw_df, interval)
+    indicator_df = apply_indicators(raw_df)
+
+    if indicator_df is None or indicator_df.empty:
+        return BacktestData(raw=raw_df, indicators=pd.DataFrame())
+
+    indicator_df = normalise_kline_frame(indicator_df, interval)
+    return BacktestData(raw=raw_df, indicators=indicator_df)
+
+
+def closed_slice(indicator_df, decision_ms, interval, min_rows=220):
+    if indicator_df is None or indicator_df.empty:
+        return None
+
+    close_times = indicator_df["close_time"].to_numpy()
+    end_pos = close_times.searchsorted(decision_ms, side="left")
+
+    if end_pos < min_rows:
+        return None
+
+    max_rows = int(getattr(config, "BACKTEST_SLICE_MAX_ROWS", 0) or 0)
+
+    if max_rows > 0:
+        start_pos = max(0, end_pos - max(max_rows, min_rows))
+    else:
+        start_pos = 0
+
+    closed = indicator_df.iloc[start_pos:end_pos]
+    forming = closed.iloc[[-1]].copy()
+    forming["time"] = int(decision_ms)
+    forming["close_time"] = int(decision_ms + interval_to_ms(interval) - 1)
+    return pd.concat([closed, forming], ignore_index=True, copy=False)
+
+
+def btc_trend_from_slice(btc_df):
+    if btc_df is None or len(btc_df) < 2:
+        return "NEUTRAL"
+
+    latest = btc_df.iloc[-2]
+
+    if latest["ema50"] > latest["ema200"]:
+        return "BULLISH"
+
+    if latest["ema50"] < latest["ema200"]:
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+
+def calculate_btc_context(symbol, trend_df, btc_df):
+    if symbol == "BTCUSDT":
+        return 1.0, 0.0
+
+    if trend_df is None or btc_df is None:
+        return 0.0, 0.0
+
+    try:
+        coin_close = trend_df.iloc[:-1]["close"].tail(100).reset_index(drop=True)
+        btc_close = btc_df.iloc[:-1]["close"].tail(100).reset_index(drop=True)
+        length = min(len(coin_close), len(btc_close))
+
+        if length < 20:
+            btc_corr = 0.0
+        else:
+            coin_ret = coin_close.tail(length).pct_change().dropna()
+            btc_ret = btc_close.tail(length).pct_change().dropna()
+            btc_corr = coin_ret.corr(btc_ret)
+
+            if btc_corr != btc_corr:
+                btc_corr = 0.0
+
+        if length < 10:
+            rs = 0.0
+        else:
+            coin_tail = coin_close.tail(length)
+            btc_tail = btc_close.tail(length)
+            coin_r = ((coin_tail.iloc[-1] - coin_tail.iloc[-10]) / coin_tail.iloc[-10]) * 100
+            btc_r = ((btc_tail.iloc[-1] - btc_tail.iloc[-10]) / btc_tail.iloc[-10]) * 100
+            rs = coin_r - btc_r
+
+        return round(float(btc_corr), 2), round(float(rs), 2)
+
+    except Exception:
+        return 0.0, 0.0
+
+
+def roi_to_price(side, entry_price, roi):
+    move = (float(roi) / max(float(config.LEVERAGE), 1)) / 100
+
+    if side == "BUY":
+        return entry_price * (1 + move)
+
+    return entry_price * (1 - move)
+
+
+def apply_entry_slippage(side, price):
+    slip = float(getattr(config, "BACKTEST_SLIPPAGE_PCT", 0.02)) / 100
+
+    if side == "BUY":
+        return price * (1 + slip)
+
+    return price * (1 - slip)
+
+
+def apply_exit_slippage(side, price):
+    slip = float(getattr(config, "BACKTEST_SLIPPAGE_PCT", 0.02)) / 100
+
+    if side == "BUY":
+        return price * (1 - slip)
+
+    return price * (1 + slip)
+
+
+def margin_per_trade():
+    override = float(getattr(config, "BACKTEST_MARGIN_PER_TRADE", 0))
+    return override if override > 0 else float(config.MARGIN_PER_TRADE)
+
+
+def initial_margin():
+    base = margin_per_trade()
+
+    if getattr(config, "BACKTEST_USE_DCA", False) and config.DCA_ENABLED:
+        return base * max(float(config.DCA_INITIAL_MARGIN_PCT), 0) / 100
+
+    return base
+
+
+def dca_margin(dca_index):
+    if not getattr(config, "BACKTEST_USE_DCA", False) or not config.DCA_ENABLED:
+        return 0.0
+
+    if dca_index >= config.DCA_MAX_ORDERS:
+        return 0.0
+
+    if dca_index >= len(config.DCA_MARGIN_PCTS):
+        return 0.0
+
+    return margin_per_trade() * max(float(config.DCA_MARGIN_PCTS[dca_index]), 0) / 100
+
+
+def dca_trigger_roi(dca_index):
+    if dca_index >= config.DCA_MAX_ORDERS:
+        return None
+
+    if dca_index >= len(config.DCA_TRIGGER_ROIS):
+        return None
+
+    return float(config.DCA_TRIGGER_ROIS[dca_index])
+
+
+def position_average_entry(fills):
+    qty = sum(item["qty"] for item in fills)
+
+    if qty <= 0:
+        return 0.0
+
+    return sum(item["qty"] * item["price"] for item in fills) / qty
+
+
+def calculate_trade_pnl(side, fills, exit_price):
+    fee_rate = float(getattr(config, "BACKTEST_FEE_RATE", 0.0004))
+    gross = 0.0
+    entry_fees = 0.0
+    exit_fees = 0.0
+
+    for fill in fills:
+        qty = fill["qty"]
+
+        if side == "BUY":
+            gross += qty * (exit_price - fill["price"])
+        else:
+            gross += qty * (fill["price"] - exit_price)
+
+        entry_fees += qty * fill["price"] * fee_rate
+        exit_fees += qty * exit_price * fee_rate
+
+    fees = entry_fees + exit_fees
+    margin = sum(item["margin"] for item in fills)
+    net = gross - fees
+    roi = (net / margin * 100) if margin > 0 else 0.0
+    return gross, fees, net, roi
+
+
+def compute_take_profit(side, avg_entry, trend_df, confirm_df, dca_context=False):
+    if dca_context and config.DCA_TP_MODE in ("roi", "fixed_roi", "fallback_roi"):
+        roi = float(config.DCA_TP_ROI)
+        return roi_to_price(side, avg_entry, roi), f"DCA_ROI_{roi}%"
+
+    if config.STATIC_TP_ENABLED:
+        roi = float(config.STATIC_TP_ROI)
+        return roi_to_price(side, avg_entry, roi), f"STATIC_ROI_{roi}%"
+
+    ok, target = validate_structure_take_profit(
+        side,
+        avg_entry,
+        trend_df,
+        confirm_df,
+        leverage=config.LEVERAGE,
+    )
+
+    if ok and target.get("target_price"):
+        return float(target["target_price"]), f"STRUCTURE_{target['source']}"
+
+    roi = float(config.STRUCTURE_TP_FALLBACK_ROI)
+    return roi_to_price(side, avg_entry, roi), f"FALLBACK_ROI_{roi}%"
+
+
+def candle_hits_tp(side, candle, tp_price):
+    if side == "BUY":
+        return float(candle["high"]) >= tp_price
+
+    return float(candle["low"]) <= tp_price
+
+
+def candle_hits_dca(side, candle, trigger_price):
+    if side == "BUY":
+        return float(candle["low"]) <= trigger_price
+
+    return float(candle["high"]) >= trigger_price
+
+
+def dca_trigger_price(side, anchor_price, roi):
+    move = (float(roi) / max(float(config.LEVERAGE), 1)) / 100
+
+    if side == "BUY":
+        return anchor_price * (1 - move)
+
+    return anchor_price * (1 + move)
+
+
+def simulate_trade(
+    symbol,
+    side,
+    confirmation_type,
+    confidence,
+    entry_time,
+    entry_price,
+    entry_index,
+    frames,
+):
+    entry_price = apply_entry_slippage(side, float(entry_price))
+    init_margin = initial_margin()
+    fills = [{
+        "time": int(entry_time),
+        "price": entry_price,
+        "margin": init_margin,
+        "qty": (init_margin * float(config.LEVERAGE)) / entry_price,
+    }]
+    dca_count = 0
+    max_hold = int(getattr(config, "BACKTEST_MAX_HOLD_CANDLES", 240))
+    signal_entry_df = frames["entry"].indicators
+    exit_frame = frames.get("exit") or frames["entry"]
+    exit_df = exit_frame.indicators
+    trend_interval = config.TREND_TIMEFRAME
+    confirm_interval = config.CONFIRMATION_TIMEFRAME
+    entry_interval = config.ENTRY_TIMEFRAME
+    decision_trend = closed_slice(
+        frames["trend"].indicators,
+        int(entry_time),
+        trend_interval,
+    )
+    decision_confirm = closed_slice(
+        frames["confirm"].indicators,
+        int(entry_time),
+        confirm_interval,
+    )
+    avg_entry = position_average_entry(fills)
+    tp_price, tp_mode = compute_take_profit(
+        side,
+        avg_entry,
+        decision_trend,
+        decision_confirm,
+    )
+    max_seen_adverse_roi = 0.0
+    exit_candle = None
+    exit_reason = "OPEN_AT_DATA_END"
+    exit_price = None
+    dca_blocked_count = 0
+    last_dca_block_reason = ""
+
+    exit_times = exit_df["time"].to_numpy()
+    start_index = exit_times.searchsorted(int(entry_time), side="left")
+
+    if start_index >= len(exit_df):
+        start_index = max(len(exit_df) - 1, 0)
+
+    max_hold_ms = max_hold * interval_to_ms(config.ENTRY_TIMEFRAME)
+    max_exit_time = int(entry_time) + max_hold_ms
+    end_index = exit_times.searchsorted(max_exit_time, side="right")
+    end_index = min(max(end_index, start_index + 1), len(exit_df))
+
+    for row_index in range(start_index, end_index):
+        candle = exit_df.iloc[row_index]
+        candle_time = int(candle["time"])
+
+        while True:
+            trigger_roi = dca_trigger_roi(dca_count)
+            next_margin = dca_margin(dca_count)
+
+            if trigger_roi is None or next_margin <= 0:
+                break
+
+            anchor_price = fills[-1]["price"]
+            trigger_price = dca_trigger_price(side, anchor_price, trigger_roi)
+
+            if not candle_hits_dca(side, candle, trigger_price):
+                break
+
+            if getattr(config, "DCA_STRICT_GUARD_ENABLED", True):
+                trend_slice = closed_slice(
+                    frames["trend"].indicators,
+                    candle_time,
+                    trend_interval,
+                )
+                confirm_slice = closed_slice(
+                    frames["confirm"].indicators,
+                    candle_time,
+                    confirm_interval,
+                )
+                entry_slice = closed_slice(
+                    signal_entry_df,
+                    candle_time,
+                    entry_interval,
+                )
+                position_adverse_roi = abs(
+                    ((avg_entry - trigger_price) / avg_entry) *
+                    float(config.LEVERAGE) * 100
+                    if side == "BUY"
+                    else ((trigger_price - avg_entry) / avg_entry) *
+                    float(config.LEVERAGE) * 100
+                )
+                guard_ok, guard_info = validate_dca_continuation_guard(
+                    side,
+                    trigger_price,
+                    avg_entry,
+                    trend_slice,
+                    confirm_slice,
+                    entry_slice,
+                    leverage=config.LEVERAGE,
+                    confirmation_type=confirmation_type,
+                    dca_level=dca_count + 1,
+                    adverse_roi=trigger_roi,
+                    position_adverse_roi=round(float(position_adverse_roi), 2),
+                )
+
+                if not guard_ok:
+                    dca_blocked_count += 1
+                    last_dca_block_reason = guard_info.get(
+                        "reason",
+                        "DCA_STRICT_GUARD_BLOCKED"
+                    )
+                    break
+
+            fill_price = apply_entry_slippage(side, trigger_price)
+            fills.append({
+                "time": candle_time,
+                "price": fill_price,
+                "margin": next_margin,
+                "qty": (next_margin * float(config.LEVERAGE)) / fill_price,
+            })
+            dca_count += 1
+            avg_entry = position_average_entry(fills)
+
+            if getattr(config, "DCA_REPRICE_TP_AFTER_FILL", True):
+                trend_slice = closed_slice(
+                    frames["trend"].indicators,
+                    candle_time,
+                    trend_interval,
+                )
+                confirm_slice = closed_slice(
+                    frames["confirm"].indicators,
+                    candle_time,
+                    confirm_interval,
+                )
+
+                if trend_slice is not None and confirm_slice is not None:
+                    tp_price, tp_mode = compute_take_profit(
+                        side,
+                        avg_entry,
+                        trend_slice,
+                        confirm_slice,
+                        dca_context=True,
+                    )
+
+        adverse_price = float(candle["low"]) if side == "BUY" else float(candle["high"])
+        adverse_roi = abs(
+            ((avg_entry - adverse_price) / avg_entry) * float(config.LEVERAGE) * 100
+            if side == "BUY"
+            else ((adverse_price - avg_entry) / avg_entry) * float(config.LEVERAGE) * 100
+        )
+        max_seen_adverse_roi = max(max_seen_adverse_roi, adverse_roi)
+
+        if candle_hits_tp(side, candle, tp_price):
+            exit_price = apply_exit_slippage(side, tp_price)
+            exit_candle = candle
+            exit_reason = "TP"
+            break
+
+    if exit_price is None:
+        if exit_candle is None:
+            if end_index > start_index:
+                exit_candle = exit_df.iloc[end_index - 1]
+            else:
+                exit_candle = exit_df.iloc[min(start_index, len(exit_df) - 1)]
+
+        exit_price = apply_exit_slippage(side, float(exit_candle["close"]))
+        exit_reason = "TIMEOUT" if end_index < len(exit_df) else "DATA_END"
+
+    gross, fees, net, roi = calculate_trade_pnl(side, fills, exit_price)
+    exit_time = int(exit_candle["close_time"])
+    duration_hours = (exit_time - int(entry_time)) / 3_600_000
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "confirmation_type": confirmation_type,
+        "confidence": round(float(confidence), 2),
+        "entry_time": ms_to_iso(entry_time),
+        "exit_time": ms_to_iso(exit_time),
+        "entry_ms": int(entry_time),
+        "exit_ms": exit_time,
+        "entry_price": round(entry_price, 8),
+        "avg_entry": round(position_average_entry(fills), 8),
+        "exit_price": round(float(exit_price), 8),
+        "tp_price": round(float(tp_price), 8),
+        "tp_mode": tp_mode,
+        "exit_reason": exit_reason,
+        "dca_count": dca_count,
+        "fill_count": len(fills),
+        "margin_used": round(sum(item["margin"] for item in fills), 4),
+        "gross_pnl": round(gross, 4),
+        "fees": round(fees, 4),
+        "net_pnl": round(net, 4),
+        "roi_on_margin": round(roi, 2),
+        "result": "WIN" if net > 0 else "LOSS",
+        "duration_hours": round(duration_hours, 2),
+        "max_adverse_roi": round(max_seen_adverse_roi, 2),
+        "dca_blocked_count": dca_blocked_count,
+        "last_dca_block_reason": last_dca_block_reason,
+    }
+
+
+def passes_pre_entry_filters(signal, current_price, trend_df, confirm_df, side_analysis):
+    min_room_override = None
+
+    if side_analysis.get("confirmation_type") == "REVERSAL":
+        min_room_override = config.REVERSAL_MIN_TP_ROOM_ROI
+
+    room_ok, room_info = validate_entry_profit_room(
+        signal,
+        current_price,
+        trend_df,
+        confirm_df,
+        leverage=config.LEVERAGE,
+        min_roi_override=min_room_override,
+    )
+
+    if not room_ok:
+        return False, room_info.get("reason", "PROFIT_ROOM_BLOCKED"), {}
+
+    level_ok, level_info = validate_adverse_zone_level(
+        signal,
+        current_price,
+        trend_df,
+        confirm_df,
+        leverage=config.LEVERAGE,
+    )
+
+    if not level_ok:
+        return False, level_info.get("reason", "ADVERSE_LEVEL_BLOCKED"), {}
+
+    return True, "OK", level_info
+
+
+def generate_symbol_trades(symbol, frames, btc_frames, start_ms, end_ms):
+    trades = []
+    entry_df = frames["entry"].indicators
+    trend_df = frames["trend"].indicators
+    confirm_df = frames["confirm"].indicators
+    btc_trend_df = btc_frames["trend"].indicators if btc_frames else None
+    entry_interval = config.ENTRY_TIMEFRAME
+    active_until_ms = 0
+    rows = entry_df[
+        (entry_df["time"] >= start_ms) &
+        (entry_df["time"] <= end_ms)
+    ]
+    step_candles = max(int(getattr(config, "BACKTEST_SIGNAL_STEP_CANDLES", 4)), 1)
+    progress_every = max(int(getattr(config, "BACKTEST_PROGRESS_EVERY_CANDLES", 500)), 0)
+    scan_rows = rows.iloc[::step_candles] if step_candles > 1 else rows
+    total_rows = len(scan_rows)
+
+    print(
+        f"{symbol}: replaying {total_rows} decision candles "
+        f"(step={step_candles})",
+        flush=True,
+    )
+
+    for checked_count, row in enumerate(scan_rows.itertuples(), start=1):
+        entry_index = int(row.Index)
+        decision_ms = int(row.time)
+
+        if progress_every and checked_count % progress_every == 0:
+            print(
+                f"{symbol}: checked {checked_count}/{total_rows} "
+                f"decision candles | trades={len(trades)}",
+                flush=True,
+            )
+
+        if getattr(config, "BACKTEST_ONE_POSITION_PER_SYMBOL", True):
+            if decision_ms <= active_until_ms:
+                continue
+
+        trend_slice = closed_slice(trend_df, decision_ms, config.TREND_TIMEFRAME)
+        confirm_slice = closed_slice(confirm_df, decision_ms, config.CONFIRMATION_TIMEFRAME)
+        entry_slice = closed_slice(entry_df, decision_ms, entry_interval)
+
+        if trend_slice is None or confirm_slice is None or entry_slice is None:
+            continue
+
+        btc_slice = None
+
+        if getattr(config, "BACKTEST_USE_BTC_CONTEXT", True) and btc_trend_df is not None:
+            btc_slice = closed_slice(btc_trend_df, decision_ms, config.TREND_TIMEFRAME)
+
+        btc_trend = btc_trend_from_slice(btc_slice)
+        btc_corr, rs = calculate_btc_context(symbol, trend_slice, btc_slice)
+        analysis = analyze_signal(
+            trend_slice,
+            confirm_slice,
+            entry_slice,
+            btc_trend,
+            btc_corr,
+            rs,
+            participation=None,
+            log_details=False,
+        )
+        signal = analysis.get("signal")
+
+        if not signal:
+            continue
+
+        side_analysis = analysis.get(signal.lower(), {})
+        current_price = float(row.open)
+        filters_ok, reason, _ = passes_pre_entry_filters(
+            signal,
+            current_price,
+            trend_slice,
+            confirm_slice,
+            side_analysis,
+        )
+
+        if not filters_ok:
+            continue
+
+        trade = simulate_trade(
+            symbol,
+            signal,
+            side_analysis.get("confirmation_type", "UNKNOWN"),
+            side_analysis.get("confidence", 0),
+            decision_ms,
+            current_price,
+            int(entry_index),
+            frames,
+        )
+        trade["skip_reason"] = reason
+        trades.append(trade)
+        active_until_ms = int(trade["exit_ms"])
+
+    return trades
+
+
+def apply_position_limits(trades):
+    if not getattr(config, "BACKTEST_APPLY_POSITION_LIMITS", True):
+        return trades, 0
+
+    max_total = config.MAX_TOTAL_POSITIONS
+    max_buy = config.MAX_BUY_POSITIONS
+    max_sell = config.MAX_SELL_POSITIONS
+
+    if max_total is None and max_buy is None and max_sell is None:
+        return trades, 0
+
+    accepted = []
+    skipped = 0
+
+    for trade in sorted(trades, key=lambda item: item["entry_ms"]):
+        open_trades = [
+            item for item in accepted
+            if item["entry_ms"] <= trade["entry_ms"] < item["exit_ms"]
+        ]
+        total_count = len(open_trades)
+        buy_count = sum(1 for item in open_trades if item["side"] == "BUY")
+        sell_count = sum(1 for item in open_trades if item["side"] == "SELL")
+
+        if max_total is not None and total_count >= max_total:
+            skipped += 1
+            continue
+
+        if trade["side"] == "BUY" and max_buy is not None and buy_count >= max_buy:
+            skipped += 1
+            continue
+
+        if trade["side"] == "SELL" and max_sell is not None and sell_count >= max_sell:
+            skipped += 1
+            continue
+
+        accepted.append(trade)
+
+    return sorted(accepted, key=lambda item: item["entry_ms"]), skipped
+
+
+def summarise_trades(trades, skipped_by_limits):
+    balance = float(getattr(config, "BACKTEST_INITIAL_BALANCE", 1000))
+    equity = balance
+    peak = balance
+    max_drawdown = 0.0
+    wins = 0
+    losses = 0
+    gross_profit = 0.0
+    gross_loss = 0.0
+    dca_trades = 0
+    durations = []
+    equity_curve = []
+
+    for trade in sorted(trades, key=lambda item: item["exit_ms"]):
+        pnl = float(trade["net_pnl"])
+        equity += pnl
+        peak = max(peak, equity)
+        drawdown = ((peak - equity) / peak * 100) if peak > 0 else 0
+        max_drawdown = max(max_drawdown, drawdown)
+        equity_curve.append({
+            "time": trade["exit_time"],
+            "equity": round(equity, 4),
+            "drawdown_pct": round(drawdown, 2),
+        })
+
+        if pnl > 0:
+            wins += 1
+            gross_profit += pnl
+        else:
+            losses += 1
+            gross_loss += abs(pnl)
+
+        if int(trade["dca_count"]) > 0:
+            dca_trades += 1
+
+        durations.append(float(trade["duration_hours"]))
+
+    total = len(trades)
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+    net_pnl = equity - balance
+
+    return {
+        "initial_balance": round(balance, 4),
+        "final_balance": round(equity, 4),
+        "net_pnl": round(net_pnl, 4),
+        "net_return_pct": round((net_pnl / balance * 100) if balance else 0, 2),
+        "total_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round((wins / total * 100) if total else 0, 2),
+        "profit_factor": round(profit_factor, 3) if profit_factor is not None else None,
+        "gross_profit": round(gross_profit, 4),
+        "gross_loss": round(gross_loss, 4),
+        "max_drawdown_pct": round(max_drawdown, 2),
+        "avg_roi_on_margin_pct": round(
+            sum(float(item["roi_on_margin"]) for item in trades) / total,
+            2,
+        ) if total else 0,
+        "avg_duration_hours": round(sum(durations) / len(durations), 2) if durations else 0,
+        "dca_trades": dca_trades,
+        "skipped_by_position_limits": skipped_by_limits,
+        "notes": [
+            "Backtest uses historical OHLCV candles and simulated fills.",
+            "News, LLM, realtime websocket confirmation, order-book flow, and private account state are not replayed.",
+            "Intracandle order is conservative: DCA checks are processed before TP checks inside the same candle.",
+        ],
+        "equity_curve": equity_curve,
+    }
+
+
+def summarise_by_symbol(trades):
+    rows = []
+
+    for symbol in sorted({item["symbol"] for item in trades}):
+        subset = [item for item in trades if item["symbol"] == symbol]
+        wins = sum(1 for item in subset if item["result"] == "WIN")
+        pnl = sum(float(item["net_pnl"]) for item in subset)
+        rows.append({
+            "symbol": symbol,
+            "trades": len(subset),
+            "wins": wins,
+            "losses": len(subset) - wins,
+            "win_rate_pct": round((wins / len(subset) * 100) if subset else 0, 2),
+            "net_pnl": round(pnl, 4),
+            "avg_roi_on_margin_pct": round(
+                sum(float(item["roi_on_margin"]) for item in subset) / len(subset),
+                2,
+            ) if subset else 0,
+            "dca_trades": sum(1 for item in subset if int(item["dca_count"]) > 0),
+        })
+
+    return rows
+
+
+def write_csv(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    actual_path = path
+
+    if not rows:
+        try:
+            path.write_text("", encoding="utf-8")
+        except PermissionError:
+            actual_path = timestamped_output_path(path)
+            print(f"{path.name} is locked; writing {actual_path.name} instead")
+            actual_path.write_text("", encoding="utf-8")
+        return actual_path
+
+    try:
+        handle = path.open("w", newline="", encoding="utf-8")
+    except PermissionError:
+        actual_path = timestamped_output_path(path)
+        print(f"{path.name} is locked; writing {actual_path.name} instead")
+        handle = actual_path.open("w", newline="", encoding="utf-8")
+
+    with handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return actual_path
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    actual_path = path
+    try:
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except PermissionError:
+        actual_path = timestamped_output_path(path)
+        print(f"{path.name} is locked; writing {actual_path.name} instead")
+        actual_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return actual_path
+
+
+def timestamped_output_path(path):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return path.with_name(f"{path.stem}_{stamp}{path.suffix}")
+
+
+def load_symbol_frames(symbol, args, start_ms, end_ms):
+    intervals = {
+        "trend": config.TREND_TIMEFRAME,
+        "confirm": config.CONFIRMATION_TIMEFRAME,
+        "entry": config.ENTRY_TIMEFRAME,
+        "exit": getattr(config, "BACKTEST_EXIT_TIMEFRAME", config.ENTRY_TIMEFRAME),
+    }
+    frames = {}
+    loaded_by_interval = {}
+
+    for key, interval in intervals.items():
+        if interval in loaded_by_interval:
+            frames[key] = loaded_by_interval[interval]
+            continue
+
+        raw = load_or_download(symbol, interval, start_ms, end_ms, args)
+        frames[key] = prepare_data(raw, interval)
+        loaded_by_interval[interval] = frames[key]
+
+        if frames[key].indicators.empty:
+            raise RuntimeError(f"{symbol} {interval} has no indicator-ready data")
+
+    return frames
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description="Offline historical backtest for binance_ai_bot_v6."
+    )
+    parser.add_argument("--symbols", default="")
+    parser.add_argument("--start", default=config.BACKTEST_START)
+    parser.add_argument("--end", default=config.BACKTEST_END)
+    parser.add_argument("--data-dir", default=config.BACKTEST_DATA_DIR)
+    parser.add_argument("--results-dir", default=config.BACKTEST_RESULTS_DIR)
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        default=bool(config.BACKTEST_DOWNLOAD_DATA),
+    )
+    parser.add_argument("--no-download", action="store_false", dest="download")
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        default=bool(config.BACKTEST_FORCE_DOWNLOAD),
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        default=bool(getattr(config, "BACKTEST_FAST_MODE", False)),
+        help="Use faster rough-test settings unless explicitly overridden.",
+    )
+    parser.add_argument("--signal-step", type=int, default=None)
+    parser.add_argument("--exit-timeframe", default="")
+    parser.add_argument("--slice-max-rows", type=int, default=None)
+    parser.add_argument(
+        "--no-btc-context",
+        action="store_true",
+        default=not bool(getattr(config, "BACKTEST_USE_BTC_CONTEXT", True)),
+    )
+    return parser
+
+
+def apply_runtime_options(args):
+    if args.fast:
+        config.BACKTEST_SIGNAL_STEP_CANDLES = max(
+            int(getattr(config, "BACKTEST_SIGNAL_STEP_CANDLES", 4)),
+            8,
+        )
+        config.BACKTEST_SLICE_MAX_ROWS = min(
+            int(getattr(config, "BACKTEST_SLICE_MAX_ROWS", 420)),
+            320,
+        )
+
+        if not args.exit_timeframe:
+            config.BACKTEST_EXIT_TIMEFRAME = "4h"
+
+    if args.signal_step is not None:
+        config.BACKTEST_SIGNAL_STEP_CANDLES = max(int(args.signal_step), 1)
+
+    if args.exit_timeframe:
+        config.BACKTEST_EXIT_TIMEFRAME = args.exit_timeframe.strip()
+
+    if args.slice_max_rows is not None:
+        config.BACKTEST_SLICE_MAX_ROWS = max(int(args.slice_max_rows), 0)
+
+    if args.no_btc_context:
+        config.BACKTEST_USE_BTC_CONTEXT = False
+
+
+def run_backtest(args):
+    apply_runtime_options(args)
+    start_ms = parse_time_ms(args.start)
+    end_ms = parse_time_ms(args.end, default=utc_now_ms())
+
+    if end_ms <= start_ms:
+        raise ValueError("Backtest end time must be after start time")
+
+    symbols = parse_symbols(args.symbols)
+    print(
+        "Backtest settings | "
+        f"STEP={getattr(config, 'BACKTEST_SIGNAL_STEP_CANDLES', 4)} | "
+        f"EXIT_TF={getattr(config, 'BACKTEST_EXIT_TIMEFRAME', config.ENTRY_TIMEFRAME)} | "
+        f"SLICE_ROWS={getattr(config, 'BACKTEST_SLICE_MAX_ROWS', 0)} | "
+        f"BTC_CONTEXT={getattr(config, 'BACKTEST_USE_BTC_CONTEXT', True)}",
+        flush=True,
+    )
+
+    all_trades = []
+    failed_symbols = {}
+    btc_frames = None
+
+    if getattr(config, "BACKTEST_USE_BTC_CONTEXT", True):
+        try:
+            btc_frames = load_symbol_frames("BTCUSDT", args, start_ms, end_ms)
+        except Exception as exc:
+            failed_symbols["BTCUSDT"] = str(exc)
+
+    for symbol in symbols:
+        try:
+            if symbol == "BTCUSDT" and btc_frames is not None:
+                frames = btc_frames
+            else:
+                frames = load_symbol_frames(symbol, args, start_ms, end_ms)
+
+            trades = generate_symbol_trades(
+                symbol,
+                frames,
+                btc_frames,
+                start_ms,
+                end_ms,
+            )
+            all_trades.extend(trades)
+            print(f"{symbol}: {len(trades)} simulated trades")
+
+        except Exception as exc:
+            failed_symbols[symbol] = str(exc)
+            print(f"{symbol}: skipped - {exc}")
+
+    accepted_trades, skipped_by_limits = apply_position_limits(all_trades)
+    summary = summarise_trades(accepted_trades, skipped_by_limits)
+    summary.update({
+        "symbols": symbols,
+        "start": ms_to_iso(start_ms),
+        "end": ms_to_iso(end_ms),
+        "failed_symbols": failed_symbols,
+        "generated_trades_before_position_limits": len(all_trades),
+        "settings": {
+            "signal_step_candles": int(getattr(config, "BACKTEST_SIGNAL_STEP_CANDLES", 4)),
+            "exit_timeframe": getattr(config, "BACKTEST_EXIT_TIMEFRAME", config.ENTRY_TIMEFRAME),
+            "slice_max_rows": int(getattr(config, "BACKTEST_SLICE_MAX_ROWS", 0) or 0),
+            "use_btc_context": bool(getattr(config, "BACKTEST_USE_BTC_CONTEXT", True)),
+            "use_dca": bool(getattr(config, "BACKTEST_USE_DCA", False)),
+        },
+    })
+    symbol_summary = summarise_by_symbol(accepted_trades)
+    results_dir = Path(args.results_dir)
+    written_files = [
+        write_csv(results_dir / "trades.csv", accepted_trades),
+        write_csv(results_dir / "symbol_summary.csv", symbol_summary),
+        write_json(results_dir / "summary.json", summary),
+    ]
+
+    print("")
+    print("Backtest complete")
+    print(f"Trades: {summary['total_trades']}")
+    print(f"Win rate: {summary['win_rate_pct']}%")
+    print(f"Net PnL: {summary['net_pnl']}")
+    print(f"Net return: {summary['net_return_pct']}%")
+    print(f"Max drawdown: {summary['max_drawdown_pct']}%")
+    print(f"Results: {results_dir.resolve()}")
+    if any(item.name not in {"trades.csv", "symbol_summary.csv", "summary.json"} for item in written_files):
+        print("Locked output fallback files:")
+        for item in written_files:
+            print(f"  {item.name}")
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    run_backtest(args)
+
+
+if __name__ == "__main__":
+    main()

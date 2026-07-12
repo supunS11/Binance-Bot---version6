@@ -38,7 +38,8 @@ from strategy import (
     validate_adverse_zone_level,
     validate_structure_take_profit,
     validate_entry_profit_room,
-    validate_dca_structure_level
+    validate_dca_structure_level,
+    validate_dca_continuation_guard
 )
 from risk_management import calculate_position_size
 from signal_journal import append_signal_journal
@@ -1155,6 +1156,43 @@ def manage_dca_position(
         f"MARGIN={dca_margin} | SOURCE={price_source}"
     )
 
+    trend_df = None
+    confirm_df = None
+    entry_df = None
+
+    if getattr(config, "DCA_STRICT_GUARD_ENABLED", True):
+        trend_df, confirm_df, entry_df = get_signal_frames(symbol, btc_trend_df)
+        guard_ok, guard_info = validate_dca_continuation_guard(
+            side,
+            current_price,
+            avg_entry,
+            trend_df,
+            confirm_df,
+            entry_df,
+            leverage=config.LEVERAGE,
+            confirmation_type=position_state.get("confirmation_type"),
+            dca_level=dca_count + 1,
+            adverse_roi=adverse_roi,
+            position_adverse_roi=position_adverse_roi
+        )
+
+        if not guard_ok:
+            log_warning(
+                f"{symbol} DCA skipped | {guard_info.get('reason')} | "
+                f"PRESSURE={guard_info.get('pressure_score')} | "
+                f"RECOVERY={guard_info.get('recovery_score')} | "
+                f"TYPE={guard_info.get('trade_type')}"
+            )
+            return
+
+        log_info(
+            f"{symbol} DCA strict guard OK | "
+            f"PRESSURE={guard_info.get('pressure_score')} | "
+            f"RECOVERY={guard_info.get('recovery_score')} | "
+            f"TYPE={guard_info.get('trade_type')} | "
+            f"STRUCTURE={guard_info.get('structure', {}).get('reason')}"
+        )
+
     balance = get_balance()
     quantity = calculate_position_size(
         balance,
@@ -1244,7 +1282,9 @@ def manage_dca_position(
             f"LEVEL={dca_level} | reservation kept temporarily"
         )
 
-    trend_df, confirm_df, entry_df = get_signal_frames(symbol, btc_trend_df)
+    if trend_df is None or confirm_df is None or entry_df is None:
+        trend_df, confirm_df, entry_df = get_signal_frames(symbol, btc_trend_df)
+
     btc_corr = ""
     rs = ""
     analysis = {

@@ -2424,10 +2424,348 @@ def _reversal_momentum_context(side, confirm_df, entry_df, smc_ok):
     return score, context
 
 
+def _continuation_pressure_against_side(side, trend_df, confirm_df, entry_df):
+    trend = latest_closed(trend_df)
+    prev_trend = previous_closed(trend_df)
+    confirm = latest_closed(confirm_df)
+    prev_confirm = previous_closed(confirm_df)
+    entry = latest_closed(entry_df)
+    prev_entry = previous_closed(entry_df)
+    min_adx = get_config_float("REVERSAL_INVALIDATION_MIN_ADX", 18)
+
+    if side == "BUY":
+        checks = (
+            ("trend_close_below_ema50", trend["close"] < trend["ema50"], 1.0),
+            ("trend_ema20_below_ema50", trend["ema20"] < trend["ema50"], 1.0),
+            ("trend_ema50_below_ema200", trend["ema50"] < trend["ema200"], 1.25),
+            ("trend_lower_close", trend["close"] < prev_trend["close"], 0.75),
+            ("trend_strong_adx", trend["adx"] >= min_adx, 0.75),
+            ("confirm_close_below_ema20", confirm["close"] < confirm["ema20"], 1.0),
+            ("confirm_close_below_ema50", confirm["close"] < confirm["ema50"], 1.0),
+            ("confirm_macd_bearish", confirm["macd"] < confirm["macd_signal"], 1.0),
+            ("confirm_breakdown", confirm["close"] < prev_confirm["low"], 1.0),
+            ("entry_close_below_ema20", entry["close"] < entry["ema20"], 0.75),
+            ("entry_bearish", _is_bearish(entry), 0.75),
+            ("entry_breakdown", entry["close"] < prev_entry["low"], 0.75),
+        )
+    else:
+        checks = (
+            ("trend_close_above_ema50", trend["close"] > trend["ema50"], 1.0),
+            ("trend_ema20_above_ema50", trend["ema20"] > trend["ema50"], 1.0),
+            ("trend_ema50_above_ema200", trend["ema50"] > trend["ema200"], 1.25),
+            ("trend_higher_close", trend["close"] > prev_trend["close"], 0.75),
+            ("trend_strong_adx", trend["adx"] >= min_adx, 0.75),
+            ("confirm_close_above_ema20", confirm["close"] > confirm["ema20"], 1.0),
+            ("confirm_close_above_ema50", confirm["close"] > confirm["ema50"], 1.0),
+            ("confirm_macd_bullish", confirm["macd"] > confirm["macd_signal"], 1.0),
+            ("confirm_breakout", confirm["close"] > prev_confirm["high"], 1.0),
+            ("entry_close_above_ema20", entry["close"] > entry["ema20"], 0.75),
+            ("entry_bullish", _is_bullish(entry), 0.75),
+            ("entry_breakout", entry["close"] > prev_entry["high"], 0.75),
+        )
+
+    active = [name for name, ok, _ in checks if ok]
+    score = sum(weight for _, ok, weight in checks if ok)
+
+    return {
+        "score": round(float(score), 2),
+        "active": active,
+        "min_adx": min_adx,
+    }
+
+
+def _reversal_recovery_score(side, confirm_df, entry_df, momentum_context, smc_ok):
+    entry = latest_closed(entry_df)
+    prev_entry = previous_closed(entry_df)
+    confirm = latest_closed(confirm_df)
+    prev_confirm = previous_closed(confirm_df)
+    entry_context = _directional_candle_context(side, entry)
+    confirm_context = _directional_candle_context(side, confirm)
+    momentum_context = momentum_context or {}
+
+    if side == "BUY":
+        entry_break = entry["close"] > prev_entry["high"]
+        confirm_break = confirm["close"] > prev_confirm["high"]
+        confirm_shift = (
+            confirm["close"] > prev_confirm["close"] or
+            confirm["rsi"] > prev_confirm["rsi"] or
+            confirm["macd"] > prev_confirm["macd"]
+        )
+    else:
+        entry_break = entry["close"] < prev_entry["low"]
+        confirm_break = confirm["close"] < prev_confirm["low"]
+        confirm_shift = (
+            confirm["close"] < prev_confirm["close"] or
+            confirm["rsi"] < prev_confirm["rsi"] or
+            confirm["macd"] < prev_confirm["macd"]
+        )
+
+    min_close_position = get_config_float(
+        "REVERSAL_MOMENTUM_MIN_CLOSE_POSITION",
+        0.58
+    )
+    score = 0
+    score += 0.75 if entry_context["direction_ok"] else 0
+    score += 0.75 if entry_context["directional_close"] >= min_close_position else 0
+    score += 1.0 if entry_context["ema_reclaimed"] else 0.35 if entry_context["ema_near"] else 0
+    score += 1.0 if entry_break else 0
+    score += 0.75 if confirm_context["direction_ok"] else 0
+    score += 1.0 if confirm_context["ema_reclaimed"] else 0.35 if confirm_context["ema_near"] else 0
+    score += 0.75 if confirm_shift else 0
+    score += 0.75 if confirm_break else 0
+    score += 0.75 if momentum_context.get("ok") else 0
+    score += 0.75 if momentum_context.get("structure_break") else 0
+    score += 0.5 if smc_ok else 0
+
+    return {
+        "score": round(float(score), 2),
+        "entry": entry_context,
+        "confirm": confirm_context,
+        "entry_break": bool(entry_break),
+        "confirm_break": bool(confirm_break),
+        "confirm_shift": bool(confirm_shift),
+        "momentum_ok": bool(momentum_context.get("ok")),
+        "smc_ok": bool(smc_ok),
+    }
+
+
+def validate_reversal_invalidation(
+    side,
+    trend_df,
+    confirm_df,
+    entry_df,
+    momentum_context=None,
+    smc_ok=False,
+):
+    if not getattr(config, "REVERSAL_INVALIDATION_ENABLED", True):
+        return True, {"reason": "REVERSAL_INVALIDATION_DISABLED"}
+
+    pressure = _continuation_pressure_against_side(
+        side,
+        trend_df,
+        confirm_df,
+        entry_df,
+    )
+    recovery = _reversal_recovery_score(
+        side,
+        confirm_df,
+        entry_df,
+        momentum_context,
+        smc_ok,
+    )
+    pressure_score = float(pressure.get("score", 0))
+    recovery_score = float(recovery.get("score", 0))
+    max_pressure = get_config_float("REVERSAL_INVALIDATION_MIN_PRESSURE_SCORE", 5.5)
+    hard_pressure = get_config_float("REVERSAL_INVALIDATION_HARD_PRESSURE_SCORE", 7.0)
+    min_recovery = get_config_float("REVERSAL_INVALIDATION_MIN_RECOVERY_SCORE", 3.0)
+    require_recovery = bool(
+        getattr(config, "REVERSAL_REQUIRE_RECOVERY_CONFIRMATION", True)
+    )
+    base_recovery_min = get_config_float("REVERSAL_RECOVERY_MIN_SCORE", 3.25)
+    strong_pressure = get_config_float("REVERSAL_RECOVERY_STRONG_PRESSURE_SCORE", 4.75)
+    strong_pressure_min = get_config_float(
+        "REVERSAL_RECOVERY_STRONG_PRESSURE_MIN_SCORE",
+        4.0
+    )
+    required_recovery = (
+        max(base_recovery_min, strong_pressure_min)
+        if pressure_score >= strong_pressure
+        else base_recovery_min
+    )
+
+    info = {
+        "reason": "REVERSAL_INVALIDATION_OK",
+        "pressure": pressure,
+        "recovery": recovery,
+        "pressure_score": round(pressure_score, 2),
+        "recovery_score": round(recovery_score, 2),
+        "max_pressure": max_pressure,
+        "hard_pressure": hard_pressure,
+        "min_recovery": min_recovery,
+        "required_recovery": round(float(required_recovery), 2),
+    }
+
+    if require_recovery and recovery_score < required_recovery:
+        info["reason"] = (
+            f"REVERSAL_RECOVERY_NOT_CONFIRMED "
+            f"PRESSURE={pressure_score} RECOVERY={recovery_score} "
+            f"REQUIRED={required_recovery}"
+        )
+        return False, info
+
+    if pressure_score >= hard_pressure and recovery_score < min_recovery + 0.75:
+        info["reason"] = (
+            f"REVERSAL_INVALIDATED_HARD_PRESSURE "
+            f"PRESSURE={pressure_score} RECOVERY={recovery_score}"
+        )
+        return False, info
+
+    if pressure_score >= max_pressure and recovery_score < min_recovery:
+        info["reason"] = (
+            f"REVERSAL_INVALIDATED_PRESSURE "
+            f"PRESSURE={pressure_score} RECOVERY={recovery_score}"
+        )
+        return False, info
+
+    return True, info
+
+
+def validate_dca_continuation_guard(
+    side,
+    current_price,
+    avg_entry,
+    trend_df,
+    confirm_df,
+    entry_df,
+    leverage=None,
+    confirmation_type=None,
+    dca_level=1,
+    adverse_roi=0,
+    position_adverse_roi=0,
+):
+    if not getattr(config, "DCA_STRICT_GUARD_ENABLED", True):
+        return True, {"reason": "DCA_STRICT_GUARD_DISABLED"}
+
+    trade_type = str(confirmation_type or "").upper()
+
+    if (
+        getattr(config, "DCA_STRICT_GUARD_APPLY_TO_REVERSAL_ONLY", False)
+        and trade_type != "REVERSAL"
+    ):
+        return True, {"reason": "DCA_STRICT_GUARD_NON_REVERSAL_SKIPPED"}
+
+    if trend_df is None or confirm_df is None or entry_df is None:
+        if getattr(config, "DCA_STRICT_GUARD_REQUIRE_DATA", True):
+            return False, {"reason": "DCA_STRICT_GUARD_DATA_UNAVAILABLE"}
+
+        return True, {"reason": "DCA_STRICT_GUARD_DATA_UNAVAILABLE_ALLOWED"}
+
+    pressure = _continuation_pressure_against_side(
+        side,
+        trend_df,
+        confirm_df,
+        entry_df,
+    )
+    recovery = _reversal_recovery_score(
+        side,
+        confirm_df,
+        entry_df,
+        momentum_context=None,
+        smc_ok=False,
+    )
+    pressure_score = float(pressure.get("score", 0))
+    recovery_score = float(recovery.get("score", 0))
+    max_pressure = get_config_float("DCA_STRICT_GUARD_MAX_PRESSURE_SCORE", 5.5)
+    hard_pressure = get_config_float("DCA_STRICT_GUARD_HARD_PRESSURE_SCORE", 7.0)
+    min_recovery = (
+        get_config_float("DCA_STRICT_GUARD_REVERSAL_MIN_RECOVERY_SCORE", 3.25)
+        if trade_type == "REVERSAL"
+        else get_config_float("DCA_STRICT_GUARD_MIN_RECOVERY_SCORE", 2.5)
+    )
+
+    if trade_type == "REVERSAL" and int(dca_level or 1) <= 1:
+        min_recovery = max(
+            min_recovery,
+            get_config_float(
+                "DCA_STRICT_GUARD_REVERSAL_FIRST_DCA_MIN_RECOVERY_SCORE",
+                4.25
+            )
+        )
+        max_pressure = min(
+            max_pressure,
+            get_config_float(
+                "DCA_STRICT_GUARD_REVERSAL_FIRST_DCA_MAX_PRESSURE_SCORE",
+                4.75
+            )
+        )
+
+    max_adverse_roi = get_config_float("DCA_STRICT_GUARD_MAX_ADVERSE_ROI", 0)
+    structure_info = {"reason": "DCA_STRICT_GUARD_STRUCTURE_NOT_CHECKED"}
+
+    if getattr(config, "DCA_STRICT_GUARD_STRUCTURE_CHECK_ENABLED", True):
+        structure_ok, structure_info = validate_dca_structure_level(
+            side,
+            current_price,
+            trend_df,
+            confirm_df,
+            entry_df,
+            leverage=leverage,
+        )
+    else:
+        structure_ok = True
+
+    info = {
+        "reason": "DCA_STRICT_GUARD_OK",
+        "trade_type": trade_type or "UNKNOWN",
+        "dca_level": dca_level,
+        "current_price": current_price,
+        "avg_entry": avg_entry,
+        "adverse_roi": adverse_roi,
+        "position_adverse_roi": position_adverse_roi,
+        "pressure": pressure,
+        "recovery": recovery,
+        "pressure_score": round(pressure_score, 2),
+        "recovery_score": round(recovery_score, 2),
+        "max_pressure": max_pressure,
+        "hard_pressure": hard_pressure,
+        "min_recovery": min_recovery,
+        "structure": structure_info,
+    }
+
+    if trade_type == "REVERSAL" and int(dca_level or 1) <= 1 and recovery_score < min_recovery:
+        info["reason"] = (
+            f"DCA_STRICT_GUARD_REVERSAL_FIRST_DCA_WEAK_RECOVERY "
+            f"PRESSURE={pressure_score} RECOVERY={recovery_score} "
+            f"REQUIRED={min_recovery}"
+        )
+        return False, info
+
+    if (
+        max_adverse_roi > 0
+        and float(position_adverse_roi or adverse_roi or 0) >= max_adverse_roi
+        and recovery_score < min_recovery + 0.5
+    ):
+        info["reason"] = (
+            f"DCA_STRICT_GUARD_MAX_ADVERSE "
+            f"ROI={position_adverse_roi} MAX={max_adverse_roi}"
+        )
+        return False, info
+
+    if pressure_score >= hard_pressure and recovery_score < min_recovery + 0.75:
+        info["reason"] = (
+            f"DCA_STRICT_GUARD_HARD_PRESSURE "
+            f"PRESSURE={pressure_score} RECOVERY={recovery_score}"
+        )
+        return False, info
+
+    if pressure_score >= max_pressure and recovery_score < min_recovery:
+        info["reason"] = (
+            f"DCA_STRICT_GUARD_OPPOSITE_PRESSURE "
+            f"PRESSURE={pressure_score} RECOVERY={recovery_score}"
+        )
+        return False, info
+
+    block_on_no_structure = (
+        getattr(config, "DCA_STRICT_GUARD_BLOCK_REVERSAL_ON_NO_STRUCTURE", True)
+        if trade_type == "REVERSAL"
+        else getattr(config, "DCA_STRICT_GUARD_BLOCK_TREND_ON_NO_STRUCTURE", False)
+    )
+
+    if not structure_ok and block_on_no_structure:
+        info["reason"] = structure_info.get(
+            "reason",
+            "DCA_STRICT_GUARD_STRUCTURE_FAILED"
+        )
+        return False, info
+
+    return True, info
+
+
 def _reversal_signal_check(
     side,
     trend_df,
     confirm_df,
+    entry_df,
     trend_score,
     confirm_score,
     entry_score,
@@ -2450,10 +2788,19 @@ def _reversal_signal_check(
     smc_ok, smc_details = _reversal_smc_check(smc_score, smc_context)
     momentum_context = momentum_context or {}
     momentum_ok = bool(momentum_context.get("ok"))
+    invalidation_ok, invalidation = validate_reversal_invalidation(
+        side,
+        trend_df,
+        confirm_df,
+        entry_df,
+        momentum_context=momentum_context,
+        smc_ok=smc_ok,
+    )
     context.update({
         "counter_trend": counter_context,
         "smc": smc_details,
         "momentum": momentum_context,
+        "invalidation": invalidation,
     })
 
     if getattr(config, "REVERSAL_REQUIRE_COUNTER_TREND", True) and not counter_ok:
@@ -2551,6 +2898,9 @@ def _reversal_signal_check(
     if not level_ok:
         failures.append("LEVEL_CHECK_FAILED")
 
+    if not invalidation_ok:
+        failures.append(invalidation.get("reason", "REVERSAL_INVALIDATED"))
+
     return not failures, failures, context
 
 
@@ -2638,6 +2988,7 @@ def _side_signal_score(
         side,
         trend_df,
         confirm_df,
+        entry_df,
         trend_score,
         confirm_score,
         entry_score,

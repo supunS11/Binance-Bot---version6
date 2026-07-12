@@ -31,6 +31,8 @@ Thumbs.db
 
 # Testing
 .pytest_cache/
+backtest_data/
+backtest_results/
 
 # Build files
 build/
