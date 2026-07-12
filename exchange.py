@@ -3,6 +3,7 @@ from binance.enums import *
 
 from collections import deque
 import pandas as pd
+import re
 import threading
 import time
 import numpy as np
@@ -19,6 +20,17 @@ _public_request_weights = deque()
 _public_request_lock = threading.Lock()
 _kline_cache = {}
 _futures_context_cache = {}
+_private_rest_backoff_until = 0.0
+_private_rest_log_times = {}
+_private_rest_lock = threading.Lock()
+_private_account_cache = {"time": 0.0, "data": None}
+_private_balance_cache = {"time": 0.0, "data": None}
+_private_position_cache = {}
+_private_account_cache_lock = threading.Lock()
+_private_balance_cache_lock = threading.Lock()
+_private_position_cache_lock = threading.Lock()
+_BAN_UNTIL_RE = re.compile(r"banned until\s+(\d+)", re.IGNORECASE)
+_RATE_LIMIT_RE = re.compile(r"(code=-1003|too many requests)", re.IGNORECASE)
 
 # =========================
 # SYNC TIME
@@ -84,6 +96,355 @@ def _futures_context_throttle():
     _rate_limit_public_request(
         getattr(config, "FUTURES_CONTEXT_REQUEST_WEIGHT", 1)
     )
+
+
+def _private_rest_log_allowed(key):
+    now = time.time()
+    cooldown = max(
+        float(getattr(config, "PRIVATE_REST_LOG_COOLDOWN_SECONDS", 30)),
+        1.0
+    )
+
+    with _private_rest_lock:
+        last_logged_at = _private_rest_log_times.get(key, 0.0)
+
+        if now - last_logged_at < cooldown:
+            return False
+
+        _private_rest_log_times[key] = now
+        return True
+
+
+def _extract_private_rest_backoff_seconds(error):
+    message = str(error)
+    buffer_seconds = max(
+        float(getattr(config, "PRIVATE_REST_BACKOFF_BUFFER_SECONDS", 60)),
+        0.0
+    )
+    match = _BAN_UNTIL_RE.search(message)
+
+    if match:
+        try:
+            banned_until_ms = int(match.group(1))
+            banned_until_seconds = banned_until_ms / 1000
+            return max(
+                banned_until_seconds - time.time() + buffer_seconds,
+                buffer_seconds
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if _RATE_LIMIT_RE.search(message):
+        return max(
+            float(getattr(config, "PRIVATE_REST_DEFAULT_BACKOFF_SECONDS", 300)),
+            1.0
+        )
+
+    return 0.0
+
+
+def _set_private_rest_backoff(error, context):
+    global _private_rest_backoff_until
+
+    pause_seconds = _extract_private_rest_backoff_seconds(error)
+
+    if pause_seconds <= 0:
+        return
+
+    until = time.time() + pause_seconds
+
+    with _private_rest_lock:
+        _private_rest_backoff_until = max(_private_rest_backoff_until, until)
+
+    if _private_rest_log_allowed("private_rest_backoff_set"):
+        log_warning(
+            "Binance private REST backoff active | "
+            f"CALL={context} | PAUSE_SECONDS={round(pause_seconds, 1)} | "
+            f"ERROR={error}"
+        )
+
+
+def get_private_rest_backoff_remaining():
+    with _private_rest_lock:
+        return max(_private_rest_backoff_until - time.time(), 0.0)
+
+
+def is_private_rest_backoff_active():
+    return get_private_rest_backoff_remaining() > 0
+
+
+def _raise_if_private_rest_backoff(context):
+    remaining = get_private_rest_backoff_remaining()
+
+    if remaining <= 0:
+        return
+
+    if _private_rest_log_allowed(f"private_rest_backoff_skip:{context}"):
+        log_warning(
+            "Binance private REST call skipped during backoff | "
+            f"CALL={context} | WAIT_SECONDS={round(remaining, 1)}"
+        )
+
+    raise RuntimeError(
+        "Binance private REST backoff active | "
+        f"CALL={context} | WAIT_SECONDS={round(remaining, 1)}"
+    )
+
+
+def _private_rest_call(context, func, *args, **kwargs):
+    _raise_if_private_rest_backoff(context)
+
+    try:
+        return func(*args, **kwargs)
+
+    except Exception as e:
+        _set_private_rest_backoff(e, context)
+        raise
+
+
+def _copy_response(data):
+    if isinstance(data, list):
+        return [
+            dict(item) if isinstance(item, dict) else item
+            for item in data
+        ]
+
+    if isinstance(data, dict):
+        return dict(data)
+
+    return data
+
+
+def _cached_private_data(cache, lock, cache_seconds):
+    if cache_seconds <= 0:
+        return None, 0.0
+
+    with lock:
+        data = cache.get("data")
+        age = time.time() - float(cache.get("time", 0.0))
+
+    if data is None or age > cache_seconds:
+        return None, age
+
+    return _copy_response(data), age
+
+
+def _stale_private_data(cache, lock):
+    stale_seconds = max(
+        float(getattr(config, "PRIVATE_REST_STALE_CACHE_SECONDS", 60)),
+        0.0
+    )
+
+    with lock:
+        data = cache.get("data")
+        age = time.time() - float(cache.get("time", 0.0))
+
+    if data is None:
+        return None
+
+    if stale_seconds > 0 and age > stale_seconds:
+        return None
+
+    return _copy_response(data)
+
+
+def _store_private_cache(cache, lock, data):
+    with lock:
+        cache["time"] = time.time()
+        cache["data"] = _copy_response(data)
+
+
+def _get_futures_account(force=False):
+    cache_seconds = max(
+        float(getattr(config, "PRIVATE_ACCOUNT_CACHE_SECONDS", 5)),
+        0.0
+    )
+
+    if not force:
+        cached, _ = _cached_private_data(
+            _private_account_cache,
+            _private_account_cache_lock,
+            cache_seconds
+        )
+
+        if cached is not None:
+            return cached
+
+    if is_private_rest_backoff_active():
+        stale = _stale_private_data(
+            _private_account_cache,
+            _private_account_cache_lock
+        )
+
+        if stale is not None:
+            return stale
+
+    account = _private_rest_call(
+        "futures_account",
+        client.futures_account
+    )
+    _store_private_cache(
+        _private_account_cache,
+        _private_account_cache_lock,
+        account
+    )
+    return _copy_response(account)
+
+
+def _get_futures_account_balance(force=False):
+    cache_seconds = max(
+        float(getattr(config, "PRIVATE_ACCOUNT_CACHE_SECONDS", 5)),
+        0.0
+    )
+
+    if not force:
+        cached, _ = _cached_private_data(
+            _private_balance_cache,
+            _private_balance_cache_lock,
+            cache_seconds
+        )
+
+        if cached is not None:
+            return cached
+
+    if is_private_rest_backoff_active():
+        stale = _stale_private_data(
+            _private_balance_cache,
+            _private_balance_cache_lock
+        )
+
+        if stale is not None:
+            return stale
+
+    balances = _private_rest_call(
+        "futures_account_balance",
+        client.futures_account_balance
+    )
+    _store_private_cache(
+        _private_balance_cache,
+        _private_balance_cache_lock,
+        balances
+    )
+    return _copy_response(balances)
+
+
+def _position_cache_key(symbol=None):
+    return symbol if symbol else "__all__"
+
+
+def _get_cached_position_info(symbol, cache_seconds):
+    key = _position_cache_key(symbol)
+
+    with _private_position_cache_lock:
+        cached = _private_position_cache.get(key)
+
+        if cached:
+            age = time.time() - cached["time"]
+
+            if cache_seconds > 0 and age <= cache_seconds:
+                return _copy_response(cached["data"])
+
+        if symbol:
+            all_cached = _private_position_cache.get("__all__")
+
+            if all_cached:
+                age = time.time() - all_cached["time"]
+
+                if cache_seconds > 0 and age <= cache_seconds:
+                    positions = [
+                        item
+                        for item in all_cached["data"]
+                        if item.get("symbol") == symbol
+                    ]
+                    return _copy_response(positions)
+
+    return None
+
+
+def _get_stale_position_info(symbol):
+    stale_seconds = max(
+        float(getattr(config, "PRIVATE_REST_STALE_CACHE_SECONDS", 60)),
+        0.0
+    )
+    keys = [_position_cache_key(symbol)]
+
+    if symbol:
+        keys.append("__all__")
+
+    with _private_position_cache_lock:
+        for key in keys:
+            cached = _private_position_cache.get(key)
+
+            if not cached:
+                continue
+
+            age = time.time() - cached["time"]
+
+            if stale_seconds > 0 and age > stale_seconds:
+                continue
+
+            data = cached["data"]
+
+            if symbol and key == "__all__":
+                data = [
+                    item
+                    for item in data
+                    if item.get("symbol") == symbol
+                ]
+
+            return _copy_response(data)
+
+    return None
+
+
+def _store_position_info(symbol, positions):
+    key = _position_cache_key(symbol)
+
+    with _private_position_cache_lock:
+        _private_position_cache[key] = {
+            "time": time.time(),
+            "data": _copy_response(positions)
+        }
+
+
+def _clear_position_cache(symbol=None):
+    with _private_position_cache_lock:
+        if symbol:
+            _private_position_cache.pop(symbol, None)
+
+        _private_position_cache.pop("__all__", None)
+
+
+def _get_futures_position_information(symbol=None, force=False):
+    cache_seconds = max(
+        float(getattr(config, "PRIVATE_POSITION_CACHE_SECONDS", 3)),
+        0.0
+    )
+
+    if not force:
+        cached = _get_cached_position_info(symbol, cache_seconds)
+
+        if cached is not None:
+            return cached
+
+    if not force and is_private_rest_backoff_active():
+        stale = _get_stale_position_info(symbol)
+
+        if stale is not None:
+            return stale
+
+    params = {}
+
+    if symbol:
+        params["symbol"] = symbol
+
+    positions = _private_rest_call(
+        f"futures_position_information:{symbol or 'all'}",
+        client.futures_position_information,
+        **params
+    )
+    _store_position_info(symbol, positions)
+    return _copy_response(positions)
 
 
 def _get_cached_kline_df(key):
@@ -294,7 +655,9 @@ def get_futures_participation(symbol):
 def set_margin_type(symbol, allow_open_order_block=False):
 
     try:
-        client.futures_change_margin_type(
+        _private_rest_call(
+            f"futures_change_margin_type:{symbol}",
+            client.futures_change_margin_type,
             symbol=symbol,
             marginType=config.MARGIN_TYPE
         )
@@ -335,7 +698,9 @@ def setup_leverage(symbol):
 
     try:
 
-        response = client.futures_change_leverage(
+        response = _private_rest_call(
+            f"futures_change_leverage:{symbol}",
+            client.futures_change_leverage,
             symbol=symbol,
             leverage=config.LEVERAGE
         )
@@ -359,7 +724,7 @@ def setup_leverage(symbol):
 # =========================
 def get_balance():
 
-    balances = client.futures_account_balance()
+    balances = _get_futures_account_balance()
 
     for b in balances:
         if b['asset'] == 'USDT':
@@ -369,11 +734,11 @@ def get_balance():
 
 
 def get_margin_balance():
-    return float(client.futures_account()['totalMarginBalance'])
+    return float(_get_futures_account()['totalMarginBalance'])
 
 
 def get_unrealized_pnl():
-    return float(client.futures_account()['totalUnrealizedProfit'])
+    return float(_get_futures_account()['totalUnrealizedProfit'])
 
 
 def get_mark_price(symbol):
@@ -426,10 +791,13 @@ def get_klines(symbol, interval, limit=None):
 # =========================
 # POSITION CHECKS
 # =========================
-def has_open_position(symbol):
+def has_open_position(symbol, force=False):
 
     try:
-        positions = client.futures_position_information(symbol=symbol)
+        positions = _get_futures_position_information(
+            symbol=symbol,
+            force=force
+        )
 
         for p in positions:
             if float(p['positionAmt']) != 0:
@@ -442,10 +810,13 @@ def has_open_position(symbol):
         return False
 
 
-def is_position_closed(symbol):
+def is_position_closed(symbol, force=False):
 
     try:
-        positions = client.futures_position_information(symbol=symbol)
+        positions = _get_futures_position_information(
+            symbol=symbol,
+            force=force
+        )
 
         for p in positions:
             if abs(float(p['positionAmt'])) > 0:
@@ -458,10 +829,10 @@ def is_position_closed(symbol):
         return False
 
 
-def get_open_positions():
+def get_open_positions(force=False):
 
     try:
-        positions = client.futures_position_information()
+        positions = _get_futures_position_information(force=force)
         open_positions = {}
 
         for p in positions:
@@ -501,13 +872,13 @@ def _build_open_position_detail(position):
     }
 
 
-def get_open_position_detail_rows(symbol=None):
+def get_open_position_detail_rows(symbol=None, force=False):
 
     try:
-        if symbol:
-            positions = client.futures_position_information(symbol=symbol)
-        else:
-            positions = client.futures_position_information()
+        positions = _get_futures_position_information(
+            symbol=symbol,
+            force=force
+        )
 
         open_positions = []
 
@@ -525,9 +896,9 @@ def get_open_position_detail_rows(symbol=None):
         return None
 
 
-def get_open_position_details(symbol=None):
+def get_open_position_details(symbol=None, force=False):
 
-    rows = get_open_position_detail_rows(symbol)
+    rows = get_open_position_detail_rows(symbol, force=force)
 
     if rows is None:
         return None
@@ -577,9 +948,15 @@ def _get_open_algo_orders(symbol):
     method = getattr(client, "futures_get_open_algo_orders", None)
 
     if method:
-        return method(symbol=symbol)
+        return _private_rest_call(
+            f"futures_get_open_algo_orders:{symbol}",
+            method,
+            symbol=symbol
+        )
 
-    return client._request_futures_api(
+    return _private_rest_call(
+        f"futures_get_open_algo_orders:{symbol}",
+        client._request_futures_api,
         "get",
         "openAlgoOrders",
         True,
@@ -591,9 +968,16 @@ def _cancel_algo_order(symbol, algo_id):
     method = getattr(client, "futures_cancel_algo_order", None)
 
     if method:
-        return method(symbol=symbol, algoId=algo_id)
+        return _private_rest_call(
+            f"futures_cancel_algo_order:{symbol}",
+            method,
+            symbol=symbol,
+            algoId=algo_id
+        )
 
-    return client._request_futures_api(
+    return _private_rest_call(
+        f"futures_cancel_algo_order:{symbol}",
+        client._request_futures_api,
         "delete",
         "algoOrder",
         True,
@@ -625,7 +1009,13 @@ def get_open_take_profit_info(symbol):
     try:
         tp_types = {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}
 
-        for order in client.futures_get_open_orders(symbol=symbol):
+        orders = _private_rest_call(
+            f"futures_get_open_orders:{symbol}",
+            client.futures_get_open_orders,
+            symbol=symbol
+        )
+
+        for order in orders:
             order_type = order.get("type")
 
             if order_type not in tp_types:
@@ -663,7 +1053,11 @@ def get_open_take_profit_info(symbol):
 def cancel_open_protection_orders(symbol):
 
     try:
-        orders = client.futures_get_open_orders(symbol=symbol)
+        orders = _private_rest_call(
+            f"futures_get_open_orders:{symbol}",
+            client.futures_get_open_orders,
+            symbol=symbol
+        )
         protection_types = {
             "TAKE_PROFIT",
             "TAKE_PROFIT_MARKET",
@@ -681,7 +1075,9 @@ def cancel_open_protection_orders(symbol):
             if order_type not in protection_types and not (close_position or reduce_only):
                 continue
 
-            client.futures_cancel_order(
+            _private_rest_call(
+                f"futures_cancel_order:{symbol}",
+                client.futures_cancel_order,
                 symbol=symbol,
                 orderId=order["orderId"]
             )
@@ -765,7 +1161,10 @@ def get_entry_price(symbol, order=None):
 
     for attempt in range(config.ENTRY_PRICE_RETRIES):
         try:
-            positions = client.futures_position_information(symbol=symbol)
+            positions = _get_futures_position_information(
+                symbol=symbol,
+                force=True
+            )
             entry_price = abs(float(positions[0]["entryPrice"]))
 
             if entry_price > 0:
@@ -790,7 +1189,9 @@ def place_market_order(symbol, side, quantity):
 
     try:
 
-        order = client.futures_create_order(
+        order = _private_rest_call(
+            f"futures_create_order:{symbol}",
+            client.futures_create_order,
             symbol=symbol,
             side=side,
             type=FUTURE_ORDER_TYPE_MARKET,
@@ -798,6 +1199,7 @@ def place_market_order(symbol, side, quantity):
             newOrderRespType="RESULT"
         )
 
+        _clear_position_cache(symbol)
         log_info(f"{symbol} MARKET ORDER: {side}")
         return order
 
@@ -830,7 +1232,13 @@ def _submit_close_order(symbol, side, quantity, position_side=None, reduce_only=
     elif reduce_only:
         params["reduceOnly"] = True
 
-    return client.futures_create_order(**params)
+    order = _private_rest_call(
+        f"futures_create_order_close:{symbol}",
+        client.futures_create_order,
+        **params
+    )
+    _clear_position_cache(symbol)
+    return order
 
 
 def close_position_market(symbol, amount, position_side=None):
@@ -945,9 +1353,15 @@ def place_algo_order(**params):
     method = getattr(client, "futures_create_algo_order", None)
 
     if method:
-        return method(**params)
+        return _private_rest_call(
+            f"futures_create_algo_order:{params.get('symbol', 'unknown')}",
+            method,
+            **params
+        )
 
-    return client._request_futures_api(
+    return _private_rest_call(
+        f"futures_create_algo_order:{params.get('symbol', 'unknown')}",
+        client._request_futures_api,
         "post",
         "algoOrder",
         True,

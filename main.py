@@ -26,7 +26,8 @@ from exchange import (
     setup_leverage,
     get_entry_price,
     validate_min_notional,
-    cancel_open_protection_orders
+    cancel_open_protection_orders,
+    get_private_rest_backoff_remaining
 )
 
 from indicators import apply_indicators
@@ -1538,7 +1539,7 @@ def close_all_open_positions_for_target_stop():
     retry_seconds = max(float(config.TARGET_MARGIN_CLOSE_RETRY_SECONDS), 0)
 
     for attempt in range(1, attempts + 1):
-        position_details = get_open_position_detail_rows()
+        position_details = get_open_position_detail_rows(force=True)
 
         if position_details is None:
             log_error("Target margin stop close aborted | position snapshot unavailable")
@@ -1567,7 +1568,7 @@ def close_all_open_positions_for_target_stop():
         if verify_seconds > 0:
             time.sleep(verify_seconds)
 
-        remaining_positions = get_open_position_detail_rows()
+        remaining_positions = get_open_position_detail_rows(force=True)
 
         if remaining_positions is None:
             log_error("Target margin stop close verify failed | snapshot unavailable")
@@ -1647,20 +1648,40 @@ class TargetMarginBalanceMonitor:
             daemon=True
         )
         self.thread.start()
+        effective_check_seconds = max(
+            float(config.TARGET_MARGIN_BALANCE_CHECK_SECONDS),
+            float(config.TARGET_MARGIN_BALANCE_MIN_CHECK_SECONDS),
+            0.2
+        )
         log_info(
             "Target margin balance monitor started | "
             f"TARGET={config.TARGET_MARGIN_BALANCE} | "
-            f"CHECK_SECONDS={config.TARGET_MARGIN_BALANCE_CHECK_SECONDS}"
+            f"CHECK_SECONDS={effective_check_seconds}"
         )
 
     def stop(self):
         self.stop_event.set()
 
     def _run(self):
-        interval = max(float(config.TARGET_MARGIN_BALANCE_CHECK_SECONDS), 0.2)
+        interval = max(
+            float(config.TARGET_MARGIN_BALANCE_CHECK_SECONDS),
+            float(config.TARGET_MARGIN_BALANCE_MIN_CHECK_SECONDS),
+            0.2
+        )
 
         while not self.stop_event.is_set() and not shutdown_event.is_set():
             try:
+                backoff_remaining = get_private_rest_backoff_remaining()
+
+                if backoff_remaining > 0:
+                    log_warning(
+                        "Target margin balance monitor paused | "
+                        "PRIVATE_REST_BACKOFF_ACTIVE | "
+                        f"WAIT_SECONDS={round(backoff_remaining, 1)}"
+                    )
+                    self.stop_event.wait(max(backoff_remaining, interval))
+                    continue
+
                 margin_balance = get_margin_balance()
 
                 if margin_balance >= config.TARGET_MARGIN_BALANCE:
