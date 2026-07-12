@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ from strategy import (
 
 
 BINANCE_FAPI_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+BAN_UNTIL_RE = re.compile(r"banned until\s+(\d+)", re.IGNORECASE)
+RATE_LIMIT_RE = re.compile(r"(code=-1003|too many requests)", re.IGNORECASE)
 KLINE_COLUMNS = [
     "time",
     "open",
@@ -162,6 +165,33 @@ def save_klines_csv(path, df):
     df[columns].to_csv(path, index=False)
 
 
+def extract_rate_limit_backoff_seconds(message):
+    buffer_seconds = max(
+        float(getattr(config, "PUBLIC_REST_BACKOFF_BUFFER_SECONDS", 60)),
+        0.0,
+    )
+    match = BAN_UNTIL_RE.search(str(message))
+
+    if match:
+        try:
+            banned_until_ms = int(match.group(1))
+            banned_until_seconds = banned_until_ms / 1000
+            return max(
+                banned_until_seconds - time.time() + buffer_seconds,
+                buffer_seconds,
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if RATE_LIMIT_RE.search(str(message)):
+        return max(
+            float(getattr(config, "PUBLIC_REST_DEFAULT_BACKOFF_SECONDS", 300)),
+            1.0,
+        )
+
+    return 0.0
+
+
 def download_klines(symbol, interval, start_ms, end_ms, sleep_seconds):
     rows = []
     cursor = start_ms
@@ -178,6 +208,17 @@ def download_klines(symbol, interval, start_ms, end_ms, sleep_seconds):
         response = requests.get(BINANCE_FAPI_KLINES_URL, params=params, timeout=20)
 
         if response.status_code != 200:
+            backoff_seconds = extract_rate_limit_backoff_seconds(response.text)
+
+            if backoff_seconds > 0:
+                print(
+                    f"{symbol} {interval} Binance rate limit backoff | "
+                    f"sleep={round(backoff_seconds, 1)}s",
+                    flush=True,
+                )
+                time.sleep(backoff_seconds)
+                continue
+
             raise RuntimeError(
                 f"{symbol} {interval} download failed: "
                 f"{response.status_code} {response.text[:200]}"

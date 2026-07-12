@@ -16,8 +16,11 @@ from logger import log_info, log_warning, log_error
 client = Client(config.API_KEY, config.SECRET_KEY)
 _exchange_info_cache = None
 _last_kline_request_at = 0.0
+_public_rest_backoff_until = 0.0
+_public_rest_log_times = {}
 _public_request_weights = deque()
 _public_request_lock = threading.Lock()
+_public_rest_lock = threading.Lock()
 _kline_cache = {}
 _futures_context_cache = {}
 _private_rest_backoff_until = 0.0
@@ -41,6 +44,8 @@ client.timestamp_offset = server_time['serverTime'] - int(time.time() * 1000)
 
 def _throttle_kline_request():
     global _last_kline_request_at
+
+    _raise_if_public_rest_backoff("klines")
 
     delay = getattr(config, "REQUEST_THROTTLE_SECONDS", 0)
 
@@ -93,9 +98,119 @@ def _rate_limit_public_request(weight=1):
 
 
 def _futures_context_throttle():
+    _raise_if_public_rest_backoff("futures_context")
     _rate_limit_public_request(
         getattr(config, "FUTURES_CONTEXT_REQUEST_WEIGHT", 1)
     )
+
+
+def _public_rest_log_allowed(key):
+    now = time.time()
+    cooldown = max(
+        float(getattr(config, "PUBLIC_REST_LOG_COOLDOWN_SECONDS", 30)),
+        1.0
+    )
+
+    with _public_rest_lock:
+        last_logged_at = _public_rest_log_times.get(key, 0.0)
+
+        if now - last_logged_at < cooldown:
+            return False
+
+        _public_rest_log_times[key] = now
+        return True
+
+
+def _extract_public_rest_backoff_seconds(error):
+    message = str(error)
+    buffer_seconds = max(
+        float(getattr(config, "PUBLIC_REST_BACKOFF_BUFFER_SECONDS", 60)),
+        0.0
+    )
+    match = _BAN_UNTIL_RE.search(message)
+
+    if match:
+        try:
+            banned_until_ms = int(match.group(1))
+            banned_until_seconds = banned_until_ms / 1000
+            return max(
+                banned_until_seconds - time.time() + buffer_seconds,
+                buffer_seconds
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if _RATE_LIMIT_RE.search(message):
+        return max(
+            float(getattr(config, "PUBLIC_REST_DEFAULT_BACKOFF_SECONDS", 300)),
+            1.0
+        )
+
+    return 0.0
+
+
+def _set_public_rest_backoff(error, context):
+    global _public_rest_backoff_until
+
+    pause_seconds = _extract_public_rest_backoff_seconds(error)
+
+    if pause_seconds <= 0:
+        return
+
+    until = time.time() + pause_seconds
+
+    with _public_rest_lock:
+        _public_rest_backoff_until = max(_public_rest_backoff_until, until)
+
+    if _public_rest_log_allowed("public_rest_backoff_set"):
+        log_warning(
+            "Binance public REST backoff active | "
+            f"CALL={context} | PAUSE_SECONDS={round(pause_seconds, 1)} | "
+            f"ERROR={error}"
+        )
+
+
+def get_public_rest_backoff_remaining():
+    with _public_rest_lock:
+        return max(_public_rest_backoff_until - time.time(), 0.0)
+
+
+def is_public_rest_backoff_active():
+    return get_public_rest_backoff_remaining() > 0
+
+
+def _raise_if_public_rest_backoff(context):
+    remaining = get_public_rest_backoff_remaining()
+
+    if remaining <= 0:
+        return
+
+    if _public_rest_log_allowed(f"public_rest_backoff_skip:{context}"):
+        log_warning(
+            "Binance public REST call skipped during backoff | "
+            f"CALL={context} | WAIT_SECONDS={round(remaining, 1)}"
+        )
+
+    raise RuntimeError(
+        "Binance public REST backoff active | "
+        f"CALL={context} | WAIT_SECONDS={round(remaining, 1)}"
+    )
+
+
+def _is_public_rest_backoff_error(error):
+    return "Binance public REST backoff active" in str(error)
+
+
+def _public_rest_call(context, func, *args, weight=1, **kwargs):
+    _raise_if_public_rest_backoff(context)
+    _rate_limit_public_request(weight)
+
+    try:
+        return func(*args, **kwargs)
+
+    except Exception as e:
+        _set_public_rest_backoff(e, context)
+        raise
 
 
 def _private_rest_log_allowed(key):
@@ -486,8 +601,11 @@ def get_exchange_info():
     global _exchange_info_cache
 
     if _exchange_info_cache is None:
-        _rate_limit_public_request(1)
-        _exchange_info_cache = client.futures_exchange_info()
+        _exchange_info_cache = _public_rest_call(
+            "futures_exchange_info",
+            client.futures_exchange_info,
+            weight=1
+        )
 
     return _exchange_info_cache
 
@@ -592,6 +710,7 @@ def get_futures_participation(symbol):
         oi_hist = client.futures_open_interest_hist(**params)
         data["oi_change_pct"] = _change_pct(oi_hist, "sumOpenInterest")
     except Exception as e:
+        _set_public_rest_backoff(e, f"open_interest_hist:{symbol}")
         data["errors"].append(f"OI:{e}")
 
     try:
@@ -601,6 +720,7 @@ def get_futures_participation(symbol):
             taker.get("buySellRatio") if taker else None
         )
     except Exception as e:
+        _set_public_rest_backoff(e, f"taker_longshort_ratio:{symbol}")
         data["errors"].append(f"TAKER:{e}")
 
     try:
@@ -610,6 +730,7 @@ def get_futures_participation(symbol):
             global_ratio.get("longShortRatio") if global_ratio else None
         )
     except Exception as e:
+        _set_public_rest_backoff(e, f"global_longshort_ratio:{symbol}")
         data["errors"].append(f"GLOBAL_LS:{e}")
 
     try:
@@ -619,6 +740,7 @@ def get_futures_participation(symbol):
             top_ratio.get("longShortRatio") if top_ratio else None
         )
     except Exception as e:
+        _set_public_rest_backoff(e, f"top_longshort_ratio:{symbol}")
         data["errors"].append(f"TOP_LS:{e}")
 
     try:
@@ -626,6 +748,7 @@ def get_futures_participation(symbol):
         premium = client.futures_mark_price(symbol=symbol)
         data["funding_rate"] = _to_float(premium.get("lastFundingRate"))
     except Exception as e:
+        _set_public_rest_backoff(e, f"mark_price:{symbol}")
         data["errors"].append(f"FUNDING:{e}")
 
     usable_values = [
@@ -744,9 +867,19 @@ def get_unrealized_pnl():
 def get_mark_price(symbol):
 
     try:
-        return float(client.futures_mark_price(symbol=symbol)['markPrice'])
+        mark = _public_rest_call(
+            f"futures_mark_price:{symbol}",
+            client.futures_mark_price,
+            symbol=symbol,
+            weight=1
+        )
+        return float(mark['markPrice'])
 
     except Exception as e:
+        if _is_public_rest_backoff_error(e):
+            return None
+
+        _set_public_rest_backoff(e, f"futures_mark_price:{symbol}")
         log_error(f"{symbol} mark price error: {e}")
         return None
 
@@ -784,6 +917,10 @@ def get_klines(symbol, interval, limit=None):
         return df.copy(deep=True)
 
     except Exception as e:
+        if _is_public_rest_backoff_error(e):
+            return None
+
+        _set_public_rest_backoff(e, f"futures_klines:{symbol}:{interval}")
         log_error(f"{symbol} klines error: {e}")
         return None
 
