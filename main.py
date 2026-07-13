@@ -251,7 +251,13 @@ def get_adverse_reversal_frame(symbol, trend_df):
     return apply_indicators(safety_df)
 
 
-def check_live_entry_guard(symbol, side, current_price, mark_price=None):
+def check_live_entry_guard(
+    symbol,
+    side,
+    current_price,
+    mark_price=None,
+    require_both_override=None
+):
     if not config.LIVE_ENTRY_CONFIRMATION_ENABLED:
         return True, current_price, {"reason": "LIVE_ENTRY_GUARD_DISABLED"}
 
@@ -276,7 +282,8 @@ def check_live_entry_guard(symbol, side, current_price, mark_price=None):
         side,
         fast_guard_df,
         slow_guard_df,
-        mark_price
+        mark_price,
+        require_both_override=require_both_override
     )
 
     return guard_ok, current_price, guard_info
@@ -2047,6 +2054,14 @@ def calculate_signal_rank(candidate):
     rank += _safe_float(side_data.get("smc_score")) * config.SIGNAL_RANKING_SMC_WEIGHT
     rank += _safe_float(side_data.get("regime_score")) * config.SIGNAL_RANKING_REGIME_WEIGHT
 
+    if (side_data.get("trend_timing_rescue") or {}).get("active"):
+        rank -= max(
+            _safe_float(
+                getattr(config, "TREND_TIMING_RESCUE_RANK_PENALTY", 2.5)
+            ),
+            0
+        )
+
     news_action = str(news_context.get("action") or "").upper()
     llm_action = str(llm_context.get("action") or "").upper()
     risk_label = str(llm_context.get("risk_label") or "").lower()
@@ -2258,13 +2273,34 @@ def execute_entry_candidate(
             log_warning(limit_reason)
             return position_details, open_positions, False
 
+        side_analysis = final_analysis.get(signal.lower(), {})
+        timing_rescue = side_analysis.get("trend_timing_rescue") or {}
+        timing_rescue_active = bool(timing_rescue.get("active"))
+        require_both_live = (
+            timing_rescue_active and
+            bool(
+                getattr(
+                    config,
+                    "TREND_TIMING_RESCUE_REQUIRE_BOTH_LIVE_TIMEFRAMES",
+                    True
+                )
+            )
+        )
         current_price = entry_df["close"].iloc[-2]
+
+        if timing_rescue_active:
+            log_info(
+                f"{symbol} TREND TIMING RESCUE EXECUTION | "
+                f"MISSED={timing_rescue.get('missed_module')} | "
+                f"REQUIRE_BOTH_LIVE={require_both_live}"
+            )
 
         if config.LIVE_ENTRY_CONFIRMATION_ENABLED:
             guard_ok, current_price, guard_info = check_live_entry_guard(
                 symbol,
                 signal,
-                current_price
+                current_price,
+                require_both_override=True if require_both_live else None
             )
 
             if not guard_ok:
@@ -2291,7 +2327,6 @@ def execute_entry_candidate(
                 f"MARK={current_price} | {guard_info.get('reason')}"
             )
 
-        side_analysis = final_analysis.get(signal.lower(), {})
         min_room_override = None
 
         if side_analysis.get("confirmation_type") == "REVERSAL":

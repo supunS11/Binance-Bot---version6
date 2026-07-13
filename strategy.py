@@ -878,7 +878,13 @@ def _live_entry_timeframe_check(side, df, mark_price, label):
     }
 
 
-def validate_live_entry_guard(side, fast_df, slow_df, mark_price):
+def validate_live_entry_guard(
+    side,
+    fast_df,
+    slow_df,
+    mark_price,
+    require_both_override=None
+):
     if not config.LIVE_ENTRY_CONFIRMATION_ENABLED:
         return True, {"reason": "LIVE_ENTRY_GUARD_DISABLED"}
 
@@ -936,7 +942,13 @@ def validate_live_entry_guard(side, fast_df, slow_df, mark_price):
         }
 
     if getattr(config, "LIVE_ENTRY_REQUIRE_DIRECTION_SUPPORT", True):
-        require_both = bool(getattr(config, "LIVE_ENTRY_REQUIRE_BOTH_TIMEFRAMES", False))
+        require_both = (
+            bool(require_both_override)
+            if require_both_override is not None
+            else bool(
+                getattr(config, "LIVE_ENTRY_REQUIRE_BOTH_TIMEFRAMES", False)
+            )
+        )
 
         if opposition_count >= 2:
             return False, {
@@ -2066,6 +2078,7 @@ def _confirmation_score(side, confirm_df):
     quality["ema_gap"] = ema_gap
     quality["ema_gap_score"] = ema_gap_score
     quality["score"] = round(float(quality.get("score", 0)) + ema_gap_score, 2)
+    quality["direction_ok"] = bool(hard_ok)
     hard_ok = hard_ok and quality["quality_ok"]
 
     return round(score, 2), hard_ok, quality
@@ -2119,6 +2132,7 @@ def _entry_score(side, entry_df):
         max_ema_distance
     )
     score += quality_score
+    quality["direction_ok"] = bool(hard_ok)
     hard_ok = hard_ok and quality["quality_ok"] and late_entry_ok
     quality["late_entry_ok"] = late_entry_ok
     quality["hard_late_limit_atr"] = round(float(hard_late_limit), 2)
@@ -2245,6 +2259,185 @@ def _module_gates_check(
             failures.append(f"{label}={round(value, 2)} < {minimum}")
 
     return not failures, failures
+
+
+def _trend_timing_rescue_context(
+    trend_ok,
+    confirm_ok,
+    entry_ok,
+    level_ok,
+    trend_score,
+    confirm_score,
+    entry_score,
+    quality_score,
+    regime_score,
+    trend_confidence,
+    confirm_quality,
+    entry_quality,
+    participation_score,
+    participation,
+    futures_ok
+):
+    enabled = bool(getattr(config, "TREND_TIMING_RESCUE_ENABLED", True))
+    context = {
+        "enabled": enabled,
+        "eligible": False,
+        "active": False,
+        "missed_module": None,
+        "reasons": [],
+    }
+
+    if not enabled:
+        context["reasons"].append("TREND_TIMING_RESCUE_DISABLED")
+        return context
+
+    tolerance = max(
+        get_config_float("TREND_TIMING_RESCUE_SCORE_TOLERANCE", 0.5),
+        0
+    )
+    min_confidence = get_config_float(
+        "TREND_TIMING_RESCUE_MIN_CONFIDENCE",
+        78
+    )
+    min_quality = get_config_float(
+        "TREND_TIMING_RESCUE_MIN_QUALITY_SCORE",
+        1.0
+    )
+    min_regime = get_config_float(
+        "TREND_TIMING_RESCUE_MIN_REGIME_SCORE",
+        -1.25
+    )
+    timing_misses = set()
+    reasons = []
+
+    if not getattr(config, "LIVE_ENTRY_CONFIRMATION_ENABLED", True):
+        reasons.append("LIVE_ENTRY_GUARD_REQUIRED")
+
+    if not getattr(config, "LIVE_ENTRY_REQUIRE_DIRECTION_SUPPORT", True):
+        reasons.append("LIVE_DIRECTION_SUPPORT_REQUIRED")
+
+    if not trend_ok:
+        reasons.append("DAILY_TREND_HARD_CHECK_FAILED")
+
+    if not level_ok:
+        reasons.append("ADVERSE_LEVEL_CHECK_FAILED")
+
+    trend_min = get_config_float("SIGNAL_MIN_TREND_SCORE", 7.5)
+
+    if _safe_float(trend_score) < trend_min:
+        reasons.append(
+            f"TREND={round(_safe_float(trend_score), 2)} < {trend_min}"
+        )
+
+    if _safe_float(trend_confidence) < min_confidence:
+        reasons.append(
+            f"CONFIDENCE={round(_safe_float(trend_confidence), 2)} "
+            f"< {min_confidence}"
+        )
+
+    if _safe_float(quality_score) < min_quality:
+        reasons.append(
+            f"QUALITY={round(_safe_float(quality_score), 2)} < {min_quality}"
+        )
+
+    if _safe_float(regime_score) < min_regime:
+        reasons.append(
+            f"REGIME={round(_safe_float(regime_score), 2)} < {min_regime}"
+        )
+
+    if not bool(entry_quality.get("late_entry_ok", True)):
+        reasons.append("LATE_ENTRY_HARD_BLOCK")
+
+    timing_checks = (
+        (
+            "CONFIRM",
+            confirm_ok,
+            bool(confirm_quality.get("direction_ok")),
+            _safe_float(confirm_score),
+            get_config_float("SIGNAL_MIN_CONFIRM_SCORE", 7.0),
+        ),
+        (
+            "ENTRY",
+            entry_ok,
+            bool(entry_quality.get("direction_ok")),
+            _safe_float(entry_score),
+            get_config_float("SIGNAL_MIN_ENTRY_SCORE", 4.0),
+        ),
+    )
+
+    for label, hard_ok, direction_ok, score, minimum in timing_checks:
+        if score < minimum:
+            if minimum - score <= tolerance:
+                timing_misses.add(label)
+            else:
+                reasons.append(
+                    f"{label}={round(score, 2)} < "
+                    f"{round(minimum - tolerance, 2)} RESCUE_FLOOR"
+                )
+
+        if not hard_ok:
+            if direction_ok:
+                timing_misses.add(label)
+            else:
+                reasons.append(f"{label}_DIRECTION_HARD_CHECK_FAILED")
+
+    if len(timing_misses) != 1:
+        reasons.append(
+            f"TIMING_MISSES={len(timing_misses)} REQUIRED=1"
+        )
+
+    eligible = not reasons and len(timing_misses) == 1
+    participation_available = bool(
+        participation and participation.get("available")
+    )
+    require_futures = bool(
+        getattr(config, "TREND_TIMING_RESCUE_REQUIRE_FUTURES", True)
+    )
+    min_futures = get_config_float(
+        "TREND_TIMING_RESCUE_MIN_FUTURES_SCORE",
+        0
+    )
+    futures_score = _safe_float(participation_score)
+    futures_supports = futures_ok and futures_score >= min_futures
+    active = eligible
+
+    if require_futures:
+        if not participation_available:
+            active = False
+            reasons.append("FUTURES_CONTEXT_REQUIRED")
+        elif not futures_supports:
+            active = False
+            reasons.append(
+                f"FUTURES_SCORE={round(futures_score, 2)} < {min_futures}"
+            )
+    elif participation_available and not futures_supports:
+        active = False
+        reasons.append(
+            f"FUTURES_SCORE={round(futures_score, 2)} < {min_futures}"
+        )
+
+    context.update({
+        "eligible": eligible,
+        "active": active,
+        "missed_module": next(iter(timing_misses), None),
+        "reasons": reasons,
+        "score_tolerance": tolerance,
+        "min_confidence": min_confidence,
+        "min_quality_score": min_quality,
+        "participation_available": participation_available,
+        "futures_score": round(futures_score, 2),
+        "min_futures_score": min_futures,
+        "reason": (
+            "TREND_TIMING_RESCUE_ACTIVE"
+            if active
+            else (
+                "TREND_TIMING_RESCUE_AWAITING_FUTURES"
+                if eligible and not participation_available
+                else "TREND_TIMING_RESCUE_BLOCKED"
+            )
+        ),
+    })
+    return context
 
 
 def _counter_trend_context(side, trend_df, confirm_df):
@@ -3246,13 +3439,34 @@ def _side_signal_score(
         score,
         get_config_float("REVERSAL_CONFIDENCE_MAX_SCORE", 34)
     )
-    trend_following_ok = (
+    normal_trend_following_ok = (
         trend_ok and
         confirm_ok and
         entry_ok and
         level_ok and
         module_gates_ok and
         futures_ok
+    )
+    trend_timing_rescue = _trend_timing_rescue_context(
+        trend_ok,
+        confirm_ok,
+        entry_ok,
+        level_ok,
+        trend_score,
+        confirm_score,
+        entry_score,
+        quality_score,
+        regime_score,
+        trend_confidence,
+        confirm_quality,
+        entry_quality,
+        participation_score,
+        participation,
+        futures_ok
+    )
+    trend_following_ok = (
+        normal_trend_following_ok or
+        trend_timing_rescue.get("active", False)
     )
     reversal_ok, reversal_reasons, reversal_context = _reversal_signal_check(
         side,
@@ -3312,6 +3526,8 @@ def _side_signal_score(
         "futures_context_ok": futures_ok,
         "futures_gate_reasons": futures_gate_reasons,
         "trend_following_ok": trend_following_ok,
+        "normal_trend_following_ok": normal_trend_following_ok,
+        "trend_timing_rescue": trend_timing_rescue,
         "reversal_ok": reversal_ok,
         "reversal_confirmed": reversal_confirmed,
         "reversal_reasons": reversal_reasons,
@@ -3430,6 +3646,25 @@ def log_signal_analysis(analysis):
     )
 
     for side_data in (buy, sell):
+        rescue = side_data.get("trend_timing_rescue") or {}
+
+        if rescue.get("active"):
+            log_info(
+                f"{side_data.get('side')} TREND TIMING RESCUE ACTIVE | "
+                f"MISSED={rescue.get('missed_module')} | "
+                f"CONFIDENCE={side_data.get('trend_confidence')} | "
+                f"FUTURES={rescue.get('futures_score')}"
+            )
+        elif (
+            rescue.get("reason") ==
+            "TREND_TIMING_RESCUE_AWAITING_FUTURES"
+        ):
+            log_info(
+                f"{side_data.get('side')} TREND TIMING RESCUE WAITING | "
+                f"MISSED={rescue.get('missed_module')} | "
+                f"REASON={rescue.get('reason')}"
+            )
+
         exhaustion = side_data.get("trend_exhaustion") or {}
 
         if exhaustion.get("blocked"):
@@ -3633,6 +3868,15 @@ def should_fetch_futures_context(analysis):
 
     buy = analysis.get("buy", {})
     sell = analysis.get("sell", {})
+
+    if any(
+        (side_data.get("trend_timing_rescue") or {}).get("eligible")
+        and not (side_data.get("trend_timing_rescue") or {}).get(
+            "participation_available"
+        )
+        for side_data in (buy, sell)
+    ):
+        return True
 
     if any(
         (side_data.get("reversal_warning") or {}).get("active")

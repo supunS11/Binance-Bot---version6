@@ -426,6 +426,7 @@ def _compact_quality(side_data):
 
 def _compact_side(side_data):
     side_data = side_data or {}
+    timing_rescue = side_data.get("trend_timing_rescue") or {}
 
     return {
         "side": side_data.get("side") or "",
@@ -438,6 +439,14 @@ def _compact_side(side_data):
         "trend_ok": _safe_bool(side_data.get("trend_ok")),
         "confirm_ok": _safe_bool(side_data.get("confirm_ok")),
         "entry_ok": _safe_bool(side_data.get("entry_ok")),
+        "trend_timing_rescue": {
+            "active": _safe_bool(timing_rescue.get("active")),
+            "missed_module": timing_rescue.get("missed_module") or "",
+            "futures_score": _round_value(
+                timing_rescue.get("futures_score"),
+                2
+            ),
+        },
         "level": _compact_level(side_data),
         "quality": _compact_quality(side_data),
         "scores": {
