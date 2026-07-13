@@ -122,6 +122,25 @@ def parse_symbols(value):
     return result
 
 
+def parse_confirmation_types(value):
+    if not value:
+        values = getattr(config, "BACKTEST_CONFIRMATION_TYPES", [])
+    elif isinstance(value, str):
+        values = [item.strip() for item in value.split(",") if item.strip()]
+    else:
+        values = list(value)
+
+    result = []
+
+    for item in values:
+        confirmation_type = str(item).upper().strip()
+
+        if confirmation_type and confirmation_type not in result:
+            result.append(confirmation_type)
+
+    return result
+
+
 def data_path(data_dir, symbol, interval):
     return Path(data_dir) / f"{symbol}_{interval}.csv"
 
@@ -370,6 +389,91 @@ def roi_to_price(side, entry_price, roi):
     return entry_price * (1 - move)
 
 
+def roi_stop_loss_price(side, entry_price, roi):
+    move = (float(roi) / max(float(config.LEVERAGE), 1)) / 100
+
+    if side == "BUY":
+        return entry_price * (1 - move)
+
+    return entry_price * (1 + move)
+
+
+def stop_loss_enabled(confirmation_type):
+    confirmation_type = str(confirmation_type or "").upper()
+
+    if confirmation_type == "REVERSAL":
+        return bool(getattr(config, "REVERSAL_SL_ENABLED", config.SL_ENABLED))
+
+    if confirmation_type == "TREND":
+        return bool(getattr(config, "TREND_SL_ENABLED", config.SL_ENABLED))
+
+    return bool(getattr(config, "SL_ENABLED", False))
+
+
+def max_sl_roi(confirmation_type):
+    confirmation_type = str(confirmation_type or "").upper()
+
+    if confirmation_type == "REVERSAL":
+        return float(getattr(config, "REVERSAL_MAX_SL_ROI", config.MAX_SL_ROI))
+
+    return float(getattr(config, "TREND_MAX_SL_ROI", config.MAX_SL_ROI))
+
+
+def structure_stop_loss_price(side, confirm_df):
+    try:
+        if confirm_df is None or len(confirm_df) < 12:
+            return None
+
+        atr = float(confirm_df["atr"].iloc[-1])
+
+        if atr <= 0:
+            return None
+
+        if side == "BUY":
+            return float(confirm_df["low"].iloc[-10:-1].min()) - (atr * 0.5)
+
+        return float(confirm_df["high"].iloc[-10:-1].max()) + (atr * 0.5)
+
+    except Exception:
+        return None
+
+
+def compute_stop_loss(side, avg_entry, confirm_df, confirmation_type):
+    if not stop_loss_enabled(confirmation_type):
+        return None, "SL_DISABLED"
+
+    structure_sl = structure_stop_loss_price(side, confirm_df)
+    cap_roi = max_sl_roi(confirmation_type)
+    capped_sl = roi_stop_loss_price(side, avg_entry, cap_roi) if cap_roi > 0 else None
+
+    if structure_sl is None:
+        return capped_sl, f"ROI_SL_{cap_roi}%"
+
+    if capped_sl is None:
+        return structure_sl, "STRUCTURE_SL"
+
+    if side == "BUY":
+        if structure_sl >= avg_entry:
+            return capped_sl, f"ROI_SL_{cap_roi}%"
+
+        return max(structure_sl, capped_sl), f"STRUCTURE_SL_CAPPED_{cap_roi}%"
+
+    if structure_sl <= avg_entry:
+        return capped_sl, f"ROI_SL_{cap_roi}%"
+
+    return min(structure_sl, capped_sl), f"STRUCTURE_SL_CAPPED_{cap_roi}%"
+
+
+def candle_hits_sl(side, candle, sl_price):
+    if sl_price is None:
+        return False
+
+    if side == "BUY":
+        return float(candle["low"]) <= sl_price
+
+    return float(candle["high"]) >= sl_price
+
+
 def apply_entry_slippage(side, price):
     slip = float(getattr(config, "BACKTEST_SLIPPAGE_PCT", 0.02)) / 100
 
@@ -548,6 +652,12 @@ def simulate_trade(
         decision_trend,
         decision_confirm,
     )
+    sl_price, sl_mode = compute_stop_loss(
+        side,
+        avg_entry,
+        decision_confirm,
+        confirmation_type,
+    )
     max_seen_adverse_roi = 0.0
     exit_candle = None
     exit_reason = "OPEN_AT_DATA_END"
@@ -658,6 +768,12 @@ def simulate_trade(
                         confirm_slice,
                         dca_context=True,
                     )
+                    sl_price, sl_mode = compute_stop_loss(
+                        side,
+                        avg_entry,
+                        confirm_slice,
+                        confirmation_type,
+                    )
 
         adverse_price = float(candle["low"]) if side == "BUY" else float(candle["high"])
         adverse_roi = abs(
@@ -666,6 +782,12 @@ def simulate_trade(
             else ((adverse_price - avg_entry) / avg_entry) * float(config.LEVERAGE) * 100
         )
         max_seen_adverse_roi = max(max_seen_adverse_roi, adverse_roi)
+
+        if candle_hits_sl(side, candle, sl_price):
+            exit_price = apply_exit_slippage(side, sl_price)
+            exit_candle = candle
+            exit_reason = "SL"
+            break
 
         if candle_hits_tp(side, candle, tp_price):
             exit_price = apply_exit_slippage(side, tp_price)
@@ -701,6 +823,8 @@ def simulate_trade(
         "exit_price": round(float(exit_price), 8),
         "tp_price": round(float(tp_price), 8),
         "tp_mode": tp_mode,
+        "sl_price": round(float(sl_price), 8) if sl_price is not None else "",
+        "sl_mode": sl_mode,
         "exit_reason": exit_reason,
         "dca_count": dca_count,
         "fill_count": len(fills),
@@ -749,7 +873,14 @@ def passes_pre_entry_filters(signal, current_price, trend_df, confirm_df, side_a
     return True, "OK", level_info
 
 
-def generate_symbol_trades(symbol, frames, btc_frames, start_ms, end_ms):
+def generate_symbol_trades(
+    symbol,
+    frames,
+    btc_frames,
+    start_ms,
+    end_ms,
+    allowed_confirmation_types=None,
+):
     trades = []
     entry_df = frames["entry"].indicators
     trend_df = frames["trend"].indicators
@@ -817,6 +948,16 @@ def generate_symbol_trades(symbol, frames, btc_frames, start_ms, end_ms):
             continue
 
         side_analysis = analysis.get(signal.lower(), {})
+        confirmation_type = str(
+            side_analysis.get("confirmation_type", "UNKNOWN")
+        ).upper()
+
+        if (
+            allowed_confirmation_types
+            and confirmation_type not in allowed_confirmation_types
+        ):
+            continue
+
         current_price = float(row.open)
         filters_ok, reason, _ = passes_pre_entry_filters(
             signal,
@@ -832,7 +973,7 @@ def generate_symbol_trades(symbol, frames, btc_frames, start_ms, end_ms):
         trade = simulate_trade(
             symbol,
             signal,
-            side_analysis.get("confirmation_type", "UNKNOWN"),
+            confirmation_type,
             side_analysis.get("confidence", 0),
             decision_ms,
             current_price,
@@ -846,24 +987,45 @@ def generate_symbol_trades(symbol, frames, btc_frames, start_ms, end_ms):
     return trades
 
 
+def backtest_position_pool(trade):
+    confirmation_type = str(
+        trade.get("confirmation_type") or "TREND"
+    ).upper()
+    return "REVERSAL" if confirmation_type == "REVERSAL" else "TREND"
+
+
+def backtest_position_limits(pool):
+    if pool == "REVERSAL":
+        return (
+            getattr(config, "REVERSAL_EXTRA_TOTAL_POSITIONS", 0),
+            getattr(config, "REVERSAL_EXTRA_BUY_POSITIONS", 0),
+            getattr(config, "REVERSAL_EXTRA_SELL_POSITIONS", 0),
+        )
+
+    return (
+        config.MAX_TOTAL_POSITIONS,
+        config.MAX_BUY_POSITIONS,
+        config.MAX_SELL_POSITIONS,
+    )
+
+
 def apply_position_limits(trades):
     if not getattr(config, "BACKTEST_APPLY_POSITION_LIMITS", True):
-        return trades, 0
-
-    max_total = config.MAX_TOTAL_POSITIONS
-    max_buy = config.MAX_BUY_POSITIONS
-    max_sell = config.MAX_SELL_POSITIONS
-
-    if max_total is None and max_buy is None and max_sell is None:
         return trades, 0
 
     accepted = []
     skipped = 0
 
     for trade in sorted(trades, key=lambda item: item["entry_ms"]):
+        pool = backtest_position_pool(trade)
+        max_total, max_buy, max_sell = backtest_position_limits(pool)
+
         open_trades = [
             item for item in accepted
-            if item["entry_ms"] <= trade["entry_ms"] < item["exit_ms"]
+            if (
+                item["entry_ms"] <= trade["entry_ms"] < item["exit_ms"]
+                and backtest_position_pool(item) == pool
+            )
         ]
         total_count = len(open_trades)
         buy_count = sum(1 for item in open_trades if item["side"] == "BUY")
@@ -950,7 +1112,7 @@ def summarise_trades(trades, skipped_by_limits):
         "notes": [
             "Backtest uses historical OHLCV candles and simulated fills.",
             "News, LLM, realtime websocket confirmation, order-book flow, and private account state are not replayed.",
-            "Intracandle order is conservative: DCA checks are processed before TP checks inside the same candle.",
+            "Intracandle order is conservative: DCA, SL, then TP are evaluated inside the same candle.",
         ],
         "equity_curve": equity_curve,
     }
@@ -1080,6 +1242,11 @@ def build_arg_parser():
     parser.add_argument("--exit-timeframe", default="")
     parser.add_argument("--slice-max-rows", type=int, default=None)
     parser.add_argument(
+        "--confirmation-types",
+        default="",
+        help="Comma-separated confirmation types to include, e.g. TREND or REVERSAL.",
+    )
+    parser.add_argument(
         "--no-btc-context",
         action="store_true",
         default=not bool(getattr(config, "BACKTEST_USE_BTC_CONTEXT", True)),
@@ -1113,6 +1280,10 @@ def apply_runtime_options(args):
     if args.no_btc_context:
         config.BACKTEST_USE_BTC_CONTEXT = False
 
+    config.BACKTEST_CONFIRMATION_TYPES = parse_confirmation_types(
+        args.confirmation_types
+    )
+
 
 def run_backtest(args):
     apply_runtime_options(args)
@@ -1123,12 +1294,16 @@ def run_backtest(args):
         raise ValueError("Backtest end time must be after start time")
 
     symbols = parse_symbols(args.symbols)
+    allowed_confirmation_types = parse_confirmation_types(
+        getattr(config, "BACKTEST_CONFIRMATION_TYPES", [])
+    )
     print(
         "Backtest settings | "
         f"STEP={getattr(config, 'BACKTEST_SIGNAL_STEP_CANDLES', 4)} | "
         f"EXIT_TF={getattr(config, 'BACKTEST_EXIT_TIMEFRAME', config.ENTRY_TIMEFRAME)} | "
         f"SLICE_ROWS={getattr(config, 'BACKTEST_SLICE_MAX_ROWS', 0)} | "
-        f"BTC_CONTEXT={getattr(config, 'BACKTEST_USE_BTC_CONTEXT', True)}",
+        f"BTC_CONTEXT={getattr(config, 'BACKTEST_USE_BTC_CONTEXT', True)} | "
+        f"CONFIRMATION_TYPES={','.join(allowed_confirmation_types) if allowed_confirmation_types else 'ALL'}",
         flush=True,
     )
 
@@ -1155,6 +1330,7 @@ def run_backtest(args):
                 btc_frames,
                 start_ms,
                 end_ms,
+                allowed_confirmation_types=allowed_confirmation_types,
             )
             all_trades.extend(trades)
             print(f"{symbol}: {len(trades)} simulated trades")
@@ -1177,6 +1353,32 @@ def run_backtest(args):
             "slice_max_rows": int(getattr(config, "BACKTEST_SLICE_MAX_ROWS", 0) or 0),
             "use_btc_context": bool(getattr(config, "BACKTEST_USE_BTC_CONTEXT", True)),
             "use_dca": bool(getattr(config, "BACKTEST_USE_DCA", False)),
+            "trend_sl_enabled": bool(
+                getattr(config, "TREND_SL_ENABLED", getattr(config, "SL_ENABLED", False))
+            ),
+            "reversal_sl_enabled": bool(
+                getattr(config, "REVERSAL_SL_ENABLED", getattr(config, "SL_ENABLED", False))
+            ),
+            "trend_max_sl_roi": float(
+                getattr(config, "TREND_MAX_SL_ROI", getattr(config, "MAX_SL_ROI", 0))
+            ),
+            "reversal_max_sl_roi": float(
+                getattr(config, "REVERSAL_MAX_SL_ROI", getattr(config, "MAX_SL_ROI", 0))
+            ),
+            "reversal_entry_enabled": bool(
+                getattr(config, "REVERSAL_ENTRY_ENABLED", True)
+            ),
+            "trend_exhaustion_guard_enabled": bool(
+                getattr(config, "TREND_EXHAUSTION_GUARD_ENABLED", True)
+            ),
+            "trend_exhaustion_min_warning_points": float(
+                getattr(config, "TREND_EXHAUSTION_MIN_WARNING_POINTS", 4)
+            ),
+            "confirmation_types": (
+                allowed_confirmation_types
+                if allowed_confirmation_types
+                else ["ALL"]
+            ),
         },
     })
     symbol_summary = summarise_by_symbol(accepted_trades)

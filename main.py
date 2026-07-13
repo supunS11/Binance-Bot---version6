@@ -44,7 +44,11 @@ from strategy import (
 )
 from risk_management import calculate_position_size
 from signal_journal import append_signal_journal
-from llm_service import apply_llm_filter, begin_llm_scan_budget
+from llm_service import (
+    apply_llm_filter,
+    begin_llm_scan_budget,
+    prefetch_llm_candidate_reviews,
+)
 from news_service import apply_news_filter
 from telegram_service import (
     send_order_opened_message,
@@ -509,6 +513,7 @@ def place_tp_sl_with_recovery(
     structure_tp=None,
     roi_override=None,
     roi_mode_label=None,
+    signal_type=None,
     context_label="ENTRY",
     return_details=True
 ):
@@ -525,6 +530,7 @@ def place_tp_sl_with_recovery(
             structure_tp=structure_tp,
             roi_override=roi_override,
             roi_mode_label=roi_mode_label,
+            signal_type=signal_type,
             return_details=True
         )
         last_result = result or {}
@@ -565,6 +571,7 @@ def place_tp_sl_with_recovery(
             structure_tp=None,
             roi_override=fallback_roi,
             roi_mode_label=f"TP_RECOVERY_ROI_{fallback_roi}%",
+            signal_type=signal_type,
             return_details=True
         )
         last_result = fallback_result or last_result
@@ -1000,6 +1007,10 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
                 total_quantity,
                 confirm_df,
                 structure_tp=structure_tp,
+                signal_type=(
+                    position_state.get("confirmation_type") or
+                    position_state.get("signal_type")
+                ),
                 context_label="LEGACY_DCA",
                 return_details=False
             )
@@ -1351,6 +1362,10 @@ def manage_dca_position(
                     f"DCA_ROI_{dca_tp_roi}%"
                     if dca_tp_roi is not None
                     else None
+                ),
+                signal_type=(
+                    position_state.get("confirmation_type") or
+                    position_state.get("signal_type")
                 ),
                 context_label=f"DCA_LEVEL_{dca_count + 1}",
                 return_details=True
@@ -2384,7 +2399,9 @@ def execute_entry_candidate(
             btc_trend=btc_trend,
             btc_corr=btc_corr,
             rs=rs,
-            news_context=news_context
+            news_context=news_context,
+            prefetched_review=candidate.get("llm_prefetched_review"),
+            prefetched_source=candidate.get("llm_prefetched_source", "")
         )
         signal = final_analysis["signal"]
 
@@ -2502,6 +2519,7 @@ def execute_entry_candidate(
             quantity,
             confirm_df,
             structure_tp=structure_tp,
+            signal_type=signal_type,
             context_label="ENTRY",
             return_details=True
         )
@@ -2556,7 +2574,8 @@ def execute_entry_candidate(
             f"ADVERSE ROI TO LEVEL: {adverse_roi}%\n"
             f"SAFETY ROI LIMIT: {max_adverse_roi}%\n"
             f"SAFETY TIMEFRAME: {safety_timeframe}\n"
-            f"SL: {'ENABLED' if config.SL_ENABLED else 'DISABLED'}\n"
+            f"SL: {'ENABLED' if protection_result.get('sl_enabled') else 'DISABLED'} "
+            f"({signal_type or 'UNKNOWN'})\n"
             f"BALANCE: {balance}\n"
         )
         send_order_opened_message(
@@ -2616,6 +2635,7 @@ def process_ranked_entry_candidates(
         ranked = ranked[:config.SIGNAL_RANKING_MAX_CANDIDATES]
 
     log_info(f"SIGNAL RANKING | CANDIDATES={len(ranked)}")
+    prefetch_llm_candidate_reviews(ranked)
 
     for index, candidate in enumerate(ranked, start=1):
         if shutdown_event.is_set():
@@ -2759,6 +2779,14 @@ def run_bot():
                         signal = final_analysis["signal"]
 
                         if not signal:
+                            exhaustion_blocked = bool(
+                                final_analysis.get("trend_exhaustion_blocked")
+                            )
+                            no_signal_reason = (
+                                "TREND_EXHAUSTION_GUARD"
+                                if exhaustion_blocked
+                                else "NO_FINAL_SIGNAL"
+                            )
                             append_signal_journal(
                                 symbol,
                                 final_analysis,
@@ -2770,10 +2798,10 @@ def run_bot():
                                 btc_corr,
                                 rs,
                                 action="NO_SIGNAL",
-                                skip_reason="NO_FINAL_SIGNAL"
+                                skip_reason=no_signal_reason
                             )
                             log_warning(
-                                f"{symbol} NO SIGNAL | "
+                                f"{symbol} NO SIGNAL | REASON={no_signal_reason} | "
                                 f"BTC={btc_trend} | CORR={btc_corr} | RS={rs}"
                             )
                             continue

@@ -1,0 +1,77 @@
+{
+  "initial_balance": 1000.0,
+  "final_balance": 979.3716,
+  "net_pnl": -20.6284,
+  "net_return_pct": -2.06,
+  "total_trades": 7,
+  "wins": 4,
+  "losses": 3,
+  "win_rate_pct": 57.14,
+  "profit_factor": 0.111,
+  "gross_profit": 2.5707,
+  "gross_loss": 23.1991,
+  "max_drawdown_pct": 2.23,
+  "avg_roi_on_margin_pct": -67.2,
+  "avg_duration_hours": 121.29,
+  "dca_trades": 2,
+  "skipped_by_position_limits": 0,
+  "notes": [
+    "Backtest uses historical OHLCV candles and simulated fills.",
+    "News, LLM, realtime websocket confirmation, order-book flow, and private account state are not replayed.",
+    "Intracandle order is conservative: DCA checks are processed before TP checks inside the same candle."
+  ],
+  "equity_curve": [
+    {
+      "time": "2026-03-03T05:59:59.999000+00:00",
+      "equity": 1000.4101,
+      "drawdown_pct": 0.0
+    },
+    {
+      "time": "2026-03-31T09:59:59.999000+00:00",
+      "equity": 1000.796,
+      "drawdown_pct": 0.0
+    },
+    {
+      "time": "2026-04-12T01:59:59.999000+00:00",
+      "equity": 1001.7128,
+      "drawdown_pct": 0.0
+    },
+    {
+      "time": "2026-04-22T16:59:59.999000+00:00",
+      "equity": 993.9187,
+      "drawdown_pct": 0.78
+    },
+    {
+      "time": "2026-05-14T12:59:59.999000+00:00",
+      "equity": 993.1601,
+      "drawdown_pct": 0.85
+    },
+    {
+      "time": "2026-05-16T07:59:59.999000+00:00",
+      "equity": 994.018,
+      "drawdown_pct": 0.77
+    },
+    {
+      "time": "2026-06-28T20:59:59.999000+00:00",
+      "equity": 979.3716,
+      "drawdown_pct": 2.23
+    }
+  ],
+  "symbols": [
+    "XLMUSDT"
+  ],
+  "start": "2026-03-01T00:00:00+00:00",
+  "end": "2026-07-01T00:00:00+00:00",
+  "failed_symbols": {},
+  "generated_trades_before_position_limits": 7,
+  "settings": {
+    "signal_step_candles": 4,
+    "exit_timeframe": "1h",
+    "slice_max_rows": 420,
+    "use_btc_context": true,
+    "use_dca": true,
+    "confirmation_types": [
+      "TREND"
+    ]
+  }
+}

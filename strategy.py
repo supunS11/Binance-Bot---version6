@@ -2841,6 +2841,73 @@ def _reversal_signal_check(
             regime_min
         )
 
+    recovery_score = _safe_float(invalidation.get("recovery_score", 0))
+    pressure_score = _safe_float(invalidation.get("pressure_score", 0))
+    required_recovery = _safe_float(
+        invalidation.get(
+            "required_recovery",
+            get_config_float("REVERSAL_RECOVERY_MIN_SCORE", 3.25)
+        )
+    )
+    confirmation_items = {
+        "counter_trend": bool(counter_ok),
+        "smc": bool(smc_ok),
+        "momentum": bool(momentum_ok),
+        "recovery": recovery_score >= required_recovery,
+        "confirm_score": _safe_float(confirm_score) >= confirm_min,
+        "entry_score": _safe_float(entry_score) >= entry_min,
+        "quality_score": _safe_float(quality_score) >= quality_min,
+        "level": bool(level_ok),
+    }
+    confirmation_points = sum(
+        1 for ok in confirmation_items.values() if ok
+    )
+    min_confirmation_points = get_config_float(
+        "REVERSAL_MIN_CONFIRMATION_POINTS",
+        5
+    )
+
+    if pressure_score >= get_config_float(
+        "REVERSAL_CONFIRMATION_STRONG_PRESSURE_SCORE",
+        5.0
+    ):
+        min_confirmation_points = max(
+            min_confirmation_points,
+            get_config_float(
+                "REVERSAL_STRONG_PRESSURE_MIN_CONFIRMATION_POINTS",
+                6
+            )
+        )
+
+    context["extra_confirmation"] = {
+        "enabled": bool(getattr(config, "REVERSAL_EXTRA_CONFIRMATION_ENABLED", True)),
+        "items": confirmation_items,
+        "points": confirmation_points,
+        "required": min_confirmation_points,
+        "pressure_score": pressure_score,
+        "recovery_score": recovery_score,
+        "required_recovery": required_recovery,
+    }
+
+    if (
+        getattr(config, "REVERSAL_REQUIRE_MOMENTUM_OR_RECOVERY", True)
+        and not momentum_ok
+        and recovery_score < required_recovery
+    ):
+        failures.append(
+            f"REVERSAL_MOMENTUM_OR_RECOVERY_MISSING "
+            f"RECOVERY={recovery_score} REQUIRED={required_recovery}"
+        )
+
+    if (
+        getattr(config, "REVERSAL_EXTRA_CONFIRMATION_ENABLED", True)
+        and confirmation_points < min_confirmation_points
+    ):
+        failures.append(
+            f"REVERSAL_CONFIRMATIONS_LOW "
+            f"POINTS={confirmation_points} REQUIRED={min_confirmation_points}"
+        )
+
     checks = (
         (
             "CONFIDENCE",
@@ -2902,6 +2969,209 @@ def _reversal_signal_check(
         failures.append(invalidation.get("reason", "REVERSAL_INVALIDATED"))
 
     return not failures, failures, context
+
+
+def _refresh_side_decision(side_data):
+    trend_ok = bool(side_data.get("trend_following_ok"))
+    reversal_ok = bool(side_data.get("reversal_ok"))
+    side_data["hard_ok"] = trend_ok or reversal_ok
+
+    if trend_ok:
+        side_data["confirmation_type"] = "TREND"
+        side_data["confidence"] = side_data.get("trend_confidence", 0)
+    elif reversal_ok:
+        side_data["confirmation_type"] = "REVERSAL"
+        side_data["confidence"] = side_data.get("reversal_confidence", 0)
+    else:
+        side_data["confirmation_type"] = "NONE"
+        side_data["confidence"] = side_data.get("trend_confidence", 0)
+
+    return side_data
+
+
+def _reversal_warning_context(side_data):
+    enabled = bool(getattr(config, "TREND_EXHAUSTION_GUARD_ENABLED", True))
+    context = {
+        "enabled": enabled,
+        "active": False,
+        "stage": "NONE",
+        "side": side_data.get("side"),
+        "items": {},
+        "points": 0,
+        "required": 0,
+        "reasons": [],
+    }
+
+    if not enabled:
+        context["reasons"].append("TREND_EXHAUSTION_GUARD_DISABLED")
+        return context
+
+    reversal_context = side_data.get("reversal_context") or {}
+    extra = reversal_context.get("extra_confirmation") or {}
+    invalidation = reversal_context.get("invalidation") or {}
+    counter_ok = (
+        reversal_context.get("counter_trend", {}).get("count", 0) >= 2
+    )
+    smc_ok = bool(extra.get("items", {}).get("smc"))
+    momentum_ok = bool(extra.get("items", {}).get("momentum"))
+    recovery_score = _safe_float(invalidation.get("recovery_score", 0))
+    pressure_score = _safe_float(invalidation.get("pressure_score", 0))
+    recovery_ok = recovery_score >= get_config_float(
+        "TREND_EXHAUSTION_MIN_RECOVERY_SCORE",
+        2.5
+    )
+    futures_score = _safe_float(side_data.get("participation_score", 0))
+    futures_available = bool(side_data.get("participation_available"))
+    futures_support = (
+        futures_available and
+        futures_score >= get_config_float(
+            "TREND_EXHAUSTION_FUTURES_SUPPORT_SCORE",
+            0.5
+        )
+    )
+    futures_conflict = (
+        futures_available and
+        futures_score < get_config_float(
+            "FUTURES_CONTEXT_MIN_SIGNAL_SCORE",
+            -0.5
+        )
+    )
+    warning_items = {
+        "smc": smc_ok,
+        "momentum": momentum_ok,
+        "recovery": recovery_ok,
+        "confirm_score": _safe_float(side_data.get("confirm_score")) >= get_config_float(
+            "REVERSAL_MOMENTUM_MIN_CONFIRM_SCORE",
+            5
+        ),
+        "entry_score": _safe_float(side_data.get("entry_score")) >= get_config_float(
+            "REVERSAL_MOMENTUM_MIN_ENTRY_SCORE",
+            4
+        ),
+        "quality_score": _safe_float(side_data.get("quality_score")) >= get_config_float(
+            "SIGNAL_MIN_QUALITY_SCORE",
+            0.25
+        ),
+        "level": bool(side_data.get("level_ok")),
+        "futures": futures_support,
+    }
+    points = sum(1 for item_ok in warning_items.values() if item_ok)
+    required = get_config_float("TREND_EXHAUSTION_MIN_WARNING_POINTS", 4)
+
+    if pressure_score >= get_config_float(
+        "REVERSAL_CONFIRMATION_STRONG_PRESSURE_SCORE",
+        5.0
+    ):
+        required = max(
+            required,
+            get_config_float(
+                "TREND_EXHAUSTION_STRONG_PRESSURE_MIN_WARNING_POINTS",
+                5
+            )
+        )
+
+    directional_trigger = (
+        momentum_ok or
+        recovery_ok or
+        (smc_ok and futures_support)
+    )
+    confidence = _safe_float(side_data.get("reversal_confidence"))
+    min_confidence = get_config_float(
+        "TREND_EXHAUSTION_MIN_REVERSAL_CONFIDENCE",
+        65
+    )
+    active = counter_ok and points >= required and confidence >= min_confidence
+
+    if (
+        getattr(config, "TREND_EXHAUSTION_REQUIRE_DIRECTIONAL_TRIGGER", True)
+        and not directional_trigger
+    ):
+        active = False
+        context["reasons"].append("DIRECTIONAL_TRIGGER_MISSING")
+
+    if (
+        getattr(config, "TREND_EXHAUSTION_FUTURES_VETO_ENABLED", True)
+        and futures_conflict
+    ):
+        active = False
+        context["reasons"].append(
+            f"FUTURES_CONFLICT={round(futures_score, 2)}"
+        )
+
+    if not counter_ok:
+        context["reasons"].append("COUNTER_TREND_CONTEXT_MISSING")
+    if points < required:
+        context["reasons"].append(f"POINTS={points} < {required}")
+    if confidence < min_confidence:
+        context["reasons"].append(
+            f"CONFIDENCE={round(confidence, 2)} < {min_confidence}"
+        )
+
+    if side_data.get("reversal_confirmed"):
+        stage = (
+            "CONFIRMED_ENTRY"
+            if side_data.get("reversal_ok")
+            else "CONFIRMED_WARNING_ONLY"
+        )
+    elif active:
+        stage = "WARNING"
+    else:
+        stage = "NONE"
+
+    context.update({
+        "active": active,
+        "stage": stage,
+        "items": warning_items,
+        "points": points,
+        "required": required,
+        "confidence": round(confidence, 2),
+        "min_confidence": min_confidence,
+        "pressure_score": round(pressure_score, 2),
+        "recovery_score": round(recovery_score, 2),
+        "directional_trigger": directional_trigger,
+        "futures_available": futures_available,
+        "futures_score": round(futures_score, 2),
+    })
+    return context
+
+
+def _apply_trend_exhaustion_guard(buy, sell):
+    for side_data in (buy, sell):
+        warning = _reversal_warning_context(side_data)
+        side_data["reversal_warning"] = warning
+        side_data.setdefault("reversal_context", {})["stage"] = warning["stage"]
+        side_data["trend_exhaustion"] = {
+            "enabled": warning["enabled"],
+            "blocked": False,
+            "opposite_side": None,
+            "reason": None,
+        }
+
+    if not getattr(config, "TREND_EXHAUSTION_GUARD_ENABLED", True):
+        return buy, sell
+
+    for trend_side, opposite_side in ((buy, sell), (sell, buy)):
+        warning = opposite_side.get("reversal_warning") or {}
+
+        if not trend_side.get("trend_following_ok") or not warning.get("active"):
+            continue
+
+        reason = (
+            f"OPPOSITE_{opposite_side.get('side')}_REVERSAL_WARNING "
+            f"POINTS={warning.get('points')} REQUIRED={warning.get('required')} "
+            f"CONFIDENCE={warning.get('confidence')}"
+        )
+        trend_side["trend_following_ok"] = False
+        trend_side["trend_exhaustion"] = {
+            "enabled": True,
+            "blocked": True,
+            "opposite_side": opposite_side.get("side"),
+            "reason": reason,
+            "warning": warning,
+        }
+        _refresh_side_decision(trend_side)
+
+    return buy, sell
 
 
 def _side_signal_score(
@@ -3007,21 +3277,17 @@ def _side_signal_score(
         reversal_ok = False
         reversal_reasons = list(reversal_reasons) + futures_gate_reasons
 
-    hard_ok = trend_following_ok or reversal_ok
-    confirmation_type = (
-        "TREND" if trend_following_ok
-        else "REVERSAL" if reversal_ok
-        else "NONE"
-    )
-    confidence = (
-        reversal_confidence if reversal_ok and not trend_following_ok
-        else trend_confidence
-    )
+    reversal_confirmed = reversal_ok
 
-    return {
+    if reversal_ok and not getattr(config, "REVERSAL_ENTRY_ENABLED", True):
+        reversal_ok = False
+        reversal_reasons = list(reversal_reasons) + [
+            "REVERSAL_ENTRY_DISABLED_WARNING_ONLY"
+        ]
+
+    side_data = {
         "side": side,
         "score": score,
-        "confidence": confidence,
         "trend_confidence": trend_confidence,
         "reversal_confidence": reversal_confidence,
         "base_score": trend_score + confirm_score + entry_score + btc_score + level_score,
@@ -3040,14 +3306,16 @@ def _side_signal_score(
         "regime_score": regime_score,
         "regime_context": regime_context,
         "participation_score": participation_score,
+        "participation_available": bool(
+            participation and participation.get("available")
+        ),
         "futures_context_ok": futures_ok,
         "futures_gate_reasons": futures_gate_reasons,
-        "hard_ok": hard_ok,
         "trend_following_ok": trend_following_ok,
         "reversal_ok": reversal_ok,
+        "reversal_confirmed": reversal_confirmed,
         "reversal_reasons": reversal_reasons,
         "reversal_context": reversal_context,
-        "confirmation_type": confirmation_type,
         "trend_ok": trend_ok,
         "confirm_ok": confirm_ok,
         "entry_ok": entry_ok,
@@ -3057,6 +3325,7 @@ def _side_signal_score(
         "level": level,
         "ema_distance": ema_distance,
     }
+    return _refresh_side_decision(side_data)
 
 
 def _signal_threshold(side_data):
@@ -3159,6 +3428,27 @@ def log_signal_analysis(analysis):
         f"futures={sell.get('participation_score', 0)} "
         f"futures_ok={sell.get('futures_context_ok', True)}"
     )
+
+    for side_data in (buy, sell):
+        exhaustion = side_data.get("trend_exhaustion") or {}
+
+        if exhaustion.get("blocked"):
+            log_warning(
+                f"{side_data.get('side')} TREND ENTRY BLOCKED | "
+                f"{exhaustion.get('reason')}"
+            )
+
+        warning = side_data.get("reversal_warning") or {}
+
+        if warning.get("active") and not side_data.get("reversal_ok"):
+            log_info(
+                f"{side_data.get('side')} REVERSAL WARNING | "
+                f"STAGE={warning.get('stage')} "
+                f"POINTS={warning.get('points')}/{warning.get('required')} "
+                f"CONFIDENCE={warning.get('confidence')} "
+                f"PRESSURE={warning.get('pressure_score')} "
+                f"RECOVERY={warning.get('recovery_score')}"
+            )
 
     if not buy.get("futures_context_ok", True):
         log_warning(
@@ -3291,8 +3581,14 @@ def analyze_signal(
             rs,
             participation=participation
         )
+        buy, sell = _apply_trend_exhaustion_guard(buy, sell)
         signal = _select_signal(buy, sell)
         best = buy if buy["confidence"] >= sell["confidence"] else sell
+        exhaustion_blocks = [
+            side_data.get("trend_exhaustion", {}).get("reason")
+            for side_data in (buy, sell)
+            if side_data.get("trend_exhaustion", {}).get("blocked")
+        ]
         analysis = {
             "buy": buy,
             "sell": sell,
@@ -3304,6 +3600,8 @@ def analyze_signal(
             "participation_available": bool(
                 participation and participation.get("available")
             ),
+            "trend_exhaustion_blocked": bool(exhaustion_blocks),
+            "trend_exhaustion_reasons": exhaustion_blocks,
         }
 
         if log_details:
@@ -3335,6 +3633,13 @@ def should_fetch_futures_context(analysis):
 
     buy = analysis.get("buy", {})
     sell = analysis.get("sell", {})
+
+    if any(
+        (side_data.get("reversal_warning") or {}).get("active")
+        for side_data in (buy, sell)
+    ):
+        return True
+
     best_key = (analysis.get("best_side") or "").lower()
     best = analysis.get(best_key, {}) if best_key in ("buy", "sell") else {}
 

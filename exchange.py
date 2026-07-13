@@ -1479,6 +1479,72 @@ def get_roi_take_profit(side, entry_price, roi, precision):
     )
 
 
+def _normalise_signal_type(signal_type=None):
+    signal_type = str(signal_type or "").upper().strip()
+    return "REVERSAL" if signal_type == "REVERSAL" else "TREND"
+
+
+def is_stop_loss_enabled_for_signal(signal_type=None):
+    signal_type = str(signal_type or "").upper().strip()
+
+    if signal_type == "REVERSAL":
+        return bool(getattr(config, "REVERSAL_SL_ENABLED", config.SL_ENABLED))
+
+    if signal_type == "TREND":
+        return bool(getattr(config, "TREND_SL_ENABLED", config.SL_ENABLED))
+
+    return bool(getattr(config, "SL_ENABLED", False))
+
+
+def get_max_sl_roi_for_signal(signal_type=None):
+    trade_type = _normalise_signal_type(signal_type)
+
+    if trade_type == "REVERSAL":
+        return float(getattr(config, "REVERSAL_MAX_SL_ROI", config.MAX_SL_ROI))
+
+    return float(getattr(config, "TREND_MAX_SL_ROI", config.MAX_SL_ROI))
+
+
+def get_roi_stop_loss(side, entry_price, roi, precision):
+    move = (float(roi) / max(float(config.LEVERAGE), 1)) / 100
+
+    if side == SIDE_BUY:
+        return round(entry_price * (1 - move), precision)
+
+    return round(entry_price * (1 + move), precision)
+
+
+def get_signal_stop_loss(side, entry_price, confirm_df, signal_type, precision):
+    if not is_stop_loss_enabled_for_signal(signal_type):
+        return None
+
+    structure_sl = get_structure_stop_loss(confirm_df, side)
+    max_roi = get_max_sl_roi_for_signal(signal_type)
+    capped_sl = None
+
+    if max_roi > 0:
+        capped_sl = get_roi_stop_loss(side, entry_price, max_roi, precision)
+
+    if structure_sl is None:
+        return capped_sl
+
+    structure_sl = round(structure_sl, precision)
+
+    if capped_sl is None:
+        return structure_sl
+
+    if side == SIDE_BUY:
+        if structure_sl >= entry_price:
+            return capped_sl
+
+        return max(structure_sl, capped_sl)
+
+    if structure_sl <= entry_price:
+        return capped_sl
+
+    return min(structure_sl, capped_sl)
+
+
 def is_valid_take_profit(side, tp_price, market_price):
     if side == SIDE_BUY:
         return tp_price > market_price
@@ -1518,17 +1584,22 @@ def place_tp_sl(
     structure_tp=None,
     roi_override=None,
     roi_mode_label=None,
+    signal_type=None,
     return_details=False
 ):
+    signal_type = str(signal_type or "").upper().strip()
+    sl_enabled = is_stop_loss_enabled_for_signal(signal_type)
     details = {
         "ok": False,
         "symbol": symbol,
         "side": side,
+        "signal_type": signal_type or "UNKNOWN",
         "entry_price": entry_price,
         "quantity": quantity,
         "tp_price": None,
         "tp_mode": "",
         "sl_price": None,
+        "sl_enabled": sl_enabled,
         "tp_order": None,
     }
 
@@ -1541,26 +1612,24 @@ def place_tp_sl(
             return details if return_details else False
 
         if side == SIDE_BUY:
-            sl_price = None
-
-            if config.SL_ENABLED:
-                sl_price = round(
-                    get_structure_stop_loss(confirm_df, SIDE_BUY),
-                    precision
-                )
-
+            sl_price = get_signal_stop_loss(
+                SIDE_BUY,
+                entry_price,
+                confirm_df,
+                signal_type,
+                precision
+            )
             close_side = SIDE_SELL
 
         # ================= SELL =================
         else:
-            sl_price = None
-
-            if config.SL_ENABLED:
-                sl_price = round(
-                    get_structure_stop_loss(confirm_df, SIDE_SELL),
-                    precision
-                )
-
+            sl_price = get_signal_stop_loss(
+                SIDE_SELL,
+                entry_price,
+                confirm_df,
+                signal_type,
+                precision
+            )
             close_side = SIDE_BUY
 
         if roi_override is not None:
@@ -1612,7 +1681,7 @@ def place_tp_sl(
         details.update({
             "tp_price": tp_price,
             "tp_mode": tp_mode,
-            "sl_price": sl_price if config.SL_ENABLED else None,
+            "sl_price": sl_price if sl_enabled else None,
         })
 
         # ================= VALIDATION ONLY =================
@@ -1623,24 +1692,49 @@ def place_tp_sl(
             )
             return details if return_details else False
 
-        if side == SIDE_BUY and config.SL_ENABLED and sl_price >= market_price:
+        if sl_enabled and sl_price is None:
+            log_warning(
+                f"{symbol} SL unavailable | TYPE={signal_type or 'UNKNOWN'}"
+            )
+
+            if getattr(config, "SL_INVALID_FAILS_PROTECTION_ORDER", False):
+                return details if return_details else False
+
+            sl_enabled = False
+            details["sl_enabled"] = False
+            details["sl_price"] = None
+
+        if side == SIDE_BUY and sl_enabled and sl_price >= market_price:
             log_warning(
                 f"{symbol} SL invalid for BUY | "
                 f"SL={sl_price} | MARKET={market_price}"
             )
-            return details if return_details else False
 
-        if side == SIDE_SELL and config.SL_ENABLED and sl_price <= market_price:
+            if getattr(config, "SL_INVALID_FAILS_PROTECTION_ORDER", False):
+                return details if return_details else False
+
+            sl_enabled = False
+            details["sl_enabled"] = False
+            details["sl_price"] = None
+
+        if side == SIDE_SELL and sl_enabled and sl_price <= market_price:
             log_warning(
                 f"{symbol} SL invalid for SELL | "
                 f"SL={sl_price} | MARKET={market_price}"
             )
-            return details if return_details else False
+
+            if getattr(config, "SL_INVALID_FAILS_PROTECTION_ORDER", False):
+                return details if return_details else False
+
+            sl_enabled = False
+            details["sl_enabled"] = False
+            details["sl_price"] = None
 
         log_info(
             f"{symbol}\nENTRY: {entry_price}\nTP: {tp_price}\n"
             f"TP_MODE: {tp_mode}\n"
-            f"SL: {sl_price if config.SL_ENABLED else 'DISABLED'}"
+            f"SL: {sl_price if sl_enabled else 'DISABLED'} | "
+            f"TYPE={signal_type or 'UNKNOWN'}"
         )
 
         # TAKE PROFIT
@@ -1663,7 +1757,7 @@ def place_tp_sl(
         )
         details["tp_order"] = tp_order
 
-        if config.SL_ENABLED:
+        if sl_enabled:
             time.sleep(config.PROTECTION_ORDER_DELAY_SECONDS)
 
             # STOP LOSS
@@ -1685,7 +1779,9 @@ def place_tp_sl(
                 f"TYPE={sl_order.get('orderType')}"
             )
         else:
-            log_warning(f"{symbol} SL DISABLED | CROSS-MARGIN LONG-TERM MODE")
+            log_warning(
+                f"{symbol} SL DISABLED | TYPE={signal_type or 'UNKNOWN'}"
+            )
 
         log_info(f"{symbol} TP CREATED")
         details["ok"] = True
