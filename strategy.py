@@ -1,5 +1,15 @@
+from collections import OrderedDict
+from copy import deepcopy
+import threading
+
+import numpy as np
+
 import config
 from logger import log_info, log_error, log_warning
+
+
+_signal_analysis_cache = OrderedDict()
+_signal_analysis_cache_lock = threading.RLock()
 
 
 def score_to_confidence(score, max_score=None):
@@ -118,11 +128,9 @@ def _level_tolerance(df):
 
 
 def _touch_positions(data, column, level, tolerance):
-    return [
-        index
-        for index, value in enumerate(data[column])
-        if abs(float(value) - level) <= tolerance
-    ]
+    values = np.asarray(data[column], dtype=float)
+    mask = np.isfinite(values) & (np.abs(values - level) <= tolerance)
+    return np.flatnonzero(mask).tolist()
 
 
 def _distinct_touch_count(positions, min_gap):
@@ -139,60 +147,77 @@ def _distinct_touch_count(positions, min_gap):
 
 def _level_reaction_score(data, side, level, tolerance):
     column = "low" if side == "BUY" else "high"
-    reactions = []
+    touch_values = np.asarray(data[column], dtype=float)
+    touch_mask = (
+        np.isfinite(touch_values) &
+        (np.abs(touch_values - level) <= tolerance)
+    )
 
-    for _, candle in data.iterrows():
-        if abs(float(candle[column]) - level) > tolerance:
-            continue
-
-        high = _safe_float(candle.get("high"))
-        low = _safe_float(candle.get("low"))
-        close = _safe_float(candle.get("close"))
-        open_price = _safe_float(candle.get("open"))
-        candle_range = high - low
-
-        if candle_range <= 0:
-            continue
-
-        if side == "BUY":
-            directional_close = (close - low) / candle_range
-            wick_rejection = (min(open_price, close) - low) / candle_range
-        else:
-            directional_close = (high - close) / candle_range
-            wick_rejection = (high - max(open_price, close)) / candle_range
-
-        reactions.append(max(directional_close, wick_rejection, 0))
-
-    if not reactions:
+    if not np.any(touch_mask):
         return 0
 
-    reactions = sorted(reactions, reverse=True)[:5]
-    return min(sum(reactions) / len(reactions), 1)
+    high = np.asarray(data["high"], dtype=float)[touch_mask]
+    low = np.asarray(data["low"], dtype=float)[touch_mask]
+    close = np.asarray(data["close"], dtype=float)[touch_mask]
+    open_price = np.asarray(data["open"], dtype=float)[touch_mask]
+
+    high = np.nan_to_num(high, nan=0.0)
+    low = np.nan_to_num(low, nan=0.0)
+    close = np.nan_to_num(close, nan=0.0)
+    open_price = np.nan_to_num(open_price, nan=0.0)
+    candle_range = high - low
+    valid_range = candle_range > 0
+
+    if not np.any(valid_range):
+        return 0
+
+    high = high[valid_range]
+    low = low[valid_range]
+    close = close[valid_range]
+    open_price = open_price[valid_range]
+    candle_range = candle_range[valid_range]
+
+    if side == "BUY":
+        directional_close = (close - low) / candle_range
+        wick_rejection = (np.minimum(open_price, close) - low) / candle_range
+    else:
+        directional_close = (high - close) / candle_range
+        wick_rejection = (high - np.maximum(open_price, close)) / candle_range
+
+    reactions = np.maximum(np.maximum(directional_close, wick_rejection), 0)
+
+    if reactions.size > 5:
+        reactions = np.partition(reactions, reactions.size - 5)[-5:]
+
+    return min(float(np.mean(reactions)), 1)
 
 
 def _volume_touch_score(data, column, level, tolerance):
     if "volume_sma" not in data.columns or "volume" not in data.columns:
         return 0
 
-    strong_touches = 0
-
-    for _, candle in data.iterrows():
-        if abs(float(candle[column]) - level) > tolerance:
-            continue
-
-        if _safe_float(candle.get("volume")) > _safe_float(candle.get("volume_sma")):
-            strong_touches += 1
+    touch_values = np.asarray(data[column], dtype=float)
+    touch_mask = (
+        np.isfinite(touch_values) &
+        (np.abs(touch_values - level) <= tolerance)
+    )
+    volume = np.nan_to_num(np.asarray(data["volume"], dtype=float), nan=0.0)
+    volume_sma = np.nan_to_num(
+        np.asarray(data["volume_sma"], dtype=float),
+        nan=0.0,
+    )
+    strong_touches = int(np.count_nonzero(touch_mask & (volume > volume_sma)))
 
     return min(strong_touches / 3, 1)
 
 
 def _recent_break_penalty(data, side, level, tolerance):
-    recent = data.tail(5)
+    recent_close = np.asarray(data["close"].tail(5), dtype=float)
 
     if side == "BUY":
-        broken = any(float(close) < level - tolerance for close in recent["close"])
+        broken = bool(np.any(recent_close < level - tolerance))
     else:
-        broken = any(float(close) > level + tolerance for close in recent["close"])
+        broken = bool(np.any(recent_close > level + tolerance))
 
     if not broken:
         return 0
@@ -211,9 +236,10 @@ def _level_strength_score(
     min_gap = max(get_config_int("LONG_TERM_SR_TOUCH_MIN_GAP", 5), 1)
     distinct_touches = _distinct_touch_count(positions, min_gap)
     recency_score = (max(positions) / len(data)) if positions else 0
-    reaction_score = _level_reaction_score(data, side, level, _level_tolerance(data))
-    volume_score = _volume_touch_score(data, column, level, _level_tolerance(data))
-    penalty = _recent_break_penalty(data, side, level, _level_tolerance(data))
+    tolerance = _level_tolerance(data)
+    reaction_score = _level_reaction_score(data, side, level, tolerance)
+    volume_score = _volume_touch_score(data, column, level, tolerance)
+    penalty = _recent_break_penalty(data, side, level, tolerance)
     score = (
         distinct_touches * timeframe_weight +
         recency_score +
@@ -243,16 +269,16 @@ def _collect_pivot_levels(df, side, label, timeframe_weight):
     swing = max(get_config_int("LONG_TERM_SR_SWING", 3), 2)
     column = "low" if side == "BUY" else "high"
     levels = []
+    values = np.asarray(data[column], dtype=float)
 
     for pos in range(swing, len(data) - swing):
-        candle = data.iloc[pos]
-        window = data.iloc[pos - swing:pos + swing + 1]
-        level = float(candle[column])
+        level = float(values[pos])
+        window_values = values[pos - swing:pos + swing + 1]
 
-        if side == "BUY" and level > window["low"].min():
+        if side == "BUY" and level > np.nanmin(window_values):
             continue
 
-        if side == "SELL" and level < window["high"].max():
+        if side == "SELL" and level < np.nanmax(window_values):
             continue
 
         positions = _touch_positions(data, column, level, tolerance)
@@ -1053,34 +1079,44 @@ def _collect_order_blocks(df, side, label, timeframe_weight):
     if len(data) < 10:
         return blocks
 
+    open_values = np.asarray(data["open"], dtype=float)
+    high_values = np.asarray(data["high"], dtype=float)
+    low_values = np.asarray(data["low"], dtype=float)
+    close_values = np.asarray(data["close"], dtype=float)
+    atr_values = np.asarray(data["atr"], dtype=float)
+    volume_values = np.asarray(data["volume"], dtype=float)
+    volume_sma_values = np.asarray(data["volume_sma"], dtype=float)
+
     for pos in range(2, len(data) - 3):
-        candle = data.iloc[pos]
-        next_window = data.iloc[pos + 1:pos + 4]
-        atr = _candle_atr(candle)
-        zone_low = float(candle["low"])
-        zone_high = float(candle["high"])
+        atr = max(float(atr_values[pos]), 1e-10)
+        zone_low = float(low_values[pos])
+        zone_high = float(high_values[pos])
         zone_width_pct = ((zone_high - zone_low) / max(zone_high, 1e-10)) * 100
 
         if zone_width_pct > max_zone_pct:
             continue
 
         if side == "BUY":
-            if not _is_bearish(candle):
+            if not close_values[pos] < open_values[pos]:
                 continue
 
-            displacement = (next_window["close"].max() - candle["high"]) / atr
-            broke_structure = next_window["high"].max() > candle["high"]
+            next_close = np.nanmax(close_values[pos + 1:pos + 4])
+            next_high = np.nanmax(high_values[pos + 1:pos + 4])
+            displacement = (next_close - zone_high) / atr
+            broke_structure = next_high > zone_high
 
             if displacement < min_displacement or not broke_structure:
                 continue
 
             anchor = zone_high
         else:
-            if not _is_bullish(candle):
+            if not close_values[pos] > open_values[pos]:
                 continue
 
-            displacement = (candle["low"] - next_window["close"].min()) / atr
-            broke_structure = next_window["low"].min() < candle["low"]
+            next_close = np.nanmin(close_values[pos + 1:pos + 4])
+            next_low = np.nanmin(low_values[pos + 1:pos + 4])
+            displacement = (zone_low - next_close) / atr
+            broke_structure = next_low < zone_low
 
             if displacement < min_displacement or not broke_structure:
                 continue
@@ -1088,7 +1124,11 @@ def _collect_order_blocks(df, side, label, timeframe_weight):
             anchor = zone_low
 
         recency_score = pos / len(data)
-        volume_bonus = 0.25 if candle.get("volume", 0) > candle.get("volume_sma", 0) else 0
+        volume_bonus = (
+            0.25
+            if volume_values[pos] > volume_sma_values[pos]
+            else 0
+        )
         score = timeframe_weight + min(max(displacement, 0), 2.5) + recency_score + volume_bonus
         blocks.append({
             "type": "order_block",
@@ -1148,19 +1188,25 @@ def _collect_fvgs(df, label):
     if len(data) < 5:
         return fvgs
 
-    for pos in range(2, len(data)):
-        left = data.iloc[pos - 2]
-        right = data.iloc[pos]
-        atr = _candle_atr(right)
+    high_values = np.asarray(data["high"], dtype=float)
+    low_values = np.asarray(data["low"], dtype=float)
+    atr_values = np.asarray(data["atr"], dtype=float)
 
-        if left["high"] < right["low"]:
-            gap_low = float(left["high"])
-            gap_high = float(right["low"])
+    for pos in range(2, len(data)):
+        left_high = high_values[pos - 2]
+        left_low = low_values[pos - 2]
+        right_high = high_values[pos]
+        right_low = low_values[pos]
+        atr = max(float(atr_values[pos]), 1e-10)
+
+        if left_high < right_low:
+            gap_low = float(left_high)
+            gap_high = float(right_low)
             gap_atr = (gap_high - gap_low) / atr
-            after = data.iloc[pos + 1:]
+            after_low = low_values[pos + 1:]
 
             if gap_atr >= min_gap_atr and not (
-                len(after) and after["low"].min() <= gap_low
+                after_low.size and np.nanmin(after_low) <= gap_low
             ):
                 fvgs.append({
                     "type": "bullish_fvg",
@@ -1171,14 +1217,14 @@ def _collect_fvgs(df, label):
                     "score": round(1 + min(gap_atr, 2), 2),
                 })
 
-        if left["low"] > right["high"]:
-            gap_low = float(right["high"])
-            gap_high = float(left["low"])
+        if left_low > right_high:
+            gap_low = float(right_high)
+            gap_high = float(left_low)
             gap_atr = (gap_high - gap_low) / atr
-            after = data.iloc[pos + 1:]
+            after_high = high_values[pos + 1:]
 
             if gap_atr >= min_gap_atr and not (
-                len(after) and after["high"].max() >= gap_high
+                after_high.size and np.nanmax(after_high) >= gap_high
             ):
                 fvgs.append({
                     "type": "bearish_fvg",
@@ -4333,7 +4379,7 @@ def analyze_signal(
 
     except Exception as e:
         log_error(f"STRATEGY ERROR: {e}")
-        return {
+    return {
             "buy": {},
             "sell": {},
             "signal": None,
@@ -4343,7 +4389,119 @@ def analyze_signal(
             "min_edge": config.LONG_TERM_MIN_SIGNAL_EDGE,
             "participation_available": False,
             "error": str(e),
-        }
+    }
+
+
+def _analysis_signature_value(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    return None if value != value else value
+
+
+def _analysis_frame_signature(df):
+    if df is None or len(df) == 0:
+        return None
+
+    signature = [len(df)]
+
+    for column in (
+        "time",
+        "close_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ):
+        if column not in df.columns:
+            continue
+
+        signature.append((
+            column,
+            tuple(
+                _analysis_signature_value(value)
+                for value in df[column].tail(2)
+            ),
+        ))
+
+    return tuple(signature)
+
+
+def clear_signal_analysis_cache():
+    with _signal_analysis_cache_lock:
+        _signal_analysis_cache.clear()
+
+
+def analyze_signal_cached(
+    trend_df,
+    confirm_df,
+    entry_df,
+    btc_trend,
+    btc_corr,
+    rs,
+    participation=None,
+    log_details=False,
+    cache_namespace=None,
+):
+    cache_enabled = bool(
+        getattr(config, "SIGNAL_ANALYSIS_CACHE_ENABLED", True)
+    )
+
+    if not cache_enabled or participation is not None or log_details:
+        return analyze_signal(
+            trend_df,
+            confirm_df,
+            entry_df,
+            btc_trend,
+            btc_corr,
+            rs,
+            participation=participation,
+            log_details=log_details,
+        )
+
+    key = (
+        str(cache_namespace or ""),
+        _analysis_frame_signature(trend_df),
+        _analysis_frame_signature(confirm_df),
+        _analysis_frame_signature(entry_df),
+        str(btc_trend),
+        _analysis_signature_value(btc_corr),
+        _analysis_signature_value(rs),
+    )
+
+    with _signal_analysis_cache_lock:
+        cached = _signal_analysis_cache.get(key)
+
+        if cached is not None:
+            _signal_analysis_cache.move_to_end(key)
+            return deepcopy(cached)
+
+    analysis = analyze_signal(
+        trend_df,
+        confirm_df,
+        entry_df,
+        btc_trend,
+        btc_corr,
+        rs,
+        participation=None,
+        log_details=False,
+    )
+    max_items = max(
+        int(getattr(config, "SIGNAL_ANALYSIS_CACHE_MAX_ITEMS", 1200)),
+        1,
+    )
+
+    with _signal_analysis_cache_lock:
+        _signal_analysis_cache[key] = deepcopy(analysis)
+        _signal_analysis_cache.move_to_end(key)
+
+        while len(_signal_analysis_cache) > max_items:
+            _signal_analysis_cache.popitem(last=False)
+
+    return analysis
 
 
 def should_fetch_futures_context(analysis):

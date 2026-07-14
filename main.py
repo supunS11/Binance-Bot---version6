@@ -35,6 +35,7 @@ from exchange import (
 from indicators import apply_indicators
 from strategy import (
     analyze_signal,
+    analyze_signal_cached,
     evaluate_reversal_profit_protection,
     futures_context_priority,
     log_signal_analysis,
@@ -3243,14 +3244,15 @@ def run_bot():
                         log_info(f"{symbol} BTC CORR: {btc_corr}")
                         log_info(f"{symbol} RS: {rs}%")
 
-                        base_analysis = analyze_signal(
+                        base_analysis = analyze_signal_cached(
                             trend_df,
                             confirm_df,
                             entry_df,
                             btc_trend,
                             btc_corr,
                             rs,
-                            log_details=False
+                            log_details=False,
+                            cache_namespace=symbol,
                         )
                         scan_item = {
                             "symbol": symbol,
