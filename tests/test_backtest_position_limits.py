@@ -2,7 +2,11 @@ import unittest
 from unittest.mock import patch
 
 import config
-from backtest import apply_position_limits
+from backtest import (
+    apply_position_limits,
+    record_reversal_diagnostics,
+    reversal_diagnostics_summary,
+)
 
 
 def trade(side, confirmation_type, entry_ms, exit_ms):
@@ -54,6 +58,40 @@ class BacktestPositionLimitTests(unittest.TestCase):
 
         self.assertEqual(accepted, [])
         self.assertEqual(skipped, 1)
+
+    def test_reversal_diagnostics_count_unique_rejection_reasons(self):
+        diagnostics = {}
+        analysis = {
+            "buy": {
+                "reversal_confirmed": False,
+                "reversal_confidence": 84,
+                "reversal_reasons": [
+                    "CONFIDENCE=84 < 86",
+                    "CONFIDENCE=84 < 86",
+                    "ENTRY=4.5 < 5",
+                ],
+            },
+            "sell": {
+                "reversal_confirmed": True,
+                "reversal_confidence": 90,
+                "reversal_reasons": [],
+            },
+        }
+
+        record_reversal_diagnostics(diagnostics, analysis)
+        summary = reversal_diagnostics_summary(diagnostics)
+
+        self.assertEqual(summary["evaluations"], 2)
+        self.assertEqual(summary["chart_confirmed"], 1)
+        self.assertEqual(summary["near_misses"], 1)
+        self.assertEqual(summary["max_confidence"], 90)
+        self.assertEqual(
+            summary["top_rejection_reasons"],
+            [
+                {"reason": "CONFIDENCE", "count": 1},
+                {"reason": "ENTRY", "count": 1},
+            ],
+        )
 
 
 if __name__ == "__main__":

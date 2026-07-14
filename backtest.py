@@ -142,6 +142,99 @@ def parse_confirmation_types(value):
     return result
 
 
+def _reversal_reason_key(reason):
+    text = str(reason or "UNKNOWN").strip()
+
+    if not text:
+        return "UNKNOWN"
+
+    return text.split(" ", 1)[0].split("=", 1)[0]
+
+
+def record_reversal_diagnostics(diagnostics, analysis):
+    if diagnostics is None:
+        return
+
+    diagnostics.setdefault("evaluations", 0)
+    diagnostics.setdefault("chart_confirmed", 0)
+    diagnostics.setdefault("final_signals", 0)
+    diagnostics.setdefault("near_misses", 0)
+    diagnostics.setdefault("max_confidence", 0.0)
+    reason_counts = diagnostics.setdefault("rejection_reasons", {})
+    combination_counts = diagnostics.setdefault("rejection_combinations", {})
+
+    for side in ("buy", "sell"):
+        side_data = analysis.get(side, {}) or {}
+        diagnostics["evaluations"] += 1
+        confidence = float(side_data.get("reversal_confidence", 0) or 0)
+        diagnostics["max_confidence"] = max(
+            float(diagnostics["max_confidence"]),
+            confidence,
+        )
+
+        if side_data.get("reversal_confirmed"):
+            diagnostics["chart_confirmed"] += 1
+            continue
+
+        reasons = {
+            _reversal_reason_key(reason)
+            for reason in side_data.get("reversal_reasons", [])
+        }
+
+        if reasons:
+            combination = "+".join(sorted(reasons))
+            combination_counts[combination] = (
+                combination_counts.get(combination, 0) + 1
+            )
+
+        if confidence >= 80 and len(reasons) <= 2:
+            diagnostics["near_misses"] += 1
+
+        for reason in reasons:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+
+def reversal_diagnostics_summary(diagnostics, top_reasons=10):
+    diagnostics = diagnostics or {}
+    reason_counts = diagnostics.get("rejection_reasons", {}) or {}
+    ordered_reasons = sorted(
+        reason_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+    combination_counts = diagnostics.get("rejection_combinations", {}) or {}
+    ordered_combinations = sorted(
+        combination_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+    pre_entry_counts = diagnostics.get("pre_entry_rejections", {}) or {}
+    ordered_pre_entry = sorted(
+        pre_entry_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return {
+        "evaluations": int(diagnostics.get("evaluations", 0)),
+        "chart_confirmed": int(diagnostics.get("chart_confirmed", 0)),
+        "final_signals": int(diagnostics.get("final_signals", 0)),
+        "near_misses": int(diagnostics.get("near_misses", 0)),
+        "max_confidence": round(
+            float(diagnostics.get("max_confidence", 0) or 0),
+            2,
+        ),
+        "top_rejection_reasons": [
+            {"reason": reason, "count": int(count)}
+            for reason, count in ordered_reasons[:max(int(top_reasons), 0)]
+        ],
+        "top_rejection_combinations": [
+            {"reasons": reasons, "count": int(count)}
+            for reasons, count in ordered_combinations[:max(int(top_reasons), 0)]
+        ],
+        "pre_entry_rejections": [
+            {"reason": reason, "count": int(count)}
+            for reason, count in ordered_pre_entry[:max(int(top_reasons), 0)]
+        ],
+    }
+
+
 def data_path(data_dir, symbol, interval):
     return Path(data_dir) / f"{symbol}_{interval}.csv"
 
@@ -964,6 +1057,7 @@ def generate_symbol_trades(
     start_ms,
     end_ms,
     allowed_confirmation_types=None,
+    reversal_diagnostics=None,
 ):
     trades = []
     entry_df = frames["entry"].indicators
@@ -1026,6 +1120,7 @@ def generate_symbol_trades(
             participation=None,
             log_details=False,
         )
+        record_reversal_diagnostics(reversal_diagnostics, analysis)
         signal = analysis.get("signal")
 
         if not signal:
@@ -1035,6 +1130,11 @@ def generate_symbol_trades(
         confirmation_type = str(
             side_analysis.get("confirmation_type", "UNKNOWN")
         ).upper()
+
+        if confirmation_type == "REVERSAL" and reversal_diagnostics is not None:
+            reversal_diagnostics["final_signals"] = (
+                reversal_diagnostics.get("final_signals", 0) + 1
+            )
 
         if (
             allowed_confirmation_types
@@ -1052,6 +1152,15 @@ def generate_symbol_trades(
         )
 
         if not filters_ok:
+            if confirmation_type == "REVERSAL" and reversal_diagnostics is not None:
+                pre_entry_rejections = reversal_diagnostics.setdefault(
+                    "pre_entry_rejections",
+                    {},
+                )
+                reason_key = str(reason or "PRE_ENTRY_FILTER_BLOCKED").strip()
+                pre_entry_rejections[reason_key] = (
+                    pre_entry_rejections.get(reason_key, 0) + 1
+                )
             continue
 
         trade = simulate_trade(
@@ -1393,6 +1502,7 @@ def run_backtest(args):
 
     all_trades = []
     failed_symbols = {}
+    reversal_diagnostics = {}
     btc_frames = None
 
     if getattr(config, "BACKTEST_USE_BTC_CONTEXT", True):
@@ -1403,6 +1513,7 @@ def run_backtest(args):
 
     for symbol in symbols:
         try:
+            symbol_reversal_diagnostics = {}
             if symbol == "BTCUSDT" and btc_frames is not None:
                 frames = btc_frames
             else:
@@ -1415,9 +1526,28 @@ def run_backtest(args):
                 start_ms,
                 end_ms,
                 allowed_confirmation_types=allowed_confirmation_types,
+                reversal_diagnostics=symbol_reversal_diagnostics,
+            )
+            reversal_diagnostics[symbol] = reversal_diagnostics_summary(
+                symbol_reversal_diagnostics
             )
             all_trades.extend(trades)
             print(f"{symbol}: {len(trades)} simulated trades")
+
+            diagnostic = reversal_diagnostics[symbol]
+            top_reasons = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in diagnostic["top_rejection_reasons"][:5]
+            ) or "NONE"
+            print(
+                f"{symbol}: reversal diagnostics | "
+                f"confirmed={diagnostic['chart_confirmed']} | "
+                f"final_signals={diagnostic['final_signals']} | "
+                f"near_misses={diagnostic['near_misses']} | "
+                f"max_confidence={diagnostic['max_confidence']} | "
+                f"top_reasons={top_reasons}",
+                flush=True,
+            )
 
         except Exception as exc:
             failed_symbols[symbol] = str(exc)
@@ -1431,6 +1561,7 @@ def run_backtest(args):
         "end": ms_to_iso(end_ms),
         "failed_symbols": failed_symbols,
         "generated_trades_before_position_limits": len(all_trades),
+        "reversal_diagnostics": reversal_diagnostics,
         "settings": {
             "signal_step_candles": int(getattr(config, "BACKTEST_SIGNAL_STEP_CANDLES", 4)),
             "exit_timeframe": getattr(config, "BACKTEST_EXIT_TIMEFRAME", config.ENTRY_TIMEFRAME),

@@ -168,6 +168,66 @@ class TrendTimingRescueTests(unittest.TestCase):
             "LIVE_DIRECTION_SUPPORT_MISSING_BOTH",
         )
 
+    @patch("strategy._live_entry_timeframe_check")
+    def test_single_timeframe_mode_still_blocks_dual_opposition(
+        self,
+        timeframe_check,
+    ):
+        opposing = {
+            "structure_break": False,
+            "opposite_reversal": False,
+            "ema_wrong_side": False,
+            "ema_chase": False,
+            "close_chase": False,
+            "supports_direction": False,
+            "opposes_direction": True,
+        }
+        timeframe_check.side_effect = [opposing, opposing]
+
+        allowed, details = validate_live_entry_guard(
+            "BUY",
+            object(),
+            object(),
+            100,
+            require_both_override=False,
+        )
+
+        self.assertFalse(allowed)
+        self.assertEqual(
+            details["reason"],
+            "DUAL_LIVE_DIRECTION_OPPOSITION",
+        )
+
+    @patch("strategy._live_entry_timeframe_check")
+    def test_single_timeframe_mode_still_blocks_structure_failure(
+        self,
+        timeframe_check,
+    ):
+        neutral = {
+            "structure_break": False,
+            "opposite_reversal": False,
+            "ema_wrong_side": False,
+            "ema_chase": False,
+            "close_chase": False,
+            "supports_direction": True,
+            "opposes_direction": False,
+        }
+        timeframe_check.side_effect = [
+            {**neutral, "structure_break": True},
+            neutral,
+        ]
+
+        allowed, details = validate_live_entry_guard(
+            "BUY",
+            object(),
+            object(),
+            100,
+            require_both_override=False,
+        )
+
+        self.assertFalse(allowed)
+        self.assertEqual(details["reason"], "OPPOSITE_STRUCTURE_BREAK")
+
 
 if __name__ == "__main__":
     unittest.main()

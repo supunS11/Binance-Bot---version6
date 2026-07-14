@@ -1,0 +1,170 @@
+{
+  "initial_balance": 1000.0,
+  "final_balance": 999.1733,
+  "net_pnl": -0.8267,
+  "net_return_pct": -0.08,
+  "total_trades": 1,
+  "wins": 0,
+  "losses": 1,
+  "win_rate_pct": 0.0,
+  "profit_factor": 0.0,
+  "gross_profit": 0.0,
+  "gross_loss": 0.8267,
+  "max_drawdown_pct": 0.08,
+  "avg_roi_on_margin_pct": -41.33,
+  "avg_duration_hours": 27.0,
+  "dca_trades": 0,
+  "skipped_by_position_limits": 0,
+  "notes": [
+    "Backtest uses historical OHLCV candles and simulated fills.",
+    "News, LLM, realtime websocket confirmation, order-book flow, and private account state are not replayed.",
+    "Intracandle order is conservative: DCA, SL, then TP are evaluated inside the same candle."
+  ],
+  "equity_curve": [
+    {
+      "time": "2025-09-07T14:59:59.999000+00:00",
+      "equity": 999.1733,
+      "drawdown_pct": 0.08
+    }
+  ],
+  "symbols": [
+    "DOGEUSDT"
+  ],
+  "start": "2025-07-01T00:00:00+00:00",
+  "end": "2026-07-01T00:00:00+00:00",
+  "failed_symbols": {},
+  "generated_trades_before_position_limits": 1,
+  "reversal_diagnostics": {
+    "DOGEUSDT": {
+      "evaluations": 1458,
+      "chart_confirmed": 5,
+      "final_signals": 5,
+      "near_misses": 133,
+      "max_confidence": 100.0,
+      "top_rejection_reasons": [
+        {
+          "reason": "REVERSAL_CONFIRMATIONS_LOW",
+          "count": 1113
+        },
+        {
+          "reason": "REGIME",
+          "count": 1079
+        },
+        {
+          "reason": "CONFIDENCE",
+          "count": 853
+        },
+        {
+          "reason": "REVERSAL_RECOVERY_NOT_CONFIRMED",
+          "count": 852
+        },
+        {
+          "reason": "ENTRY",
+          "count": 843
+        },
+        {
+          "reason": "REVERSAL_MOMENTUM_OR_RECOVERY_MISSING",
+          "count": 839
+        },
+        {
+          "reason": "QUALITY",
+          "count": 828
+        },
+        {
+          "reason": "CONFIRM",
+          "count": 816
+        },
+        {
+          "reason": "ENTRY_HARD_CHECK_FAILED",
+          "count": 790
+        },
+        {
+          "reason": "CONFIRMATION_HARD_CHECK_FAILED",
+          "count": 730
+        }
+      ],
+      "top_rejection_combinations": [
+        {
+          "reasons": "CONFIDENCE+CONFIRM+CONFIRMATION_HARD_CHECK_FAILED+ENTRY+ENTRY_HARD_CHECK_FAILED+QUALITY+REGIME+REVERSAL_CONFIRMATIONS_LOW+REVERSAL_MOMENTUM_OR_RECOVERY_MISSING+REVERSAL_RECOVERY_NOT_CONFIRMED",
+          "count": 97
+        },
+        {
+          "reasons": "CONFIDENCE+CONFIRM+CONFIRMATION_HARD_CHECK_FAILED+ENTRY+ENTRY_HARD_CHECK_FAILED+QUALITY+REGIME+REVERSAL_CONFIRMATIONS_LOW+REVERSAL_MOMENTUM_OR_RECOVERY_MISSING+REVERSAL_RECOVERY_NOT_CONFIRMED+SMC_REVERSAL_EVIDENCE_MISSING",
+          "count": 92
+        },
+        {
+          "reasons": "COUNTER_TREND_CONTEXT_MISSING+TREND",
+          "count": 66
+        },
+        {
+          "reasons": "CONFIDENCE+CONFIRM+CONFIRMATION_HARD_CHECK_FAILED+ENTRY+ENTRY_HARD_CHECK_FAILED+LEVEL_CHECK_FAILED+QUALITY+REGIME+REVERSAL_CONFIRMATIONS_LOW+REVERSAL_MOMENTUM_OR_RECOVERY_MISSING+REVERSAL_RECOVERY_NOT_CONFIRMED+SMC_REVERSAL_EVIDENCE_MISSING",
+          "count": 35
+        },
+        {
+          "reasons": "CONFIDENCE+CONFIRM+CONFIRMATION_HARD_CHECK_FAILED+COUNTER_TREND_CONTEXT_MISSING+ENTRY+ENTRY_HARD_CHECK_FAILED+QUALITY+REGIME+REVERSAL_CONFIRMATIONS_LOW+REVERSAL_MOMENTUM_OR_RECOVERY_MISSING+REVERSAL_RECOVERY_NOT_CONFIRMED+TREND",
+          "count": 33
+        },
+        {
+          "reasons": "CONFIDENCE+CONFIRM+CONFIRMATION_HARD_CHECK_FAILED+ENTRY+ENTRY_HARD_CHECK_FAILED+QUALITY+REGIME+REVERSAL_CONFIRMATIONS_LOW+REVERSAL_MOMENTUM_OR_RECOVERY_MISSING+REVERSAL_RECOVERY_NOT_CONFIRMED+SMC_REVERSAL_EVIDENCE_MISSING+TREND",
+          "count": 26
+        },
+        {
+          "reasons": "CONFIDENCE+CONFIRM+CONFIRMATION_HARD_CHECK_FAILED+ENTRY+ENTRY_HARD_CHECK_FAILED+QUALITY+REGIME+REVERSAL_CONFIRMATIONS_LOW+REVERSAL_MOMENTUM_OR_RECOVERY_MISSING+REVERSAL_RECOVERY_NOT_CONFIRMED+TREND",
+          "count": 24
+        },
+        {
+          "reasons": "CONFIDENCE+CONFIRM+CONFIRMATION_HARD_CHECK_FAILED+COUNTER_TREND_CONTEXT_MISSING+ENTRY+ENTRY_HARD_CHECK_FAILED+QUALITY+REGIME+REVERSAL_CONFIRMATIONS_LOW+REVERSAL_MOMENTUM_OR_RECOVERY_MISSING+REVERSAL_RECOVERY_NOT_CONFIRMED+SMC_REVERSAL_EVIDENCE_MISSING+TREND",
+          "count": 23
+        },
+        {
+          "reasons": "REGIME",
+          "count": 23
+        },
+        {
+          "reasons": "COUNTER_TREND_CONTEXT_MISSING+REGIME+TREND",
+          "count": 20
+        }
+      ],
+      "pre_entry_rejections": [
+        {
+          "reason": "TOO CLOSE TO SUPPORT | ROOM=-2.71% < MIN=15.0%",
+          "count": 1
+        },
+        {
+          "reason": "TOO CLOSE TO SUPPORT | ROOM=-2.81% < MIN=15.0%",
+          "count": 1
+        },
+        {
+          "reason": "TOO CLOSE TO SUPPORT | ROOM=3.1% < MIN=15.0%",
+          "count": 1
+        },
+        {
+          "reason": "TOO CLOSE TO SUPPORT | ROOM=7.96% < MIN=15.0%",
+          "count": 1
+        }
+      ]
+    }
+  },
+  "settings": {
+    "signal_step_candles": 12,
+    "exit_timeframe": "1h",
+    "slice_max_rows": 420,
+    "use_btc_context": true,
+    "use_dca": true,
+    "trend_sl_enabled": false,
+    "reversal_sl_enabled": true,
+    "trend_max_sl_roi": 6.0,
+    "reversal_max_sl_roi": 80.0,
+    "reversal_tp_max_roi": 45.0,
+    "reversal_profit_protection_enabled": true,
+    "reversal_profit_trigger_roi": 12.0,
+    "reversal_profit_lock_roi": 3.0,
+    "reversal_profit_retrace_pct": 50.0,
+    "reversal_entry_enabled": true,
+    "trend_exhaustion_guard_enabled": true,
+    "trend_exhaustion_min_warning_points": 4.0,
+    "confirmation_types": [
+      "REVERSAL"
+    ]
+  }
+}

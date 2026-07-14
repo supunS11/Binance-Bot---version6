@@ -1,0 +1,53 @@
+{
+  "initial_balance": 1000.0,
+  "final_balance": 1000.0,
+  "net_pnl": 0.0,
+  "net_return_pct": 0.0,
+  "total_trades": 0,
+  "wins": 0,
+  "losses": 0,
+  "win_rate_pct": 0,
+  "profit_factor": null,
+  "gross_profit": 0.0,
+  "gross_loss": 0.0,
+  "max_drawdown_pct": 0.0,
+  "avg_roi_on_margin_pct": 0,
+  "avg_duration_hours": 0,
+  "dca_trades": 0,
+  "skipped_by_position_limits": 0,
+  "notes": [
+    "Backtest uses historical OHLCV candles and simulated fills.",
+    "News, LLM, realtime websocket confirmation, order-book flow, and private account state are not replayed.",
+    "Intracandle order is conservative: DCA, SL, then TP are evaluated inside the same candle."
+  ],
+  "equity_curve": [],
+  "symbols": [
+    "DOGEUSDT"
+  ],
+  "start": "2025-07-01T00:00:00+00:00",
+  "end": "2026-07-01T00:00:00+00:00",
+  "failed_symbols": {},
+  "generated_trades_before_position_limits": 0,
+  "settings": {
+    "signal_step_candles": 4,
+    "exit_timeframe": "1h",
+    "slice_max_rows": 420,
+    "use_btc_context": true,
+    "use_dca": true,
+    "trend_sl_enabled": false,
+    "reversal_sl_enabled": true,
+    "trend_max_sl_roi": 6.0,
+    "reversal_max_sl_roi": 80.0,
+    "reversal_tp_max_roi": 45.0,
+    "reversal_profit_protection_enabled": true,
+    "reversal_profit_trigger_roi": 12.0,
+    "reversal_profit_lock_roi": 3.0,
+    "reversal_profit_retrace_pct": 50.0,
+    "reversal_entry_enabled": true,
+    "trend_exhaustion_guard_enabled": true,
+    "trend_exhaustion_min_warning_points": 4.0,
+    "confirmation_types": [
+      "REVERSAL"
+    ]
+  }
+}
