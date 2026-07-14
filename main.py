@@ -2,7 +2,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import config
 
@@ -82,6 +82,43 @@ _dca_locks = {}
 _dca_locks_guard = threading.Lock()
 shutdown_event = threading.Event()
 target_margin_stop_lock = threading.Lock()
+
+
+def wait_for_next_scan(reason="SCAN_COMPLETE"):
+    wait_seconds = max(float(config.SCAN_SLEEP_SECONDS), 0)
+    heartbeat_seconds = max(
+        float(getattr(config, "SCAN_WAIT_HEARTBEAT_SECONDS", 60)),
+        1,
+    )
+    deadline = time.monotonic() + wait_seconds
+    next_scan_at = datetime.now() + timedelta(seconds=wait_seconds)
+    next_scan_label = next_scan_at.isoformat(timespec="seconds")
+    log_info(
+        f"Waiting next scan | REASON={reason} | "
+        f"WAIT_SECONDS={round(wait_seconds, 1)} | "
+        f"NEXT_SCAN_AT={next_scan_label}"
+    )
+
+    while not shutdown_event.is_set():
+        remaining = deadline - time.monotonic()
+
+        if remaining <= 0:
+            log_info("Next scan wait complete | starting scan now")
+            return True
+
+        if shutdown_event.wait(min(remaining, heartbeat_seconds)):
+            return False
+
+        remaining = max(deadline - time.monotonic(), 0)
+
+        if remaining > 0:
+            log_info(
+                f"Next scan heartbeat | "
+                f"REMAINING_SECONDS={round(remaining, 1)} | "
+                f"NEXT_SCAN_AT={next_scan_label}"
+            )
+
+    return False
 
 
 def get_dca_lock(symbol):
@@ -3181,7 +3218,7 @@ def run_bot():
 
                 if position_details is None:
                     log_warning("Position snapshot unavailable; skipping this scan")
-                    shutdown_event.wait(config.SCAN_SLEEP_SECONDS)
+                    wait_for_next_scan("POSITION_SNAPSHOT_UNAVAILABLE")
                     continue
 
                 open_positions = get_open_position_amounts(position_details)
@@ -3388,12 +3425,11 @@ def run_bot():
                 if shutdown_event.is_set():
                     break
 
-                log_info("Waiting next scan...")
-                shutdown_event.wait(config.SCAN_SLEEP_SECONDS)
+                wait_for_next_scan()
 
             except Exception as e:
                 log_error(f"MAIN LOOP ERROR: {e}")
-                shutdown_event.wait(config.SCAN_SLEEP_SECONDS)
+                wait_for_next_scan("MAIN_LOOP_ERROR")
 
     finally:
         target_margin_monitor.stop()
