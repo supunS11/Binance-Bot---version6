@@ -2440,6 +2440,263 @@ def _trend_timing_rescue_context(
     return context
 
 
+def _continuation_pullback_context(
+    side,
+    entry_df,
+    trend_ok,
+    confirm_ok,
+    entry_ok,
+    level_ok,
+    trend_score,
+    confirm_score,
+    entry_score,
+    quality_score,
+    regime_score,
+    trend_confidence,
+    entry_quality,
+    participation_score,
+    participation,
+    futures_ok
+):
+    enabled = bool(getattr(config, "CONTINUATION_PULLBACK_ENABLED", True))
+    context = {
+        "enabled": enabled,
+        "eligible": False,
+        "active": False,
+        "reasons": [],
+    }
+
+    if not enabled:
+        context["reasons"].append("CONTINUATION_PULLBACK_DISABLED")
+        context["reason"] = "CONTINUATION_PULLBACK_DISABLED"
+        return context
+
+    reasons = []
+
+    if entry_ok:
+        reasons.append("NORMAL_ENTRY_ALREADY_VALID")
+    if not trend_ok:
+        reasons.append("DAILY_TREND_HARD_CHECK_FAILED")
+    if not confirm_ok:
+        reasons.append("CONFIRMATION_HARD_CHECK_FAILED")
+    if not level_ok:
+        reasons.append("ADVERSE_LEVEL_CHECK_FAILED")
+    if not bool(entry_quality.get("late_entry_ok", True)):
+        reasons.append("LATE_ENTRY_HARD_BLOCK")
+
+    minimum_checks = (
+        (
+            "CONFIDENCE",
+            trend_confidence,
+            get_config_float("CONTINUATION_PULLBACK_MIN_CONFIDENCE", 80),
+        ),
+        (
+            "TREND",
+            trend_score,
+            get_config_float("CONTINUATION_PULLBACK_MIN_TREND_SCORE", 8),
+        ),
+        (
+            "CONFIRM",
+            confirm_score,
+            get_config_float("CONTINUATION_PULLBACK_MIN_CONFIRM_SCORE", 8),
+        ),
+        (
+            "ENTRY",
+            entry_score,
+            get_config_float("CONTINUATION_PULLBACK_MIN_ENTRY_SCORE", 2.5),
+        ),
+        (
+            "QUALITY",
+            quality_score,
+            get_config_float("CONTINUATION_PULLBACK_MIN_QUALITY_SCORE", 1),
+        ),
+        (
+            "REGIME",
+            regime_score,
+            get_config_float("CONTINUATION_PULLBACK_MIN_REGIME_SCORE", 0),
+        ),
+    )
+
+    for label, value, minimum in minimum_checks:
+        value = _safe_float(value)
+        minimum = _safe_float(minimum)
+
+        if value < minimum:
+            reasons.append(f"{label}={round(value, 2)} < {minimum}")
+
+    lookback = max(
+        get_config_int("CONTINUATION_PULLBACK_STRUCTURE_LOOKBACK", 8),
+        2,
+    )
+    closed = entry_df.iloc[:-1] if len(entry_df) > 1 else entry_df
+
+    if len(closed) < lookback + 1:
+        reasons.append(
+            f"INSUFFICIENT_ENTRY_HISTORY={len(closed)} < {lookback + 1}"
+        )
+        candle = latest_closed(entry_df)
+        prior = closed.iloc[0:0]
+    else:
+        candle = closed.iloc[-1]
+        prior = closed.iloc[-lookback - 1:-1]
+
+    close = _safe_float(candle.get("close"))
+    high = _safe_float(candle.get("high"))
+    low = _safe_float(candle.get("low"))
+    atr = max(_safe_float(candle.get("atr")), 1e-10)
+    ema20 = _safe_float(candle.get("ema20"))
+    ema50 = _safe_float(candle.get("ema50"))
+    rsi = _safe_float(candle.get("rsi"), 50)
+    volume = _safe_float(candle.get("volume"))
+    volume_sma = _safe_float(candle.get("volume_sma"))
+    candle_atr = max(high - low, 0) / atr
+    volume_mult = volume / volume_sma if volume_sma > 0 else 0
+    ema20_distance_atr = abs(close - ema20) / atr if ema20 else float("inf")
+    touch_buffer = max(
+        get_config_float("CONTINUATION_PULLBACK_EMA20_TOUCH_ATR", 0.20),
+        0,
+    ) * atr
+    ema50_buffer = max(
+        get_config_float(
+            "CONTINUATION_PULLBACK_EMA50_BREAK_BUFFER_ATR",
+            0.15,
+        ),
+        0,
+    ) * atr
+    structure_buffer = max(
+        get_config_float(
+            "CONTINUATION_PULLBACK_STRUCTURE_BREAK_BUFFER_ATR",
+            0.15,
+        ),
+        0,
+    ) * atr
+    ema20_touched = low <= ema20 + touch_buffer and high >= ema20 - touch_buffer
+
+    if side == "BUY":
+        ema_stack_ok = ema20 > ema50
+        ema50_hold_ok = close >= ema50 - ema50_buffer
+        structure_level = (
+            _safe_float(prior["low"].min())
+            if not prior.empty and "low" in prior
+            else 0
+        )
+        structure_ok = bool(structure_level) and close >= structure_level - structure_buffer
+        rsi_ok = (
+            get_config_float("CONTINUATION_PULLBACK_BUY_MIN_RSI", 44)
+            <= rsi <=
+            get_config_float("CONTINUATION_PULLBACK_BUY_MAX_RSI", 70)
+        )
+    else:
+        ema_stack_ok = ema20 < ema50
+        ema50_hold_ok = close <= ema50 + ema50_buffer
+        structure_level = (
+            _safe_float(prior["high"].max())
+            if not prior.empty and "high" in prior
+            else 0
+        )
+        structure_ok = bool(structure_level) and close <= structure_level + structure_buffer
+        rsi_ok = (
+            get_config_float("CONTINUATION_PULLBACK_SELL_MIN_RSI", 30)
+            <= rsi <=
+            get_config_float("CONTINUATION_PULLBACK_SELL_MAX_RSI", 56)
+        )
+
+    max_ema20_distance_atr = get_config_float(
+        "CONTINUATION_PULLBACK_MAX_EMA20_DISTANCE_ATR",
+        0.75,
+    )
+    max_candle_atr = get_config_float(
+        "CONTINUATION_PULLBACK_MAX_CANDLE_ATR",
+        1.25,
+    )
+    max_volume_mult = get_config_float(
+        "CONTINUATION_PULLBACK_MAX_VOLUME_MULT",
+        1.35,
+    )
+    setup_checks = (
+        ("EMA_STACK_NOT_ALIGNED", ema_stack_ok),
+        ("EMA20_NOT_TOUCHED", ema20_touched),
+        ("EMA50_HOLD_FAILED", ema50_hold_ok),
+        ("ENTRY_STRUCTURE_BROKEN", structure_ok),
+        ("PULLBACK_RSI_OUT_OF_RANGE", rsi_ok),
+        (
+            f"EMA20_DISTANCE_ATR={round(ema20_distance_atr, 2)} > "
+            f"{max_ema20_distance_atr}",
+            ema20_distance_atr <= max_ema20_distance_atr,
+        ),
+        (
+            f"CANDLE_ATR={round(candle_atr, 2)} > {max_candle_atr}",
+            candle_atr <= max_candle_atr,
+        ),
+        (
+            f"VOLUME_MULT={round(volume_mult, 2)} > {max_volume_mult}",
+            volume_sma > 0 and volume_mult <= max_volume_mult,
+        ),
+    )
+
+    for reason, check_ok in setup_checks:
+        if not check_ok:
+            reasons.append(reason)
+
+    eligible = not reasons
+    participation_available = bool(
+        participation and participation.get("available")
+    )
+    require_futures = bool(
+        getattr(config, "CONTINUATION_PULLBACK_REQUIRE_FUTURES", True)
+    )
+    min_futures = get_config_float(
+        "CONTINUATION_PULLBACK_MIN_FUTURES_SCORE",
+        0.5,
+    )
+    futures_score = _safe_float(participation_score)
+    futures_supports = futures_ok and futures_score >= min_futures
+    active = eligible
+
+    if require_futures:
+        if not participation_available:
+            active = False
+            reasons.append("FUTURES_CONTEXT_REQUIRED")
+        elif not futures_supports:
+            active = False
+            reasons.append(
+                f"FUTURES_SCORE={round(futures_score, 2)} < {min_futures}"
+            )
+    elif participation_available and not futures_supports:
+        active = False
+        reasons.append(
+            f"FUTURES_SCORE={round(futures_score, 2)} < {min_futures}"
+        )
+
+    context.update({
+        "eligible": eligible,
+        "active": active,
+        "reasons": reasons,
+        "ema_stack_ok": ema_stack_ok,
+        "ema20_touched": ema20_touched,
+        "ema50_hold_ok": ema50_hold_ok,
+        "structure_ok": structure_ok,
+        "structure_level": round(structure_level, 8),
+        "rsi": round(rsi, 2),
+        "ema20_distance_atr": round(ema20_distance_atr, 2),
+        "candle_atr": round(candle_atr, 2),
+        "volume_mult": round(volume_mult, 2),
+        "participation_available": participation_available,
+        "futures_score": round(futures_score, 2),
+        "min_futures_score": min_futures,
+        "reason": (
+            "CONTINUATION_PULLBACK_ACTIVE"
+            if active
+            else (
+                "CONTINUATION_PULLBACK_AWAITING_FUTURES"
+                if eligible and not participation_available
+                else "CONTINUATION_PULLBACK_BLOCKED"
+            )
+        ),
+    })
+    return context
+
+
 def _counter_trend_context(side, trend_df, confirm_df):
     trend = latest_closed(trend_df)
     confirm = latest_closed(confirm_df)
@@ -3002,7 +3259,10 @@ def _reversal_signal_check(
     if (
         getattr(config, "REVERSAL_REQUIRE_SMC", True)
         and not smc_ok
-        and not momentum_ok
+        and not (
+            momentum_ok and
+            getattr(config, "REVERSAL_ALLOW_MOMENTUM_WITHOUT_SMC", False)
+        )
     ):
         failures.append("SMC_REVERSAL_EVIDENCE_MISSING")
 
@@ -3162,6 +3422,149 @@ def _reversal_signal_check(
         failures.append(invalidation.get("reason", "REVERSAL_INVALIDATED"))
 
     return not failures, failures, context
+
+
+def _reversal_futures_confirmation_context(
+    chart_reversal_ok,
+    participation_score,
+    participation,
+    futures_ok,
+):
+    required = bool(
+        getattr(config, "REVERSAL_REQUIRE_FUTURES_CONFIRMATION", True)
+    )
+    available = bool(participation and participation.get("available"))
+    score = _safe_float(participation_score)
+    minimum = get_config_float("REVERSAL_MIN_FUTURES_SCORE", 0.5)
+    eligible = bool(chart_reversal_ok)
+    active = bool(
+        eligible and
+        (
+            not required or
+            (available and futures_ok and score >= minimum)
+        )
+    )
+    reasons = []
+
+    if eligible and required and not available:
+        reasons.append("REVERSAL_FUTURES_CONTEXT_REQUIRED")
+    elif eligible and required and not futures_ok:
+        reasons.append("REVERSAL_FUTURES_CONTEXT_CONFLICT")
+    elif eligible and required and score < minimum:
+        reasons.append(
+            f"REVERSAL_FUTURES_SCORE={round(score, 2)} < {minimum}"
+        )
+
+    return {
+        "required": required,
+        "eligible": eligible,
+        "active": active,
+        "available": available,
+        "score": round(score, 2),
+        "minimum": minimum,
+        "reasons": reasons,
+        "reason": (
+            "REVERSAL_FUTURES_CONFIRMED"
+            if active
+            else (
+                "REVERSAL_FUTURES_AWAITING_CONTEXT"
+                if eligible and required and not available
+                else "REVERSAL_FUTURES_BLOCKED"
+            )
+        ),
+    }
+
+
+def evaluate_reversal_profit_protection(
+    side,
+    avg_entry,
+    current_price,
+    peak_roi=0,
+    leverage=None,
+):
+    enabled = bool(
+        getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True)
+    )
+    info = {
+        "enabled": enabled,
+        "armed": False,
+        "should_exit": False,
+        "current_roi": 0.0,
+        "peak_roi": max(_safe_float(peak_roi), 0),
+        "floor_roi": 0.0,
+        "reason": "REVERSAL_PROFIT_PROTECTION_DISABLED",
+    }
+
+    if not enabled:
+        return info
+
+    avg_entry = _safe_float(avg_entry)
+    current_price = _safe_float(current_price)
+    leverage = max(
+        _safe_float(leverage, getattr(config, "LEVERAGE", 1)),
+        1,
+    )
+
+    if side not in ("BUY", "SELL") or avg_entry <= 0 or current_price <= 0:
+        info["reason"] = "REVERSAL_PROFIT_PROTECTION_INVALID_PRICE"
+        return info
+
+    if side == "BUY":
+        current_roi = (
+            (current_price - avg_entry) / avg_entry
+        ) * leverage * 100
+    else:
+        current_roi = (
+            (avg_entry - current_price) / avg_entry
+        ) * leverage * 100
+
+    peak_roi = max(_safe_float(peak_roi), current_roi, 0)
+    trigger_roi = max(
+        get_config_float("REVERSAL_PROFIT_PROTECTION_TRIGGER_ROI", 12),
+        0,
+    )
+    lock_roi = max(
+        get_config_float("REVERSAL_PROFIT_PROTECTION_LOCK_ROI", 3),
+        0,
+    )
+    retrace_pct = min(
+        max(
+            get_config_float(
+                "REVERSAL_PROFIT_PROTECTION_RETRACE_PCT",
+                50,
+            ),
+            0,
+        ),
+        100,
+    )
+    armed = peak_roi >= trigger_roi
+    floor_roi = (
+        max(lock_roi, peak_roi * (1 - retrace_pct / 100))
+        if armed
+        else 0
+    )
+    should_exit = armed and current_roi <= floor_roi
+
+    info.update({
+        "armed": armed,
+        "should_exit": should_exit,
+        "current_roi": round(float(current_roi), 2),
+        "peak_roi": round(float(peak_roi), 2),
+        "floor_roi": round(float(floor_roi), 2),
+        "trigger_roi": trigger_roi,
+        "lock_roi": lock_roi,
+        "retrace_pct": retrace_pct,
+        "reason": (
+            "REVERSAL_PROFIT_RETRACE_EXIT"
+            if should_exit
+            else (
+                "REVERSAL_PROFIT_PROTECTION_ARMED"
+                if armed
+                else "REVERSAL_PROFIT_TRIGGER_NOT_REACHED"
+            )
+        ),
+    })
+    return info
 
 
 def _refresh_side_decision(side_data):
@@ -3464,9 +3867,28 @@ def _side_signal_score(
         participation,
         futures_ok
     )
+    continuation_pullback = _continuation_pullback_context(
+        side,
+        entry_df,
+        trend_ok,
+        confirm_ok,
+        entry_ok,
+        level_ok,
+        trend_score,
+        confirm_score,
+        entry_score,
+        quality_score,
+        regime_score,
+        trend_confidence,
+        entry_quality,
+        participation_score,
+        participation,
+        futures_ok
+    )
     trend_following_ok = (
         normal_trend_following_ok or
-        trend_timing_rescue.get("active", False)
+        trend_timing_rescue.get("active", False) or
+        continuation_pullback.get("active", False)
     )
     reversal_ok, reversal_reasons, reversal_context = _reversal_signal_check(
         side,
@@ -3486,12 +3908,33 @@ def _side_signal_score(
         entry_ok,
         level_ok
     )
+    chart_reversal_ok = reversal_ok
+    reversal_futures_confirmation = _reversal_futures_confirmation_context(
+        chart_reversal_ok,
+        participation_score,
+        participation,
+        futures_ok,
+    )
+    reversal_context["futures_confirmation"] = (
+        reversal_futures_confirmation
+    )
 
     if not futures_ok:
         reversal_ok = False
         reversal_reasons = list(reversal_reasons) + futures_gate_reasons
 
-    reversal_confirmed = reversal_ok
+    if (
+        reversal_futures_confirmation.get("available") and
+        reversal_futures_confirmation.get("required") and
+        not reversal_futures_confirmation.get("active")
+    ):
+        reversal_ok = False
+        reversal_reasons = (
+            list(reversal_reasons) +
+            list(reversal_futures_confirmation.get("reasons", []))
+        )
+
+    reversal_confirmed = chart_reversal_ok
 
     if reversal_ok and not getattr(config, "REVERSAL_ENTRY_ENABLED", True):
         reversal_ok = False
@@ -3528,6 +3971,7 @@ def _side_signal_score(
         "trend_following_ok": trend_following_ok,
         "normal_trend_following_ok": normal_trend_following_ok,
         "trend_timing_rescue": trend_timing_rescue,
+        "continuation_pullback": continuation_pullback,
         "reversal_ok": reversal_ok,
         "reversal_confirmed": reversal_confirmed,
         "reversal_reasons": reversal_reasons,
@@ -3647,6 +4091,13 @@ def log_signal_analysis(analysis):
 
     for side_data in (buy, sell):
         rescue = side_data.get("trend_timing_rescue") or {}
+        pullback = side_data.get("continuation_pullback") or {}
+        reversal_futures = (
+            (side_data.get("reversal_context") or {}).get(
+                "futures_confirmation",
+                {},
+            )
+        )
 
         if rescue.get("active"):
             log_info(
@@ -3663,6 +4114,42 @@ def log_signal_analysis(analysis):
                 f"{side_data.get('side')} TREND TIMING RESCUE WAITING | "
                 f"MISSED={rescue.get('missed_module')} | "
                 f"REASON={rescue.get('reason')}"
+            )
+
+        if pullback.get("active"):
+            log_info(
+                f"{side_data.get('side')} CONTINUATION PULLBACK ACTIVE | "
+                f"CONFIDENCE={side_data.get('trend_confidence')} | "
+                f"EMA20_DISTANCE_ATR={pullback.get('ema20_distance_atr')} | "
+                f"FUTURES={pullback.get('futures_score')}"
+            )
+        elif (
+            pullback.get("reason") ==
+            "CONTINUATION_PULLBACK_AWAITING_FUTURES"
+        ):
+            log_info(
+                f"{side_data.get('side')} CONTINUATION PULLBACK WAITING | "
+                f"EMA20_DISTANCE_ATR={pullback.get('ema20_distance_atr')} | "
+                f"REASON={pullback.get('reason')}"
+            )
+
+        if (
+            reversal_futures.get("reason") ==
+            "REVERSAL_FUTURES_AWAITING_CONTEXT"
+        ):
+            log_info(
+                f"{side_data.get('side')} REVERSAL FUTURES WAITING | "
+                f"MIN_SCORE={reversal_futures.get('minimum')}"
+            )
+        elif (
+            reversal_futures.get("eligible") and
+            reversal_futures.get("available") and
+            not reversal_futures.get("active")
+        ):
+            log_warning(
+                f"{side_data.get('side')} REVERSAL FUTURES BLOCKED | "
+                f"SCORE={reversal_futures.get('score')} | "
+                f"MIN={reversal_futures.get('minimum')}"
             )
 
         exhaustion = side_data.get("trend_exhaustion") or {}
@@ -3870,6 +4357,32 @@ def should_fetch_futures_context(analysis):
     sell = analysis.get("sell", {})
 
     if any(
+        (side_data.get("continuation_pullback") or {}).get("eligible")
+        and not (side_data.get("continuation_pullback") or {}).get(
+            "participation_available"
+        )
+        for side_data in (buy, sell)
+    ):
+        return True
+
+    if any(
+        (
+            (side_data.get("reversal_context") or {}).get(
+                "futures_confirmation",
+                {},
+            )
+        ).get("eligible")
+        and not (
+            (side_data.get("reversal_context") or {}).get(
+                "futures_confirmation",
+                {},
+            )
+        ).get("available")
+        for side_data in (buy, sell)
+    ):
+        return True
+
+    if any(
         (side_data.get("trend_timing_rescue") or {}).get("eligible")
         and not (side_data.get("trend_timing_rescue") or {}).get(
             "participation_available"
@@ -3920,6 +4433,70 @@ def should_fetch_futures_context(analysis):
         (buy.get("level_ok") and buy.get("hard_ok")) or
         (sell.get("level_ok") and sell.get("hard_ok"))
     )
+
+
+def futures_context_priority(analysis):
+    signal = analysis.get("signal")
+    priorities = []
+
+    for side_data in (analysis.get("buy", {}), analysis.get("sell", {})):
+        if not side_data:
+            continue
+
+        priority = _safe_float(
+            side_data.get("confidence"),
+            _safe_float(
+                side_data.get("trend_confidence"),
+                analysis.get("best_confidence", 0),
+            ),
+        )
+        priority += (
+            _safe_float(side_data.get("quality_score")) *
+            get_config_float("SIGNAL_RANKING_QUALITY_WEIGHT", 1.5)
+        )
+        priority += (
+            _safe_float(side_data.get("smc_score")) *
+            get_config_float("SIGNAL_RANKING_SMC_WEIGHT", 1.0)
+        )
+        priority += (
+            _safe_float(side_data.get("regime_score")) *
+            get_config_float("SIGNAL_RANKING_REGIME_WEIGHT", 1.0)
+        )
+
+        if (side_data.get("continuation_pullback") or {}).get("eligible"):
+            priority += get_config_float(
+                "FUTURES_CONTEXT_PRIORITY_PULLBACK_BONUS",
+                8,
+            )
+
+        if (side_data.get("trend_timing_rescue") or {}).get("eligible"):
+            priority += get_config_float(
+                "FUTURES_CONTEXT_PRIORITY_RESCUE_BONUS",
+                5,
+            )
+
+        reversal_futures = (
+            (side_data.get("reversal_context") or {}).get(
+                "futures_confirmation",
+                {},
+            )
+        )
+
+        if reversal_futures.get("eligible"):
+            priority += get_config_float(
+                "FUTURES_CONTEXT_PRIORITY_REVERSAL_BONUS",
+                6,
+            )
+
+        if signal == side_data.get("side"):
+            priority += get_config_float(
+                "FUTURES_CONTEXT_PRIORITY_SIGNAL_BONUS",
+                3,
+            )
+
+        priorities.append(priority)
+
+    return round(max(priorities, default=0), 2)
 
 
 def check_signal(trend_df, confirm_df, entry_df, btc_trend, btc_corr, rs):

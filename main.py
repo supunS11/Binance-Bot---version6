@@ -22,6 +22,8 @@ from exchange import (
     get_futures_participation,
     get_mark_price,
     get_open_take_profit_info,
+    get_open_stop_loss_info,
+    place_stop_loss_only,
     set_margin_type,
     setup_leverage,
     get_entry_price,
@@ -33,6 +35,8 @@ from exchange import (
 from indicators import apply_indicators
 from strategy import (
     analyze_signal,
+    evaluate_reversal_profit_protection,
+    futures_context_priority,
     log_signal_analysis,
     should_fetch_futures_context,
     validate_live_entry_guard,
@@ -65,6 +69,7 @@ from trade_state import (
     prune_closed_positions,
     record_dca_fill,
     reserve_dca_level,
+    update_position_runtime_fields,
     update_position_tp_status,
     upsert_position_state
 )
@@ -160,8 +165,8 @@ def calculate_btc_context(symbol, trend_df, btc_df):
         return 0, 0
 
     try:
-        coin_close = trend_df["close"].tail(100).reset_index(drop=True)
-        btc_close = btc_df["close"].tail(100).reset_index(drop=True)
+        coin_close = trend_df["close"].iloc[:-1].tail(100).reset_index(drop=True)
+        btc_close = btc_df["close"].iloc[:-1].tail(100).reset_index(drop=True)
         length = min(len(coin_close), len(btc_close))
 
         if length < 20:
@@ -1496,11 +1501,112 @@ def run_scan_dca_check(
     )
 
 
-def dca_tick_ready(symbol, mark_price):
-    state = load_trade_state()
+def ensure_reversal_stop_loss(
+    symbol,
+    position_detail,
+    state,
+    btc_trend_df,
+):
+    if not getattr(config, "REVERSAL_SL_ENABLED", False):
+        return
+
     position_state = get_position_state(state, symbol)
 
     if not position_state or not position_state.get("managed_by_bot"):
+        return
+
+    signal_type = str(
+        position_state.get("confirmation_type") or
+        position_state.get("signal_type") or
+        ""
+    ).upper()
+
+    if signal_type != "REVERSAL":
+        return
+
+    if (
+        position_state.get("sl_status") == "CREATED" and
+        position_state.get("sl_price") not in (None, "")
+    ):
+        return
+
+    existing_sl = get_open_stop_loss_info(symbol)
+
+    if existing_sl.get("sl_price") not in (None, ""):
+        update_position_runtime_fields(
+            state,
+            symbol,
+            {
+                "sl_status": "CREATED",
+                "sl_enabled": True,
+                "sl_price": existing_sl.get("sl_price"),
+                "sl_source": existing_sl.get("source"),
+            },
+        )
+        return
+
+    entry_price = float(
+        position_detail.get("entry_price") or
+        position_state.get("avg_entry") or
+        position_state.get("initial_entry") or
+        0
+    )
+
+    if entry_price <= 0:
+        log_warning(f"{symbol} reversal SL reconcile skipped | missing entry")
+        return
+
+    _, confirm_df, _ = get_signal_frames(symbol, btc_trend_df)
+
+    if confirm_df is None:
+        log_warning(
+            f"{symbol} reversal SL reconcile skipped | "
+            "confirmation data unavailable"
+        )
+        return
+
+    order_side = (
+        SIDE_BUY
+        if position_state.get("side") == "BUY"
+        else SIDE_SELL
+    )
+    result = place_stop_loss_only(
+        symbol,
+        order_side,
+        entry_price,
+        confirm_df,
+        signal_type="REVERSAL",
+    )
+    sl_created = bool(result.get("ok"))
+    update_position_runtime_fields(
+        state,
+        symbol,
+        {
+            "sl_status": "CREATED" if sl_created else "FAILED",
+            "sl_enabled": sl_created,
+            "sl_price": result.get("sl_price"),
+            "sl_source": "REVERSAL_STARTUP_RECONCILE",
+        },
+    )
+
+    if sl_created:
+        send_telegram_message(
+            f"{config.TELEGRAM_MESSAGE_PREFIX}\n"
+            f"{symbol} reversal stop loss added\n"
+            f"SL: {result.get('sl_price')}"
+        )
+    else:
+        log_error(f"{symbol} reversal SL reconcile failed")
+
+
+def dca_tick_ready(symbol, mark_price, state=None):
+    state = state or load_trade_state()
+    position_state = get_position_state(state, symbol)
+
+    if not position_state or not position_state.get("managed_by_bot"):
+        return False
+
+    if position_state.get("reversal_profit_exit_status") == "SUBMITTED":
         return False
 
     if has_active_dca_reservation(state, symbol):
@@ -1718,7 +1824,13 @@ class TargetMarginBalanceMonitor:
 
 class DcaWebsocketMonitor:
     def __init__(self):
-        self.enabled = bool(config.DCA_ENABLED and config.DCA_WEBSOCKET_ENABLED)
+        self.enabled = bool(
+            config.DCA_WEBSOCKET_ENABLED and
+            (
+                config.DCA_ENABLED or
+                getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True)
+            )
+        )
         self.twm = None
         self.socket_key = None
         self.streams = ()
@@ -1729,6 +1841,9 @@ class DcaWebsocketMonitor:
         self.last_restart_at = 0.0
         self.watchdog_thread = None
         self.watchdog_stop_event = threading.Event()
+        self.protection_lock = threading.Lock()
+        self.reversal_peaks = {}
+        self.reversal_exit_pending = set()
 
     def start(self):
         if not self.enabled:
@@ -1925,6 +2040,16 @@ class DcaWebsocketMonitor:
             return
 
         symbols = sorted((position_details or {}).keys())
+        active_symbols = set(symbols)
+
+        with self.protection_lock:
+            self.reversal_peaks = {
+                symbol: peak
+                for symbol, peak in self.reversal_peaks.items()
+                if symbol in active_symbols
+            }
+            self.reversal_exit_pending.intersection_update(active_symbols)
+
         suffix = "@markPrice@1s" if config.DCA_WEBSOCKET_FAST_MARK_PRICE else "@markPrice"
         streams = tuple(f"{symbol.lower()}{suffix}" for symbol in symbols)
 
@@ -2011,7 +2136,16 @@ class DcaWebsocketMonitor:
         with self.lock:
             self.last_message_at = time.time()
 
-        if not dca_tick_ready(symbol, mark_price):
+        state = load_trade_state()
+
+        if self._handle_reversal_profit_protection(
+            symbol,
+            mark_price,
+            state,
+        ):
+            return
+
+        if not dca_tick_ready(symbol, mark_price, state=state):
             return
 
         log_warning(
@@ -2032,6 +2166,167 @@ class DcaWebsocketMonitor:
             current_price_override=mark_price,
             price_source="websocket"
         )
+
+    def _handle_reversal_profit_protection(self, symbol, mark_price, state):
+        if not getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True):
+            return False
+
+        position_state = get_position_state(state, symbol)
+
+        if not position_state or not position_state.get("managed_by_bot"):
+            return False
+
+        signal_type = str(
+            position_state.get("confirmation_type") or
+            position_state.get("signal_type") or
+            ""
+        ).upper()
+
+        if signal_type != "REVERSAL":
+            return False
+
+        if position_state.get("reversal_profit_exit_status") == "SUBMITTED":
+            return True
+
+        side = position_state.get("side")
+        avg_entry = float(position_state.get("avg_entry") or 0)
+        saved_peak = float(position_state.get("reversal_peak_roi") or 0)
+
+        with self.protection_lock:
+            previous_peak = max(
+                saved_peak,
+                float(self.reversal_peaks.get(symbol, 0) or 0),
+            )
+
+        info = evaluate_reversal_profit_protection(
+            side,
+            avg_entry,
+            mark_price,
+            peak_roi=previous_peak,
+            leverage=config.LEVERAGE,
+        )
+        peak_roi = float(info.get("peak_roi", 0) or 0)
+
+        with self.protection_lock:
+            self.reversal_peaks[symbol] = peak_roi
+
+        persist_step = max(
+            float(
+                getattr(
+                    config,
+                    "REVERSAL_PROFIT_PEAK_PERSIST_STEP_ROI",
+                    2,
+                )
+            ),
+            0.1,
+        )
+        trigger_roi = float(info.get("trigger_roi", 0) or 0)
+        should_persist = (
+            peak_roi >= saved_peak + persist_step or
+            (peak_roi >= trigger_roi > saved_peak)
+        )
+
+        if should_persist:
+            update_position_runtime_fields(
+                state,
+                symbol,
+                {
+                    "reversal_peak_roi": round(peak_roi, 2),
+                    "reversal_profit_floor_roi": info.get("floor_roi"),
+                    "reversal_profit_armed": bool(info.get("armed")),
+                },
+            )
+
+        if not info.get("should_exit"):
+            return False
+
+        lock = get_dca_lock(symbol)
+
+        if not lock.acquire(blocking=False):
+            log_info(
+                f"{symbol} reversal profit exit deferred | position busy"
+            )
+            return True
+
+        try:
+            with self.protection_lock:
+                if symbol in self.reversal_exit_pending:
+                    return True
+
+                self.reversal_exit_pending.add(symbol)
+
+            details = get_open_position_details(symbol)
+            position_detail = (details or {}).get(symbol)
+
+            if not position_detail:
+                log_warning(
+                    f"{symbol} reversal profit exit skipped | "
+                    "live position not found"
+                )
+
+                with self.protection_lock:
+                    self.reversal_exit_pending.discard(symbol)
+
+                return True
+
+            amount = float(position_detail.get("amount", 0) or 0)
+            position_side = position_detail.get("position_side")
+            log_warning(
+                f"{symbol} REVERSAL PROFIT RETRACE EXIT | "
+                f"CURRENT_ROI={info.get('current_roi')}% | "
+                f"PEAK_ROI={info.get('peak_roi')}% | "
+                f"FLOOR_ROI={info.get('floor_roi')}%"
+            )
+            closed = close_position_market(
+                symbol,
+                amount,
+                position_side=position_side,
+            )
+
+            if closed:
+                cancel_open_protection_orders(symbol)
+                update_position_runtime_fields(
+                    state,
+                    symbol,
+                    {
+                        "reversal_peak_roi": round(peak_roi, 2),
+                        "reversal_profit_exit_status": "SUBMITTED",
+                        "reversal_profit_exit_price": mark_price,
+                        "reversal_profit_exit_roi": info.get("current_roi"),
+                        "reversal_profit_exit_reason": info.get("reason"),
+                    },
+                )
+                send_telegram_message(
+                    f"{config.TELEGRAM_MESSAGE_PREFIX}\n"
+                    f"{symbol} reversal profit protected\n"
+                    f"ROI: {info.get('current_roi')}%\n"
+                    f"Peak ROI: {info.get('peak_roi')}%\n"
+                    f"Protection floor: {info.get('floor_roi')}%"
+                )
+                return True
+
+            log_error(f"{symbol} reversal profit exit order failed")
+            update_position_runtime_fields(
+                state,
+                symbol,
+                {"reversal_profit_exit_status": "FAILED"},
+            )
+
+            with self.protection_lock:
+                self.reversal_exit_pending.discard(symbol)
+
+            return True
+
+        except Exception as e:
+            log_error(f"{symbol} reversal profit protection error: {e}")
+
+            with self.protection_lock:
+                self.reversal_exit_pending.discard(symbol)
+
+            return True
+
+        finally:
+            lock.release()
 
 
 def _safe_float(value, default=0.0):
@@ -2058,6 +2353,14 @@ def calculate_signal_rank(candidate):
         rank -= max(
             _safe_float(
                 getattr(config, "TREND_TIMING_RESCUE_RANK_PENALTY", 2.5)
+            ),
+            0
+        )
+
+    if (side_data.get("continuation_pullback") or {}).get("active"):
+        rank -= max(
+            _safe_float(
+                getattr(config, "CONTINUATION_PULLBACK_RANK_PENALTY", 1.5)
             ),
             0
         )
@@ -2274,15 +2577,76 @@ def execute_entry_candidate(
             return position_details, open_positions, False
 
         side_analysis = final_analysis.get(signal.lower(), {})
+        reversal_futures = (
+            (side_analysis.get("reversal_context") or {}).get(
+                "futures_confirmation",
+                {},
+            )
+        )
+
+        if (
+            signal_type == "REVERSAL" and
+            getattr(config, "REVERSAL_REQUIRE_FUTURES_CONFIRMATION", True) and
+            not reversal_futures.get("active")
+        ):
+            reason = "; ".join(
+                reversal_futures.get("reasons", [])
+            ) or "REVERSAL_FUTURES_CONFIRMATION_MISSING"
+            log_warning(f"{symbol} REVERSAL ENTRY BLOCKED | {reason}")
+            append_signal_journal(
+                symbol,
+                final_analysis,
+                participation,
+                trend_df,
+                confirm_df,
+                entry_df,
+                btc_trend,
+                btc_corr,
+                rs,
+                action="SKIPPED_REVERSAL_FUTURES",
+                skip_reason=reason,
+                news_context=news_context,
+                llm_context=llm_context
+            )
+            return position_details, open_positions, False
+
         timing_rescue = side_analysis.get("trend_timing_rescue") or {}
+        continuation_pullback = (
+            side_analysis.get("continuation_pullback") or {}
+        )
         timing_rescue_active = bool(timing_rescue.get("active"))
+        continuation_pullback_active = bool(
+            continuation_pullback.get("active")
+        )
         require_both_live = (
-            timing_rescue_active and
-            bool(
-                getattr(
-                    config,
-                    "TREND_TIMING_RESCUE_REQUIRE_BOTH_LIVE_TIMEFRAMES",
-                    True
+            (
+                timing_rescue_active and
+                bool(
+                    getattr(
+                        config,
+                        "TREND_TIMING_RESCUE_REQUIRE_BOTH_LIVE_TIMEFRAMES",
+                        True
+                    )
+                )
+            ) or
+            (
+                continuation_pullback_active and
+                bool(
+                    getattr(
+                        config,
+                        "CONTINUATION_PULLBACK_REQUIRE_BOTH_LIVE_TIMEFRAMES",
+                        True
+                    )
+                )
+            ) or
+            (
+                signal_type == "REVERSAL" and
+                bool(
+                    getattr(
+                        config,
+                        "REVERSAL_REQUIRE_BOTH_LIVE_TIMEFRAMES",
+                        True
+                    )
                 )
             )
         )
@@ -2292,6 +2656,14 @@ def execute_entry_candidate(
             log_info(
                 f"{symbol} TREND TIMING RESCUE EXECUTION | "
                 f"MISSED={timing_rescue.get('missed_module')} | "
+                f"REQUIRE_BOTH_LIVE={require_both_live}"
+            )
+
+        if continuation_pullback_active:
+            log_info(
+                f"{symbol} CONTINUATION PULLBACK EXECUTION | "
+                f"EMA20_DISTANCE_ATR="
+                f"{continuation_pullback.get('ema20_distance_atr')} | "
                 f"REQUIRE_BOTH_LIVE={require_both_live}"
             )
 
@@ -2583,6 +2955,14 @@ def execute_entry_candidate(
         position_state["tp_price"] = protection_result.get("tp_price")
         position_state["tp_mode"] = protection_result.get("tp_mode")
         position_state["tp_context"] = "ENTRY"
+        position_state["sl_status"] = (
+            "CREATED"
+            if protection_result.get("sl_created")
+            else "DISABLED"
+        )
+        position_state["sl_enabled"] = bool(protection_result.get("sl_created"))
+        position_state["sl_price"] = protection_result.get("sl_price")
+        position_state["sl_source"] = "ENTRY"
         position_state["tp_updated_at"] = datetime.now().isoformat(
             timespec="seconds"
         )
@@ -2694,6 +3074,90 @@ def process_ranked_entry_candidates(
     return position_details, open_positions
 
 
+def finalize_scanned_symbol(
+    scan_item,
+    signal_candidates,
+    trade_state,
+    position_details,
+    open_positions,
+    btc_trend_df,
+    dca_monitor
+):
+    symbol = scan_item["symbol"]
+    final_analysis = scan_item["analysis"]
+    participation = scan_item.get("participation")
+    trend_df = scan_item["trend_df"]
+    confirm_df = scan_item["confirm_df"]
+    entry_df = scan_item["entry_df"]
+    btc_trend = scan_item["btc_trend"]
+    btc_corr = scan_item["btc_corr"]
+    rs = scan_item["rs"]
+
+    log_signal_analysis(final_analysis)
+    signal = final_analysis["signal"]
+
+    if not signal:
+        exhaustion_blocked = bool(
+            final_analysis.get("trend_exhaustion_blocked")
+        )
+        no_signal_reason = (
+            "TREND_EXHAUSTION_GUARD"
+            if exhaustion_blocked
+            else "NO_FINAL_SIGNAL"
+        )
+        append_signal_journal(
+            symbol,
+            final_analysis,
+            participation,
+            trend_df,
+            confirm_df,
+            entry_df,
+            btc_trend,
+            btc_corr,
+            rs,
+            action="NO_SIGNAL",
+            skip_reason=no_signal_reason
+        )
+        log_warning(
+            f"{symbol} NO SIGNAL | REASON={no_signal_reason} | "
+            f"BTC={btc_trend} | CORR={btc_corr} | RS={rs}"
+        )
+        return position_details, open_positions
+
+    candidate = build_entry_candidate(
+        symbol,
+        signal,
+        final_analysis,
+        participation,
+        trend_df,
+        confirm_df,
+        entry_df,
+        btc_trend,
+        btc_corr,
+        rs,
+        {},
+        {}
+    )
+
+    if config.SIGNAL_RANKING_ENABLED:
+        signal_candidates.append(candidate)
+        log_info(
+            f"{symbol} TECHNICAL SIGNAL QUEUED | "
+            f"RANK_SCORE={candidate['rank_score']}"
+        )
+        return position_details, open_positions
+
+    position_details, open_positions, _ = execute_entry_candidate(
+        candidate,
+        trade_state,
+        position_details,
+        open_positions,
+        btc_trend_df,
+        dca_monitor
+    )
+    return position_details, open_positions
+
+
 def run_bot():
 
     log_info("BOT STARTED")
@@ -2727,7 +3191,21 @@ def run_bot():
 
                 btc_trend_df, btc_trend = get_cached_btc_context()
                 log_info(f"BTC TREND: {btc_trend}")
-                futures_context_fetches = 0
+
+                for open_symbol, position_detail in position_details.items():
+                    try:
+                        ensure_reversal_stop_loss(
+                            open_symbol,
+                            position_detail,
+                            trade_state,
+                            btc_trend_df,
+                        )
+                    except Exception as e:
+                        log_error(
+                            f"{open_symbol} reversal SL reconcile error: {e}"
+                        )
+
+                futures_context_queue = []
                 signal_candidates = []
                 begin_llm_scan_budget()
 
@@ -2774,98 +3252,32 @@ def run_bot():
                             rs,
                             log_details=False
                         )
-                        participation = None
-                        final_analysis = base_analysis
+                        scan_item = {
+                            "symbol": symbol,
+                            "analysis": base_analysis,
+                            "participation": None,
+                            "trend_df": trend_df,
+                            "confirm_df": confirm_df,
+                            "entry_df": entry_df,
+                            "btc_trend": btc_trend,
+                            "btc_corr": btc_corr,
+                            "rs": rs,
+                        }
 
                         if should_fetch_futures_context(base_analysis):
-                            if (
-                                futures_context_fetches <
-                                config.FUTURES_CONTEXT_MAX_SYMBOLS_PER_SCAN
-                            ):
-                                participation = get_futures_participation(symbol)
-                                futures_context_fetches += 1
-                                log_info(
-                                    f"{symbol} FUTURES CONTEXT | "
-                                    f"OI={participation.get('oi_change_pct')}% | "
-                                    f"TAKER={participation.get('taker_buy_sell_ratio')} | "
-                                    f"GLOBAL_LS={participation.get('global_long_short_ratio')} | "
-                                    f"TOP_LS={participation.get('top_long_short_ratio')} | "
-                                    f"FUNDING={participation.get('funding_rate')}"
-                                )
-                                final_analysis = analyze_signal(
-                                    trend_df,
-                                    confirm_df,
-                                    entry_df,
-                                    btc_trend,
-                                    btc_corr,
-                                    rs,
-                                    participation=participation,
-                                    log_details=True
-                                )
-                            else:
-                                log_warning(
-                                    f"{symbol} FUTURES CONTEXT SKIPPED | "
-                                    f"SCAN LIMIT={config.FUTURES_CONTEXT_MAX_SYMBOLS_PER_SCAN}"
-                                )
-                                log_signal_analysis(final_analysis)
-                        else:
-                            log_signal_analysis(final_analysis)
-
-                        signal = final_analysis["signal"]
-
-                        if not signal:
-                            exhaustion_blocked = bool(
-                                final_analysis.get("trend_exhaustion_blocked")
+                            scan_item["futures_priority"] = (
+                                futures_context_priority(base_analysis)
                             )
-                            no_signal_reason = (
-                                "TREND_EXHAUSTION_GUARD"
-                                if exhaustion_blocked
-                                else "NO_FINAL_SIGNAL"
-                            )
-                            append_signal_journal(
-                                symbol,
-                                final_analysis,
-                                participation,
-                                trend_df,
-                                confirm_df,
-                                entry_df,
-                                btc_trend,
-                                btc_corr,
-                                rs,
-                                action="NO_SIGNAL",
-                                skip_reason=no_signal_reason
-                            )
-                            log_warning(
-                                f"{symbol} NO SIGNAL | REASON={no_signal_reason} | "
-                                f"BTC={btc_trend} | CORR={btc_corr} | RS={rs}"
-                            )
-                            continue
-
-                        candidate = build_entry_candidate(
-                            symbol,
-                            signal,
-                            final_analysis,
-                            participation,
-                            trend_df,
-                            confirm_df,
-                            entry_df,
-                            btc_trend,
-                            btc_corr,
-                            rs,
-                            {},
-                            {}
-                        )
-
-                        if config.SIGNAL_RANKING_ENABLED:
-                            signal_candidates.append(candidate)
+                            futures_context_queue.append(scan_item)
                             log_info(
-                                f"{symbol} TECHNICAL SIGNAL QUEUED | "
-                                f"RANK_SCORE={candidate['rank_score']}"
+                                f"{symbol} FUTURES CONTEXT QUEUED | "
+                                f"PRIORITY={scan_item['futures_priority']}"
                             )
                             continue
 
-                        position_details, open_positions, _ = execute_entry_candidate(
-                            candidate,
+                        position_details, open_positions = finalize_scanned_symbol(
+                            scan_item,
+                            signal_candidates,
                             trade_state,
                             position_details,
                             open_positions,
@@ -2875,6 +3287,91 @@ def run_bot():
 
                     except Exception as e:
                         log_error(f"{symbol} ERROR: {e}")
+
+                if futures_context_queue and not shutdown_event.is_set():
+                    futures_context_queue.sort(
+                        key=lambda item: item.get("futures_priority", 0),
+                        reverse=True
+                    )
+                    futures_limit = max(
+                        int(config.FUTURES_CONTEXT_MAX_SYMBOLS_PER_SCAN),
+                        0
+                    )
+                    selected_count = min(
+                        len(futures_context_queue),
+                        futures_limit
+                    )
+                    log_info(
+                        f"FUTURES CONTEXT RANKING | "
+                        f"ELIGIBLE={len(futures_context_queue)} | "
+                        f"SELECTED={selected_count} | LIMIT={futures_limit}"
+                    )
+
+                    for index, scan_item in enumerate(
+                        futures_context_queue,
+                        start=1
+                    ):
+                        if shutdown_event.is_set():
+                            log_warning(
+                                "Futures context ranking stopped | "
+                                "bot shutdown requested"
+                            )
+                            break
+
+                        symbol = scan_item["symbol"]
+
+                        try:
+                            if index <= futures_limit:
+                                participation = (
+                                    get_futures_participation(symbol) or {}
+                                )
+                                scan_item["participation"] = participation
+                                log_info(
+                                    f"{symbol} FUTURES CONTEXT "
+                                    f"RANK={index}/{len(futures_context_queue)} | "
+                                    f"PRIORITY={scan_item.get('futures_priority')} | "
+                                    f"OI={participation.get('oi_change_pct')}% | "
+                                    f"TAKER="
+                                    f"{participation.get('taker_buy_sell_ratio')} | "
+                                    f"GLOBAL_LS="
+                                    f"{participation.get('global_long_short_ratio')} | "
+                                    f"TOP_LS="
+                                    f"{participation.get('top_long_short_ratio')} | "
+                                    f"FUNDING={participation.get('funding_rate')}"
+                                )
+                                scan_item["analysis"] = analyze_signal(
+                                    scan_item["trend_df"],
+                                    scan_item["confirm_df"],
+                                    scan_item["entry_df"],
+                                    scan_item["btc_trend"],
+                                    scan_item["btc_corr"],
+                                    scan_item["rs"],
+                                    participation=participation,
+                                    log_details=False
+                                )
+                            else:
+                                log_warning(
+                                    f"{symbol} FUTURES CONTEXT SKIPPED | "
+                                    f"RANK={index} | "
+                                    f"PRIORITY={scan_item.get('futures_priority')} | "
+                                    f"SCAN LIMIT={futures_limit}"
+                                )
+
+                            position_details, open_positions = (
+                                finalize_scanned_symbol(
+                                    scan_item,
+                                    signal_candidates,
+                                    trade_state,
+                                    position_details,
+                                    open_positions,
+                                    btc_trend_df,
+                                    dca_monitor
+                                )
+                            )
+                        except Exception as e:
+                            log_error(
+                                f"{symbol} FUTURES CONTEXT PROCESSING ERROR: {e}"
+                            )
 
                 if config.SIGNAL_RANKING_ENABLED and not shutdown_event.is_set():
                     position_details, open_positions = process_ranked_entry_candidates(

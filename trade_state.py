@@ -164,12 +164,44 @@ def update_position_tp_status(state, symbol, tp_info, context=""):
             item["tp_mode"] = tp_info.get("tp_mode")
             item["tp_context"] = context
             item["tp_updated_at"] = now_iso()
+
+            if "sl_created" in tp_info or "sl_enabled" in tp_info:
+                sl_created = bool(tp_info.get("sl_created"))
+                item["sl_status"] = "CREATED" if sl_created else "DISABLED"
+                item["sl_enabled"] = sl_created
+                item["sl_price"] = tp_info.get("sl_price")
+                item["sl_source"] = context
+
             latest_state.setdefault("positions", {})[symbol] = item
             _save_trade_state_unlocked(latest_state)
             state["positions"] = latest_state.get("positions", {})
 
     except Exception as e:
         log_error(f"{symbol} TP status update error: {e}")
+
+
+def update_position_runtime_fields(state, symbol, updates):
+    if not updates:
+        return False
+
+    try:
+        with _state_file_lock():
+            latest_state = _load_trade_state_unlocked()
+            item = get_position_state(latest_state, symbol)
+
+            if not item:
+                return False
+
+            item.update(updates)
+            item["updated_at"] = now_iso()
+            latest_state.setdefault("positions", {})[symbol] = item
+            _save_trade_state_unlocked(latest_state)
+            state["positions"] = latest_state.get("positions", {})
+            return True
+
+    except Exception as e:
+        log_error(f"{symbol} runtime state update error: {e}")
+        return False
 
 
 def prune_closed_positions(state, open_positions):
@@ -227,6 +259,8 @@ def create_position_state(
         "tp_mode": "",
         "reference_price": reference_price,
         "level_info": level_info or {},
+        "reversal_peak_roi": 0,
+        "reversal_profit_exit_status": "",
     }
 
 

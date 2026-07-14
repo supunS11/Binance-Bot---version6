@@ -427,6 +427,13 @@ def _compact_quality(side_data):
 def _compact_side(side_data):
     side_data = side_data or {}
     timing_rescue = side_data.get("trend_timing_rescue") or {}
+    continuation_pullback = side_data.get("continuation_pullback") or {}
+    reversal_futures = (
+        (side_data.get("reversal_context") or {}).get(
+            "futures_confirmation",
+            {},
+        )
+    )
 
     return {
         "side": side_data.get("side") or "",
@@ -446,6 +453,24 @@ def _compact_side(side_data):
                 timing_rescue.get("futures_score"),
                 2
             ),
+        },
+        "continuation_pullback": {
+            "active": _safe_bool(continuation_pullback.get("active")),
+            "ema20_distance_atr": _round_value(
+                continuation_pullback.get("ema20_distance_atr"),
+                2
+            ),
+            "futures_score": _round_value(
+                continuation_pullback.get("futures_score"),
+                2
+            ),
+        },
+        "reversal_futures": {
+            "required": _safe_bool(reversal_futures.get("required")),
+            "active": _safe_bool(reversal_futures.get("active")),
+            "available": _safe_bool(reversal_futures.get("available")),
+            "score": _round_value(reversal_futures.get("score"), 2),
+            "minimum": _round_value(reversal_futures.get("minimum"), 2),
         },
         "level": _compact_level(side_data),
         "quality": _compact_quality(side_data),

@@ -14,6 +14,7 @@ import config
 from indicators import apply_indicators
 from strategy import (
     analyze_signal,
+    evaluate_reversal_profit_protection,
     validate_adverse_zone_level,
     validate_dca_continuation_guard,
     validate_entry_profit_room,
@@ -562,13 +563,34 @@ def calculate_trade_pnl(side, fills, exit_price):
     return gross, fees, net, roi
 
 
-def compute_take_profit(side, avg_entry, trend_df, confirm_df, dca_context=False):
+def compute_take_profit(
+    side,
+    avg_entry,
+    trend_df,
+    confirm_df,
+    confirmation_type=None,
+    dca_context=False,
+):
+    reversal = str(confirmation_type or "").upper() == "REVERSAL"
+    reversal_max_roi = max(
+        float(getattr(config, "REVERSAL_TP_MAX_ROI", 45)),
+        0,
+    )
+
     if dca_context and config.DCA_TP_MODE in ("roi", "fixed_roi", "fallback_roi"):
         roi = float(config.DCA_TP_ROI)
+
+        if reversal and reversal_max_roi > 0:
+            roi = min(roi, reversal_max_roi)
+
         return roi_to_price(side, avg_entry, roi), f"DCA_ROI_{roi}%"
 
     if config.STATIC_TP_ENABLED:
         roi = float(config.STATIC_TP_ROI)
+
+        if reversal and reversal_max_roi > 0:
+            roi = min(roi, reversal_max_roi)
+
         return roi_to_price(side, avg_entry, roi), f"STATIC_ROI_{roi}%"
 
     ok, target = validate_structure_take_profit(
@@ -580,9 +602,25 @@ def compute_take_profit(side, avg_entry, trend_df, confirm_df, dca_context=False
     )
 
     if ok and target.get("target_price"):
+        target_roi = float(target.get("target_roi") or 0)
+
+        if reversal and reversal_max_roi > 0 and target_roi > reversal_max_roi:
+            return (
+                roi_to_price(side, avg_entry, reversal_max_roi),
+                f"REVERSAL_STRUCTURE_CAPPED_{reversal_max_roi}%",
+            )
+
         return float(target["target_price"]), f"STRUCTURE_{target['source']}"
 
-    roi = float(config.STRUCTURE_TP_FALLBACK_ROI)
+    roi = float(
+        getattr(config, "REVERSAL_TP_FALLBACK_ROI", 35)
+        if reversal
+        else config.STRUCTURE_TP_FALLBACK_ROI
+    )
+
+    if reversal and reversal_max_roi > 0:
+        roi = min(roi, reversal_max_roi)
+
     return roi_to_price(side, avg_entry, roi), f"FALLBACK_ROI_{roi}%"
 
 
@@ -651,6 +689,7 @@ def simulate_trade(
         avg_entry,
         decision_trend,
         decision_confirm,
+        confirmation_type=confirmation_type,
     )
     sl_price, sl_mode = compute_stop_loss(
         side,
@@ -659,6 +698,8 @@ def simulate_trade(
         confirmation_type,
     )
     max_seen_adverse_roi = 0.0
+    max_seen_favorable_roi = 0.0
+    reversal_profit_floor_roi = 0.0
     exit_candle = None
     exit_reason = "OPEN_AT_DATA_END"
     exit_price = None
@@ -766,6 +807,7 @@ def simulate_trade(
                         avg_entry,
                         trend_slice,
                         confirm_slice,
+                        confirmation_type=confirmation_type,
                         dca_context=True,
                     )
                     sl_price, sl_mode = compute_stop_loss(
@@ -782,12 +824,52 @@ def simulate_trade(
             else ((adverse_price - avg_entry) / avg_entry) * float(config.LEVERAGE) * 100
         )
         max_seen_adverse_roi = max(max_seen_adverse_roi, adverse_roi)
+        favorable_price = (
+            float(candle["high"])
+            if side == "BUY"
+            else float(candle["low"])
+        )
+        profit_info = evaluate_reversal_profit_protection(
+            side,
+            avg_entry,
+            favorable_price,
+            peak_roi=max_seen_favorable_roi,
+            leverage=config.LEVERAGE,
+        )
+        max_seen_favorable_roi = max(
+            max_seen_favorable_roi,
+            float(profit_info.get("peak_roi", 0) or 0),
+        )
+        reversal_profit_floor_roi = float(
+            profit_info.get("floor_roi", 0) or 0
+        )
 
         if candle_hits_sl(side, candle, sl_price):
             exit_price = apply_exit_slippage(side, sl_price)
             exit_candle = candle
             exit_reason = "SL"
             break
+
+        if (
+            str(confirmation_type or "").upper() == "REVERSAL" and
+            profit_info.get("armed")
+        ):
+            profit_floor_price = roi_to_price(
+                side,
+                avg_entry,
+                reversal_profit_floor_roi,
+            )
+            profit_floor_hit = (
+                float(candle["low"]) <= profit_floor_price
+                if side == "BUY"
+                else float(candle["high"]) >= profit_floor_price
+            )
+
+            if profit_floor_hit:
+                exit_price = apply_exit_slippage(side, profit_floor_price)
+                exit_candle = candle
+                exit_reason = "REVERSAL_PROFIT_PROTECTION"
+                break
 
         if candle_hits_tp(side, candle, tp_price):
             exit_price = apply_exit_slippage(side, tp_price)
@@ -836,6 +918,8 @@ def simulate_trade(
         "result": "WIN" if net > 0 else "LOSS",
         "duration_hours": round(duration_hours, 2),
         "max_adverse_roi": round(max_seen_adverse_roi, 2),
+        "max_favorable_roi": round(max_seen_favorable_roi, 2),
+        "reversal_profit_floor_roi": round(reversal_profit_floor_roi, 2),
         "dca_blocked_count": dca_blocked_count,
         "last_dca_block_reason": last_dca_block_reason,
     }
@@ -1364,6 +1448,21 @@ def run_backtest(args):
             ),
             "reversal_max_sl_roi": float(
                 getattr(config, "REVERSAL_MAX_SL_ROI", getattr(config, "MAX_SL_ROI", 0))
+            ),
+            "reversal_tp_max_roi": float(
+                getattr(config, "REVERSAL_TP_MAX_ROI", 0)
+            ),
+            "reversal_profit_protection_enabled": bool(
+                getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True)
+            ),
+            "reversal_profit_trigger_roi": float(
+                getattr(config, "REVERSAL_PROFIT_PROTECTION_TRIGGER_ROI", 12)
+            ),
+            "reversal_profit_lock_roi": float(
+                getattr(config, "REVERSAL_PROFIT_PROTECTION_LOCK_ROI", 3)
+            ),
+            "reversal_profit_retrace_pct": float(
+                getattr(config, "REVERSAL_PROFIT_PROTECTION_RETRACE_PCT", 50)
             ),
             "reversal_entry_enabled": bool(
                 getattr(config, "REVERSAL_ENTRY_ENABLED", True)

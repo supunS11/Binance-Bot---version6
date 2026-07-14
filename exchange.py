@@ -21,7 +21,9 @@ _public_rest_log_times = {}
 _public_request_weights = deque()
 _public_request_lock = threading.Lock()
 _public_rest_lock = threading.Lock()
+_kline_request_lock = threading.Lock()
 _kline_cache = {}
+_kline_cache_lock = threading.RLock()
 _futures_context_cache = {}
 _private_rest_backoff_until = 0.0
 _private_rest_log_times = {}
@@ -47,18 +49,17 @@ def _throttle_kline_request():
 
     _raise_if_public_rest_backoff("klines")
 
-    delay = getattr(config, "REQUEST_THROTTLE_SECONDS", 0)
+    with _kline_request_lock:
+        delay = getattr(config, "REQUEST_THROTTLE_SECONDS", 0)
 
-    if delay <= 0:
-        return
+        if delay > 0:
+            elapsed = time.time() - _last_kline_request_at
 
-    elapsed = time.time() - _last_kline_request_at
+            if elapsed < delay:
+                time.sleep(delay - elapsed)
 
-    if elapsed < delay:
-        time.sleep(delay - elapsed)
-
-    _last_kline_request_at = time.time()
-    _rate_limit_public_request(getattr(config, "KLINE_REQUEST_WEIGHT", 2))
+        _rate_limit_public_request(getattr(config, "KLINE_REQUEST_WEIGHT", 2))
+        _last_kline_request_at = time.time()
 
 
 def _rate_limit_public_request(weight=1):
@@ -562,22 +563,57 @@ def _get_futures_position_information(symbol=None, force=False):
     return _copy_response(positions)
 
 
+def _kline_cache_expiry(df, now=None):
+    now = time.time() if now is None else float(now)
+    fallback_seconds = max(
+        float(getattr(config, "KLINE_CACHE_SECONDS", 0)),
+        0
+    )
+    fallback_expiry = now + fallback_seconds
+
+    if not getattr(config, "KLINE_CACHE_CANDLE_AWARE_ENABLED", True):
+        return fallback_expiry
+
+    try:
+        close_time_ms = float(df["close_time"].iloc[-1])
+        close_time_seconds = close_time_ms / 1000
+        grace_seconds = max(
+            float(getattr(config, "KLINE_CACHE_CLOSE_GRACE_SECONDS", 2)),
+            0
+        )
+        candle_expiry = close_time_seconds + grace_seconds
+
+        if candle_expiry > now:
+            return candle_expiry
+    except (KeyError, IndexError, TypeError, ValueError):
+        pass
+
+    return fallback_expiry
+
+
 def _get_cached_kline_df(key):
     cache_seconds = float(getattr(config, "KLINE_CACHE_SECONDS", 0))
 
     if cache_seconds <= 0:
         return None
 
-    cached = _kline_cache.get(key)
+    now = time.time()
 
-    if not cached:
-        return None
+    with _kline_cache_lock:
+        cached = _kline_cache.get(key)
 
-    if time.time() - cached["time"] > cache_seconds:
-        _kline_cache.pop(key, None)
-        return None
+        if not cached:
+            return None
 
-    return cached["data"].copy(deep=True)
+        expires_at = float(
+            cached.get("expires_at", cached["time"] + cache_seconds)
+        )
+
+        if now >= expires_at:
+            _kline_cache.pop(key, None)
+            return None
+
+        return cached["data"].copy(deep=True)
 
 
 def _store_cached_kline_df(key, df):
@@ -586,15 +622,22 @@ def _store_cached_kline_df(key, df):
     if cache_seconds <= 0 or df is None:
         return
 
-    max_items = max(int(getattr(config, "KLINE_CACHE_MAX_ITEMS", 1200)), 1)
-    _kline_cache[key] = {
-        "time": time.time(),
-        "data": df.copy(deep=True)
-    }
+    max_items = max(int(getattr(config, "KLINE_CACHE_MAX_ITEMS", 2400)), 1)
+    now = time.time()
 
-    while len(_kline_cache) > max_items:
-        oldest_key = min(_kline_cache, key=lambda item: _kline_cache[item]["time"])
-        _kline_cache.pop(oldest_key, None)
+    with _kline_cache_lock:
+        _kline_cache[key] = {
+            "time": now,
+            "expires_at": _kline_cache_expiry(df, now=now),
+            "data": df.copy(deep=True)
+        }
+
+        while len(_kline_cache) > max_items:
+            oldest_key = min(
+                _kline_cache,
+                key=lambda item: _kline_cache[item]["time"]
+            )
+            _kline_cache.pop(oldest_key, None)
 
 
 def get_exchange_info():
@@ -1187,6 +1230,50 @@ def get_open_take_profit_info(symbol):
         return {}
 
 
+def get_open_stop_loss_info(symbol):
+    try:
+        sl_types = {"STOP", "STOP_MARKET"}
+        orders = _private_rest_call(
+            f"futures_get_open_orders:{symbol}",
+            client.futures_get_open_orders,
+            symbol=symbol
+        )
+
+        for order in orders:
+            order_type = order.get("type")
+
+            if order_type not in sl_types:
+                continue
+
+            return {
+                "price": _order_trigger_price(order),
+                "sl_price": _order_trigger_price(order),
+                "type": order_type,
+                "source": "order",
+                "order_id": order.get("orderId", ""),
+            }
+
+        for order in _normalise_algo_orders(_get_open_algo_orders(symbol)):
+            order_type = order.get("orderType") or order.get("type")
+
+            if order_type not in sl_types:
+                continue
+
+            return {
+                "price": _order_trigger_price(order),
+                "sl_price": _order_trigger_price(order),
+                "type": order_type,
+                "source": "algo",
+                "order_id": order.get("algoId", ""),
+            }
+
+        return {}
+
+    except Exception as e:
+        log_warning(f"{symbol} open SL lookup error: {e}")
+        return {}
+
+
 def cancel_open_protection_orders(symbol):
 
     try:
@@ -1572,6 +1659,89 @@ def place_algo_order(**params):
     )
 
 
+def place_stop_loss_only(
+    symbol,
+    side,
+    entry_price,
+    confirm_df,
+    signal_type=None,
+):
+    signal_type = str(signal_type or "").upper().strip()
+    details = {
+        "ok": False,
+        "symbol": symbol,
+        "signal_type": signal_type or "UNKNOWN",
+        "sl_enabled": is_stop_loss_enabled_for_signal(signal_type),
+        "sl_price": None,
+        "sl_order": None,
+    }
+
+    if not details["sl_enabled"]:
+        return details
+
+    try:
+        precision = get_price_precision(symbol)
+        market_price = get_mark_price(symbol)
+
+        if market_price is None:
+            return details
+
+        sl_price = get_signal_stop_loss(
+            side,
+            entry_price,
+            confirm_df,
+            signal_type,
+            precision,
+        )
+        details["sl_price"] = sl_price
+
+        if sl_price is None:
+            log_warning(f"{symbol} standalone SL unavailable")
+            return details
+
+        if side == SIDE_BUY:
+            valid = sl_price < market_price
+            close_side = SIDE_SELL
+        else:
+            valid = sl_price > market_price
+            close_side = SIDE_BUY
+
+        if not valid:
+            log_warning(
+                f"{symbol} standalone SL invalid | "
+                f"SL={sl_price} | MARKET={market_price}"
+            )
+            return details
+
+        sl_order = place_algo_order(
+            algoType="CONDITIONAL",
+            symbol=symbol,
+            side=close_side,
+            type="STOP_MARKET",
+            triggerPrice=sl_price,
+            closePosition="true",
+            workingType="MARK_PRICE",
+            priceProtect="TRUE"
+        )
+        details["sl_order"] = sl_order
+        details["ok"] = bool(
+            sl_order and
+            (sl_order.get("algoId") or sl_order.get("orderId"))
+        )
+
+        if details["ok"]:
+            log_info(
+                f"{symbol} standalone SL created | "
+                f"TYPE={signal_type or 'UNKNOWN'} | SL={sl_price}"
+            )
+
+        return details
+
+    except Exception as e:
+        log_error(f"{symbol} standalone SL error: {e}")
+        return details
+
+
 # =========================
 # TP/SL EXECUTION (CLEAN VERSION)
 # =========================
@@ -1600,6 +1770,8 @@ def place_tp_sl(
         "tp_mode": "",
         "sl_price": None,
         "sl_enabled": sl_enabled,
+        "sl_created": False,
+        "sl_order": None,
         "tp_order": None,
     }
 
@@ -1632,34 +1804,87 @@ def place_tp_sl(
             )
             close_side = SIDE_BUY
 
+        reversal_tp = signal_type == "REVERSAL"
+        reversal_max_roi = max(
+            float(getattr(config, "REVERSAL_TP_MAX_ROI", 45)),
+            0,
+        )
+        fallback_roi = float(
+            getattr(config, "REVERSAL_TP_FALLBACK_ROI", 35)
+            if reversal_tp
+            else config.STRUCTURE_TP_FALLBACK_ROI
+        )
+
+        if reversal_tp and reversal_max_roi > 0:
+            fallback_roi = min(fallback_roi, reversal_max_roi)
+
         if roi_override is not None:
-            tp_mode = roi_mode_label or f"ROI_{roi_override}%"
+            effective_roi = float(roi_override)
+
+            if reversal_tp and reversal_max_roi > 0:
+                effective_roi = min(effective_roi, reversal_max_roi)
+
+            tp_mode = (
+                f"REVERSAL_CAPPED_ROI_{effective_roi}%"
+                if effective_roi != float(roi_override)
+                else roi_mode_label or f"ROI_{effective_roi}%"
+            )
             tp_price = get_roi_take_profit(
                 side,
                 entry_price,
-                roi_override,
+                effective_roi,
                 precision
             )
         elif config.STATIC_TP_ENABLED:
-            tp_mode = f"STATIC_ROI_{config.STATIC_TP_ROI}%"
+            effective_roi = float(config.STATIC_TP_ROI)
+
+            if reversal_tp and reversal_max_roi > 0:
+                effective_roi = min(effective_roi, reversal_max_roi)
+
+            tp_mode = (
+                f"REVERSAL_STATIC_CAPPED_ROI_{effective_roi}%"
+                if effective_roi != float(config.STATIC_TP_ROI)
+                else f"STATIC_ROI_{effective_roi}%"
+            )
             tp_price = get_roi_take_profit(
                 side,
                 entry_price,
-                config.STATIC_TP_ROI,
+                effective_roi,
                 precision
             )
         elif structure_tp and structure_tp.get("target_price"):
-            tp_mode = (
-                f"STRUCTURE_{structure_tp['source']} "
-                f"ROI={structure_tp['target_roi']}%"
-            )
-            tp_price = round(structure_tp["target_price"], precision)
+            target_roi = float(structure_tp.get("target_roi") or 0)
+
+            if (
+                reversal_tp and
+                reversal_max_roi > 0 and
+                target_roi > reversal_max_roi
+            ):
+                tp_mode = (
+                    f"REVERSAL_STRUCTURE_CAPPED_ROI_{reversal_max_roi}%"
+                )
+                tp_price = get_roi_take_profit(
+                    side,
+                    entry_price,
+                    reversal_max_roi,
+                    precision,
+                )
+            else:
+                tp_mode = (
+                    f"STRUCTURE_{structure_tp['source']} "
+                    f"ROI={structure_tp['target_roi']}%"
+                )
+                tp_price = round(structure_tp["target_price"], precision)
         else:
-            tp_mode = f"FALLBACK_ROI_{config.STRUCTURE_TP_FALLBACK_ROI}%"
+            tp_mode = (
+                f"REVERSAL_FALLBACK_ROI_{fallback_roi}%"
+                if reversal_tp
+                else f"FALLBACK_ROI_{fallback_roi}%"
+            )
             tp_price = get_roi_take_profit(
                 side,
                 entry_price,
-                config.STRUCTURE_TP_FALLBACK_ROI,
+                fallback_roi,
                 precision
             )
 
@@ -1670,11 +1895,15 @@ def place_tp_sl(
             and not is_valid_take_profit(side, tp_price, market_price)
         ):
             log_warning(f"{symbol} STRUCTURE TP INVALID | USING FALLBACK ROI")
-            tp_mode = f"FALLBACK_ROI_{config.STRUCTURE_TP_FALLBACK_ROI}%"
+            tp_mode = (
+                f"REVERSAL_FALLBACK_ROI_{fallback_roi}%"
+                if reversal_tp
+                else f"FALLBACK_ROI_{fallback_roi}%"
+            )
             tp_price = get_roi_take_profit(
                 side,
                 entry_price,
-                config.STRUCTURE_TP_FALLBACK_ROI,
+                fallback_roi,
                 precision
             )
 
@@ -1770,6 +1999,11 @@ def place_tp_sl(
                 closePosition="true",
                 workingType="MARK_PRICE",
                 priceProtect="TRUE"
+            )
+            details["sl_order"] = sl_order
+            details["sl_created"] = bool(
+                sl_order and
+                (sl_order.get("algoId") or sl_order.get("orderId"))
             )
             log_info(
                 f"{symbol} SL order response | "
