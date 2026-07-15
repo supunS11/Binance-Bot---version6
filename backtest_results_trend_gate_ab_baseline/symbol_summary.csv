@@ -1,0 +1,4 @@
+symbol,trades,wins,losses,win_rate_pct,net_pnl,avg_roi_on_margin_pct,dca_trades
+BTCUSDT,1,1,0,100.0,0.1777,8.89,0
+SOLUSDT,1,1,0,100.0,0.4634,23.17,0
+XRPUSDT,1,0,1,0.0,-0.166,-8.3,0

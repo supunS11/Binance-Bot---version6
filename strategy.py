@@ -1016,6 +1016,142 @@ def validate_live_entry_guard(
     }
 
 
+def evaluate_route_early_invalidation(
+    side,
+    fast_df,
+    slow_df,
+    mark_price,
+    confirmation_type=None,
+    reference_price=None,
+):
+    route = (
+        "REVERSAL"
+        if str(confirmation_type or "").upper() == "REVERSAL"
+        else "TREND"
+    )
+    unavailable = {
+        "should_exit": False,
+        "reason": "EARLY_INVALIDATION_DATA_UNAVAILABLE",
+        "route": route,
+        "reference_broken": False,
+    }
+
+    if side not in ("BUY", "SELL") or mark_price is None:
+        return unavailable
+
+    if fast_df is None or slow_df is None:
+        return unavailable
+
+    fast = _live_entry_timeframe_check(
+        side,
+        fast_df,
+        mark_price,
+        config.LIVE_ENTRY_FAST_TIMEFRAME,
+    )
+    slow = _live_entry_timeframe_check(
+        side,
+        slow_df,
+        mark_price,
+        config.LIVE_ENTRY_SLOW_TIMEFRAME,
+    )
+
+    if fast.get("latest_close") is None or slow.get("latest_close") is None:
+        return {
+            **unavailable,
+            "fast": fast,
+            "slow": slow,
+        }
+
+    ema_tolerance = max(
+        get_config_float(
+            "EARLY_FLOW_EXIT_EMA_TOLERANCE_PCT",
+            get_config_float("LIVE_ENTRY_EMA_TOLERANCE_PCT", 0.08),
+        ),
+        0,
+    ) / 100
+    fast_ema20 = _safe_float(fast.get("ema20"))
+    slow_ema20 = _safe_float(slow.get("ema20"))
+    fast_ema_wrong = bool(fast.get("ema_wrong_side"))
+    slow_ema_wrong = bool(slow.get("ema_wrong_side"))
+
+    if fast_ema20 > 0:
+        fast_ema_wrong = (
+            mark_price < fast_ema20 * (1 - ema_tolerance)
+            if side == "BUY"
+            else mark_price > fast_ema20 * (1 + ema_tolerance)
+        )
+
+    if slow_ema20 > 0:
+        slow_ema_wrong = (
+            mark_price < slow_ema20 * (1 - ema_tolerance)
+            if side == "BUY"
+            else mark_price > slow_ema20 * (1 + ema_tolerance)
+        )
+
+    fast_adverse = bool(
+        fast.get("opposes_direction") or
+        fast.get("opposite_reversal") or
+        (fast.get("structure_break") and fast_ema_wrong)
+    )
+    slow_adverse = bool(
+        slow.get("opposes_direction") or
+        slow.get("opposite_reversal") or
+        (slow.get("structure_break") and slow_ema_wrong)
+    )
+    fast_failure = bool(fast.get("structure_break") and fast_adverse)
+    slow_failure = bool(slow.get("structure_break") and slow_adverse)
+    dual_opposition = bool(
+        fast.get("opposes_direction") and slow.get("opposes_direction")
+    )
+
+    reference = _safe_float(reference_price)
+    reference_buffer = max(
+        get_config_float("EARLY_FLOW_EXIT_REFERENCE_BUFFER_PCT", 0.15),
+        0,
+    ) / 100
+    reference_broken = False
+
+    if reference > 0:
+        if side == "BUY":
+            reference_broken = mark_price < reference * (1 - reference_buffer)
+        else:
+            reference_broken = mark_price > reference * (1 + reference_buffer)
+
+    if route == "REVERSAL":
+        should_exit = bool(
+            slow_failure and
+            (fast_adverse or reference_broken)
+        )
+        reason = "REVERSAL_THESIS_INVALIDATED"
+    else:
+        should_exit = bool(
+            (fast_failure and slow_failure) or
+            (reference_broken and slow_failure and fast_adverse)
+        )
+        reason = "TREND_THESIS_INVALIDATED"
+
+    if not should_exit:
+        reason = "EARLY_INVALIDATION_EVIDENCE_INCOMPLETE"
+
+    return {
+        "should_exit": should_exit,
+        "reason": reason,
+        "route": route,
+        "mark_price": round(float(mark_price), 8),
+        "reference_price": round(reference, 8) if reference > 0 else None,
+        "reference_broken": reference_broken,
+        "fast_failure": fast_failure,
+        "slow_failure": slow_failure,
+        "fast_adverse": fast_adverse,
+        "slow_adverse": slow_adverse,
+        "fast_ema_wrong_side": fast_ema_wrong,
+        "slow_ema_wrong_side": slow_ema_wrong,
+        "dual_opposition": dual_opposition,
+        "fast": fast,
+        "slow": slow,
+    }
+
+
 def detect_liquidity_sweep(side, df, label):
     if not config.SMC_ENABLED or not config.SMC_SWEEP_ENABLED:
         return None

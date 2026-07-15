@@ -14,6 +14,7 @@ import config
 from indicators import apply_indicators
 from strategy import (
     analyze_signal,
+    evaluate_route_early_invalidation,
     evaluate_reversal_profit_protection,
     validate_adverse_zone_level,
     validate_dca_continuation_guard,
@@ -796,8 +797,10 @@ def simulate_trade(
     exit_candle = None
     exit_reason = "OPEN_AT_DATA_END"
     exit_price = None
+    exit_time_override = None
     dca_blocked_count = 0
     last_dca_block_reason = ""
+    early_invalidation_reason = ""
 
     exit_times = exit_df["time"].to_numpy()
     start_index = exit_times.searchsorted(int(entry_time), side="left")
@@ -813,6 +816,88 @@ def simulate_trade(
     for row_index in range(start_index, end_index):
         candle = exit_df.iloc[row_index]
         candle_time = int(candle["time"])
+
+        if getattr(config, "EARLY_FLOW_EXIT_ENABLED", False):
+            route = (
+                "REVERSAL"
+                if str(confirmation_type or "").upper() == "REVERSAL"
+                else "TREND"
+            )
+            route_enabled = (
+                getattr(config, "EARLY_FLOW_EXIT_REVERSAL_ENABLED", True)
+                if route == "REVERSAL"
+                else getattr(config, "EARLY_FLOW_EXIT_TREND_ENABLED", True)
+            )
+            last_activity_time = int(fills[-1]["time"])
+            grace_minutes = float(
+                getattr(
+                    config,
+                    "EARLY_FLOW_EXIT_POST_DCA_GRACE_MINUTES",
+                    config.EARLY_FLOW_EXIT_MINUTES,
+                )
+                if dca_count > 0
+                else config.EARLY_FLOW_EXIT_MINUTES
+            )
+            elapsed_ms = candle_time - last_activity_time
+            route_max_roi = min(
+                float(
+                    getattr(
+                        config,
+                        (
+                            "EARLY_FLOW_EXIT_REVERSAL_MAX_ROI"
+                            if route == "REVERSAL"
+                            else "EARLY_FLOW_EXIT_TREND_MAX_ROI"
+                        ),
+                        config.EARLY_FLOW_EXIT_MAX_ROI,
+                    )
+                ),
+                0,
+            )
+            current_price = float(candle["open"])
+            current_roi = (
+                ((current_price - avg_entry) / avg_entry) *
+                float(config.LEVERAGE) * 100
+                if side == "BUY"
+                else ((avg_entry - current_price) / avg_entry) *
+                float(config.LEVERAGE) * 100
+            )
+
+            if (
+                route_enabled and
+                elapsed_ms >= max(grace_minutes, 0) * 60_000 and
+                current_roi <= route_max_roi
+            ):
+                fast_slice = closed_slice(
+                    signal_entry_df,
+                    candle_time,
+                    entry_interval,
+                    min_rows=40,
+                )
+                slow_slice = closed_slice(
+                    frames["confirm"].indicators,
+                    candle_time,
+                    confirm_interval,
+                    min_rows=40,
+                )
+                early_info = evaluate_route_early_invalidation(
+                    side,
+                    fast_slice,
+                    slow_slice,
+                    current_price,
+                    confirmation_type=route,
+                )
+
+                if early_info.get("should_exit"):
+                    exit_price = apply_exit_slippage(side, current_price)
+                    exit_candle = candle
+                    exit_time_override = candle_time
+                    exit_reason = f"{route}_EARLY_INVALIDATION"
+                    early_invalidation_reason = early_info.get("reason", "")
+                    max_seen_adverse_roi = max(
+                        max_seen_adverse_roi,
+                        abs(float(current_roi)),
+                    )
+                    break
 
         while True:
             trigger_roi = dca_trigger_roi(dca_count)
@@ -981,7 +1066,11 @@ def simulate_trade(
         exit_reason = "TIMEOUT" if end_index < len(exit_df) else "DATA_END"
 
     gross, fees, net, roi = calculate_trade_pnl(side, fills, exit_price)
-    exit_time = int(exit_candle["close_time"])
+    exit_time = int(
+        exit_time_override
+        if exit_time_override is not None
+        else exit_candle["close_time"]
+    )
     duration_hours = (exit_time - int(entry_time)) / 3_600_000
 
     return {
@@ -1015,6 +1104,7 @@ def simulate_trade(
         "reversal_profit_floor_roi": round(reversal_profit_floor_roi, 2),
         "dca_blocked_count": dca_blocked_count,
         "last_dca_block_reason": last_dca_block_reason,
+        "early_invalidation_reason": early_invalidation_reason,
     }
 
 

@@ -36,6 +36,7 @@ from indicators import apply_indicators
 from strategy import (
     analyze_signal,
     analyze_signal_cached,
+    evaluate_route_early_invalidation,
     evaluate_reversal_profit_protection,
     futures_context_priority,
     log_signal_analysis,
@@ -1866,7 +1867,8 @@ class DcaWebsocketMonitor:
             config.DCA_WEBSOCKET_ENABLED and
             (
                 config.DCA_ENABLED or
-                getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True)
+                getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True) or
+                getattr(config, "EARLY_FLOW_EXIT_ENABLED", False)
             )
         )
         self.twm = None
@@ -1882,6 +1884,8 @@ class DcaWebsocketMonitor:
         self.protection_lock = threading.Lock()
         self.reversal_peaks = {}
         self.reversal_exit_pending = set()
+        self.route_invalidation_check_times = {}
+        self.route_exit_pending = set()
 
     def start(self):
         if not self.enabled:
@@ -2087,6 +2091,12 @@ class DcaWebsocketMonitor:
                 if symbol in active_symbols
             }
             self.reversal_exit_pending.intersection_update(active_symbols)
+            self.route_invalidation_check_times = {
+                symbol: checked_at
+                for symbol, checked_at in self.route_invalidation_check_times.items()
+                if symbol in active_symbols
+            }
+            self.route_exit_pending.intersection_update(active_symbols)
 
         suffix = "@markPrice@1s" if config.DCA_WEBSOCKET_FAST_MARK_PRICE else "@markPrice"
         streams = tuple(f"{symbol.lower()}{suffix}" for symbol in symbols)
@@ -2183,6 +2193,13 @@ class DcaWebsocketMonitor:
         ):
             return
 
+        if self._handle_route_early_invalidation(
+            symbol,
+            mark_price,
+            state,
+        ):
+            return
+
         if not dca_tick_ready(symbol, mark_price, state=state):
             return
 
@@ -2204,6 +2221,290 @@ class DcaWebsocketMonitor:
             current_price_override=mark_price,
             price_source="websocket"
         )
+
+    def _route_early_invalidation_context(self, position_state, mark_price):
+        if not position_state or not position_state.get("managed_by_bot"):
+            return None
+
+        route = (
+            "REVERSAL"
+            if str(
+                position_state.get("confirmation_type") or
+                position_state.get("signal_type") or
+                ""
+            ).upper() == "REVERSAL"
+            else "TREND"
+        )
+        route_enabled = (
+            getattr(config, "EARLY_FLOW_EXIT_REVERSAL_ENABLED", True)
+            if route == "REVERSAL"
+            else getattr(config, "EARLY_FLOW_EXIT_TREND_ENABLED", True)
+        )
+
+        if not route_enabled:
+            return None
+
+        side = str(position_state.get("side") or "").upper()
+        avg_entry = _safe_float(position_state.get("avg_entry"))
+
+        if side not in ("BUY", "SELL") or avg_entry <= 0 or mark_price <= 0:
+            return None
+
+        last_dca_at = position_state.get("last_dca_at")
+        activity_at = last_dca_at or position_state.get("opened_at")
+        elapsed = seconds_since(activity_at)
+        grace_minutes = float(
+            getattr(
+                config,
+                "EARLY_FLOW_EXIT_POST_DCA_GRACE_MINUTES",
+                config.EARLY_FLOW_EXIT_MINUTES,
+            )
+            if last_dca_at
+            else config.EARLY_FLOW_EXIT_MINUTES
+        )
+
+        if elapsed is None or elapsed < max(grace_minutes, 0) * 60:
+            return None
+
+        current_roi = -get_position_adverse_roi(side, avg_entry, mark_price)
+        max_roi = min(
+            float(
+                getattr(
+                    config,
+                    (
+                        "EARLY_FLOW_EXIT_REVERSAL_MAX_ROI"
+                        if route == "REVERSAL"
+                        else "EARLY_FLOW_EXIT_TREND_MAX_ROI"
+                    ),
+                    config.EARLY_FLOW_EXIT_MAX_ROI,
+                )
+            ),
+            0,
+        )
+
+        if current_roi > max_roi:
+            return None
+
+        reference_price = None
+
+        if not position_state.get("adopted_existing"):
+            reference_price = _safe_float(position_state.get("reference_price"))
+
+        return {
+            "route": route,
+            "side": side,
+            "avg_entry": avg_entry,
+            "current_roi": current_roi,
+            "max_roi": max_roi,
+            "reference_price": reference_price,
+        }
+
+    def _handle_route_early_invalidation(self, symbol, mark_price, state):
+        if not getattr(config, "EARLY_FLOW_EXIT_ENABLED", False):
+            return False
+
+        position_state = get_position_state(state, symbol)
+
+        if not position_state or not position_state.get("managed_by_bot"):
+            return False
+
+        if position_state.get("early_invalidation_exit_status") == "SUBMITTED":
+            return True
+
+        context = self._route_early_invalidation_context(
+            position_state,
+            mark_price,
+        )
+
+        if not context:
+            return False
+
+        now = time.monotonic()
+        check_seconds = max(
+            float(getattr(config, "EARLY_FLOW_EXIT_CHECK_SECONDS", 60)),
+            1,
+        )
+
+        with self.protection_lock:
+            if symbol in self.route_exit_pending:
+                return True
+
+            last_check = float(
+                self.route_invalidation_check_times.get(symbol, 0) or 0
+            )
+
+            if now - last_check < check_seconds:
+                return False
+
+            self.route_invalidation_check_times[symbol] = now
+
+        try:
+            fast_raw = get_klines(
+                symbol,
+                config.LIVE_ENTRY_FAST_TIMEFRAME,
+                config.LIVE_ENTRY_KLINE_LIMIT,
+            )
+            slow_raw = get_klines(
+                symbol,
+                config.LIVE_ENTRY_SLOW_TIMEFRAME,
+                config.LIVE_ENTRY_KLINE_LIMIT,
+            )
+            fast_df = apply_indicators(fast_raw) if fast_raw is not None else None
+            slow_df = apply_indicators(slow_raw) if slow_raw is not None else None
+            info = evaluate_route_early_invalidation(
+                context["side"],
+                fast_df,
+                slow_df,
+                mark_price,
+                confirmation_type=context["route"],
+                reference_price=context["reference_price"],
+            )
+
+            if not info.get("should_exit"):
+                if (
+                    info.get("reason") == "EARLY_INVALIDATION_DATA_UNAVAILABLE" and
+                    getattr(config, "EARLY_FLOW_EXIT_REQUIRE_DATA", True)
+                ):
+                    log_warning(
+                        f"{symbol} early invalidation skipped | live data unavailable"
+                    )
+
+                return False
+
+        except Exception as e:
+            log_error(f"{symbol} early invalidation analysis error: {e}")
+            return False
+
+        lock = get_dca_lock(symbol)
+
+        if not lock.acquire(blocking=False):
+            log_info(f"{symbol} early invalidation deferred | position busy")
+            return True
+
+        try:
+            fresh_state = load_trade_state()
+            fresh_position_state = get_position_state(fresh_state, symbol)
+
+            if (
+                not fresh_position_state or
+                fresh_position_state.get("early_invalidation_exit_status") == "SUBMITTED"
+            ):
+                return True
+
+            fresh_context = self._route_early_invalidation_context(
+                fresh_position_state,
+                mark_price,
+            )
+
+            if not fresh_context:
+                return True
+
+            info = evaluate_route_early_invalidation(
+                fresh_context["side"],
+                fast_df,
+                slow_df,
+                mark_price,
+                confirmation_type=fresh_context["route"],
+                reference_price=fresh_context["reference_price"],
+            )
+
+            if not info.get("should_exit"):
+                return True
+
+            with self.protection_lock:
+                if symbol in self.route_exit_pending:
+                    return True
+
+                self.route_exit_pending.add(symbol)
+
+            details = get_open_position_details(symbol)
+            position_detail = (details or {}).get(symbol)
+
+            if not position_detail:
+                log_warning(
+                    f"{symbol} early invalidation exit skipped | "
+                    "live position not found"
+                )
+
+                with self.protection_lock:
+                    self.route_exit_pending.discard(symbol)
+
+                return True
+
+            amount = float(position_detail.get("amount", 0) or 0)
+            position_side = position_detail.get("position_side")
+            log_warning(
+                f"{symbol} {fresh_context['route']} EARLY INVALIDATION EXIT | "
+                f"ROI={fresh_context['current_roi']}% | "
+                f"REASON={info.get('reason')} | "
+                f"FAST_FAILURE={info.get('fast_failure')} | "
+                f"SLOW_FAILURE={info.get('slow_failure')} | "
+                f"REFERENCE_BROKEN={info.get('reference_broken')}"
+            )
+            closed = close_position_market(
+                symbol,
+                amount,
+                position_side=position_side,
+            )
+
+            if closed:
+                cancel_open_protection_orders(symbol)
+                evidence = {
+                    "fast_failure": bool(info.get("fast_failure")),
+                    "slow_failure": bool(info.get("slow_failure")),
+                    "fast_adverse": bool(info.get("fast_adverse")),
+                    "slow_adverse": bool(info.get("slow_adverse")),
+                    "dual_opposition": bool(info.get("dual_opposition")),
+                    "reference_broken": bool(info.get("reference_broken")),
+                    "fast_support_score": (info.get("fast") or {}).get(
+                        "support_score"
+                    ),
+                    "slow_support_score": (info.get("slow") or {}).get(
+                        "support_score"
+                    ),
+                }
+                update_position_runtime_fields(
+                    fresh_state,
+                    symbol,
+                    {
+                        "early_invalidation_exit_status": "SUBMITTED",
+                        "early_invalidation_exit_price": mark_price,
+                        "early_invalidation_exit_roi": fresh_context["current_roi"],
+                        "early_invalidation_exit_reason": info.get("reason"),
+                        "early_invalidation_exit_route": fresh_context["route"],
+                        "early_invalidation_exit_evidence": evidence,
+                    },
+                )
+                send_telegram_message(
+                    f"{config.TELEGRAM_MESSAGE_PREFIX}\n"
+                    f"{symbol} {fresh_context['route'].lower()} early invalidation exit\n"
+                    f"ROI: {fresh_context['current_roi']}%\n"
+                    f"Reason: {info.get('reason')}"
+                )
+                return True
+
+            log_error(f"{symbol} early invalidation exit order failed")
+            update_position_runtime_fields(
+                fresh_state,
+                symbol,
+                {"early_invalidation_exit_status": "FAILED"},
+            )
+
+            with self.protection_lock:
+                self.route_exit_pending.discard(symbol)
+
+            return True
+
+        except Exception as e:
+            log_error(f"{symbol} early invalidation exit error: {e}")
+
+            with self.protection_lock:
+                self.route_exit_pending.discard(symbol)
+
+            return True
+
+        finally:
+            lock.release()
 
     def _handle_reversal_profit_protection(self, symbol, mark_price, state):
         if not getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True):
