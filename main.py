@@ -305,16 +305,31 @@ def check_live_entry_guard(
     if not config.LIVE_ENTRY_CONFIRMATION_ENABLED:
         return True, current_price, {"reason": "LIVE_ENTRY_GUARD_DISABLED"}
 
-    fast_guard_df = get_klines(
+    fast_guard_raw = get_klines(
         symbol,
         config.LIVE_ENTRY_FAST_TIMEFRAME,
         config.LIVE_ENTRY_KLINE_LIMIT
     )
-    slow_guard_df = get_klines(
+    slow_guard_raw = get_klines(
         symbol,
         config.LIVE_ENTRY_SLOW_TIMEFRAME,
         config.LIVE_ENTRY_KLINE_LIMIT
     )
+
+    def prepare_guard_frame(raw_df):
+        if raw_df is None:
+            return None
+
+        enriched_df = apply_indicators(raw_df)
+        min_rows = max(int(config.LIVE_ENTRY_STRUCTURE_LOOKBACK) + 3, 1)
+
+        if enriched_df is None or len(enriched_df) < min_rows:
+            return None
+
+        return enriched_df
+
+    fast_guard_df = prepare_guard_frame(fast_guard_raw)
+    slow_guard_df = prepare_guard_frame(slow_guard_raw)
 
     if mark_price is None:
         mark_price = get_mark_price(symbol)
