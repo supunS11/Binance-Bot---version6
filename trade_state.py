@@ -260,7 +260,11 @@ def create_position_state(
         "reference_price": reference_price,
         "level_info": level_info or {},
         "reversal_peak_roi": 0,
+        "reversal_profit_basis_entry": entry_price,
         "reversal_profit_exit_status": "",
+        "trend_peak_roi": 0,
+        "trend_profit_basis_entry": entry_price,
+        "trend_profit_exit_status": "",
     }
 
 
@@ -307,6 +311,15 @@ def record_dca_fill(
             item["last_dca_at"] = now_iso()
             item["updated_at"] = now_iso()
             item.pop("pending_dca", None)
+
+            # A DCA fill changes the ROI basis, so route profit peaks must
+            # restart from the new average entry.
+            for route in ("reversal", "trend"):
+                item[f"{route}_peak_roi"] = 0
+                item[f"{route}_profit_floor_roi"] = 0
+                item[f"{route}_profit_armed"] = False
+                item[f"{route}_profit_basis_entry"] = avg_entry
+                item[f"{route}_profit_exit_status"] = ""
 
             if level_info:
                 item["last_dca_level_info"] = level_info

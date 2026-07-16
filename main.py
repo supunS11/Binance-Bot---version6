@@ -37,7 +37,7 @@ from strategy import (
     analyze_signal,
     analyze_signal_cached,
     evaluate_route_early_invalidation,
-    evaluate_reversal_profit_protection,
+    evaluate_route_profit_protection,
     futures_context_priority,
     log_signal_analysis,
     should_fetch_futures_context,
@@ -204,32 +204,56 @@ def calculate_btc_context(symbol, trend_df, btc_df):
         return 0, 0
 
     try:
-        coin_close = trend_df["close"].iloc[:-1].tail(100).reset_index(drop=True)
-        btc_close = btc_df["close"].iloc[:-1].tail(100).reset_index(drop=True)
+        correlation_lookback = max(
+            int(getattr(config, "BTC_CONTEXT_CORRELATION_LOOKBACK", 72)),
+            20,
+        )
+        rs_lookback = max(
+            int(getattr(config, "BTC_CONTEXT_RS_LOOKBACK", 24)),
+            2,
+        )
+        required_rows = max(correlation_lookback, rs_lookback)
+        coin_close = (
+            trend_df["close"]
+            .iloc[:-1]
+            .tail(required_rows)
+            .reset_index(drop=True)
+        )
+        btc_close = (
+            btc_df["close"]
+            .iloc[:-1]
+            .tail(required_rows)
+            .reset_index(drop=True)
+        )
         length = min(len(coin_close), len(btc_close))
 
         if length < 20:
             btc_corr = 0
         else:
-            coin_ret = coin_close.tail(length).pct_change().dropna()
-            btc_ret = btc_close.tail(length).pct_change().dropna()
+            correlation_rows = min(length, correlation_lookback)
+            coin_ret = (
+                coin_close.tail(correlation_rows).pct_change().dropna()
+            )
+            btc_ret = (
+                btc_close.tail(correlation_rows).pct_change().dropna()
+            )
             btc_corr = coin_ret.corr(btc_ret)
 
             if btc_corr != btc_corr:
                 btc_corr = 0
 
-        if length < 10:
+        if length < rs_lookback:
             rs = 0
         else:
             coin_tail = coin_close.tail(length)
             btc_tail = btc_close.tail(length)
             coin_r = (
-                (coin_tail.iloc[-1] - coin_tail.iloc[-10]) /
-                coin_tail.iloc[-10]
+                (coin_tail.iloc[-1] - coin_tail.iloc[-rs_lookback]) /
+                coin_tail.iloc[-rs_lookback]
             ) * 100
             btc_r = (
-                (btc_tail.iloc[-1] - btc_tail.iloc[-10]) /
-                btc_tail.iloc[-10]
+                (btc_tail.iloc[-1] - btc_tail.iloc[-rs_lookback]) /
+                btc_tail.iloc[-rs_lookback]
             ) * 100
             rs = coin_r - btc_r
 
@@ -280,7 +304,7 @@ def get_signal_frames(symbol, btc_trend_df):
 
 def get_adverse_reversal_frame(symbol, trend_df):
     safety_timeframe = str(
-        getattr(config, "ADVERSE_REVERSAL_TIMEFRAME", "1d")
+        getattr(config, "ADVERSE_REVERSAL_TIMEFRAME", "1h")
     ).strip()
     trend_timeframe = str(config.TREND_TIMEFRAME).strip()
 
@@ -1660,7 +1684,10 @@ def dca_tick_ready(symbol, mark_price, state=None):
     if not position_state or not position_state.get("managed_by_bot"):
         return False
 
-    if position_state.get("reversal_profit_exit_status") == "SUBMITTED":
+    if (
+        position_state.get("reversal_profit_exit_status") == "SUBMITTED" or
+        position_state.get("trend_profit_exit_status") == "SUBMITTED"
+    ):
         return False
 
     if has_active_dca_reservation(state, symbol):
@@ -1883,6 +1910,7 @@ class DcaWebsocketMonitor:
             (
                 config.DCA_ENABLED or
                 getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True) or
+                getattr(config, "TREND_PROFIT_PROTECTION_ENABLED", False) or
                 getattr(config, "EARLY_FLOW_EXIT_ENABLED", False)
             )
         )
@@ -1898,7 +1926,11 @@ class DcaWebsocketMonitor:
         self.watchdog_stop_event = threading.Event()
         self.protection_lock = threading.Lock()
         self.reversal_peaks = {}
+        self.reversal_peak_entries = {}
         self.reversal_exit_pending = set()
+        self.trend_peaks = {}
+        self.trend_peak_entries = {}
+        self.trend_exit_pending = set()
         self.route_invalidation_check_times = {}
         self.route_exit_pending = set()
 
@@ -2105,7 +2137,23 @@ class DcaWebsocketMonitor:
                 for symbol, peak in self.reversal_peaks.items()
                 if symbol in active_symbols
             }
+            self.reversal_peak_entries = {
+                symbol: entry
+                for symbol, entry in self.reversal_peak_entries.items()
+                if symbol in active_symbols
+            }
             self.reversal_exit_pending.intersection_update(active_symbols)
+            self.trend_peaks = {
+                symbol: peak
+                for symbol, peak in self.trend_peaks.items()
+                if symbol in active_symbols
+            }
+            self.trend_peak_entries = {
+                symbol: entry
+                for symbol, entry in self.trend_peak_entries.items()
+                if symbol in active_symbols
+            }
+            self.trend_exit_pending.intersection_update(active_symbols)
             self.route_invalidation_check_times = {
                 symbol: checked_at
                 for symbol, checked_at in self.route_invalidation_check_times.items()
@@ -2202,6 +2250,13 @@ class DcaWebsocketMonitor:
         state = load_trade_state()
 
         if self._handle_reversal_profit_protection(
+            symbol,
+            mark_price,
+            state,
+        ):
+            return
+
+        if self._handle_trend_profit_protection(
             symbol,
             mark_price,
             state,
@@ -2522,7 +2577,39 @@ class DcaWebsocketMonitor:
             lock.release()
 
     def _handle_reversal_profit_protection(self, symbol, mark_price, state):
-        if not getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True):
+        return self._handle_route_profit_protection(
+            symbol,
+            mark_price,
+            state,
+            "REVERSAL",
+        )
+
+    def _handle_trend_profit_protection(self, symbol, mark_price, state):
+        return self._handle_route_profit_protection(
+            symbol,
+            mark_price,
+            state,
+            "TREND",
+        )
+
+    def _handle_route_profit_protection(
+        self,
+        symbol,
+        mark_price,
+        state,
+        route,
+    ):
+        route = "REVERSAL" if str(route).upper() == "REVERSAL" else "TREND"
+        route_key = route.lower()
+        enabled = bool(
+            getattr(
+                config,
+                f"{route}_PROFIT_PROTECTION_ENABLED",
+                route == "REVERSAL",
+            )
+        )
+
+        if not enabled:
             return False
 
         position_state = get_position_state(state, symbol)
@@ -2536,40 +2623,69 @@ class DcaWebsocketMonitor:
             ""
         ).upper()
 
-        if signal_type != "REVERSAL":
+        if signal_type != route:
             return False
 
-        if position_state.get("reversal_profit_exit_status") == "SUBMITTED":
+        exit_status_field = f"{route_key}_profit_exit_status"
+
+        if position_state.get(exit_status_field) == "SUBMITTED":
             return True
 
         side = position_state.get("side")
         avg_entry = float(position_state.get("avg_entry") or 0)
-        saved_peak = float(position_state.get("reversal_peak_roi") or 0)
+        peak_field = f"{route_key}_peak_roi"
+        basis_field = f"{route_key}_profit_basis_entry"
+        saved_peak = float(position_state.get(peak_field) or 0)
+        saved_basis = float(position_state.get(basis_field) or avg_entry)
+        peak_map = (
+            self.reversal_peaks
+            if route == "REVERSAL"
+            else self.trend_peaks
+        )
+        basis_map = (
+            self.reversal_peak_entries
+            if route == "REVERSAL"
+            else self.trend_peak_entries
+        )
+        pending = (
+            self.reversal_exit_pending
+            if route == "REVERSAL"
+            else self.trend_exit_pending
+        )
+        basis_tolerance = max(abs(avg_entry) * 1e-10, 1e-10)
+
+        if abs(saved_basis - avg_entry) > basis_tolerance:
+            saved_peak = 0
 
         with self.protection_lock:
-            previous_peak = max(
-                saved_peak,
-                float(self.reversal_peaks.get(symbol, 0) or 0),
-            )
+            memory_basis = float(basis_map.get(symbol, avg_entry) or avg_entry)
+            memory_peak = float(peak_map.get(symbol, 0) or 0)
 
-        info = evaluate_reversal_profit_protection(
+            if abs(memory_basis - avg_entry) > basis_tolerance:
+                memory_peak = 0
+
+            previous_peak = max(saved_peak, memory_peak)
+
+        info = evaluate_route_profit_protection(
             side,
             avg_entry,
             mark_price,
             peak_roi=previous_peak,
             leverage=config.LEVERAGE,
+            confirmation_type=route,
         )
         peak_roi = float(info.get("peak_roi", 0) or 0)
 
         with self.protection_lock:
-            self.reversal_peaks[symbol] = peak_roi
+            peak_map[symbol] = peak_roi
+            basis_map[symbol] = avg_entry
 
         persist_step = max(
             float(
                 getattr(
                     config,
-                    "REVERSAL_PROFIT_PEAK_PERSIST_STEP_ROI",
-                    2,
+                    f"{route}_PROFIT_PEAK_PERSIST_STEP_ROI",
+                    2 if route == "REVERSAL" else 1,
                 )
             ),
             0.1,
@@ -2577,7 +2693,8 @@ class DcaWebsocketMonitor:
         trigger_roi = float(info.get("trigger_roi", 0) or 0)
         should_persist = (
             peak_roi >= saved_peak + persist_step or
-            (peak_roi >= trigger_roi > saved_peak)
+            (peak_roi >= trigger_roi > saved_peak) or
+            abs(saved_basis - avg_entry) > basis_tolerance
         )
 
         if should_persist:
@@ -2585,9 +2702,10 @@ class DcaWebsocketMonitor:
                 state,
                 symbol,
                 {
-                    "reversal_peak_roi": round(peak_roi, 2),
-                    "reversal_profit_floor_roi": info.get("floor_roi"),
-                    "reversal_profit_armed": bool(info.get("armed")),
+                    peak_field: round(peak_roi, 2),
+                    basis_field: avg_entry,
+                    f"{route_key}_profit_floor_roi": info.get("floor_roi"),
+                    f"{route_key}_profit_armed": bool(info.get("armed")),
                 },
             )
 
@@ -2598,35 +2716,35 @@ class DcaWebsocketMonitor:
 
         if not lock.acquire(blocking=False):
             log_info(
-                f"{symbol} reversal profit exit deferred | position busy"
+                f"{symbol} {route_key} profit exit deferred | position busy"
             )
             return True
 
         try:
             with self.protection_lock:
-                if symbol in self.reversal_exit_pending:
+                if symbol in pending:
                     return True
 
-                self.reversal_exit_pending.add(symbol)
+                pending.add(symbol)
 
             details = get_open_position_details(symbol)
             position_detail = (details or {}).get(symbol)
 
             if not position_detail:
                 log_warning(
-                    f"{symbol} reversal profit exit skipped | "
+                    f"{symbol} {route_key} profit exit skipped | "
                     "live position not found"
                 )
 
                 with self.protection_lock:
-                    self.reversal_exit_pending.discard(symbol)
+                    pending.discard(symbol)
 
                 return True
 
             amount = float(position_detail.get("amount", 0) or 0)
             position_side = position_detail.get("position_side")
             log_warning(
-                f"{symbol} REVERSAL PROFIT RETRACE EXIT | "
+                f"{symbol} {route} PROFIT RETRACE EXIT | "
                 f"CURRENT_ROI={info.get('current_roi')}% | "
                 f"PEAK_ROI={info.get('peak_roi')}% | "
                 f"FLOOR_ROI={info.get('floor_roi')}%"
@@ -2643,39 +2761,40 @@ class DcaWebsocketMonitor:
                     state,
                     symbol,
                     {
-                        "reversal_peak_roi": round(peak_roi, 2),
-                        "reversal_profit_exit_status": "SUBMITTED",
-                        "reversal_profit_exit_price": mark_price,
-                        "reversal_profit_exit_roi": info.get("current_roi"),
-                        "reversal_profit_exit_reason": info.get("reason"),
+                        peak_field: round(peak_roi, 2),
+                        basis_field: avg_entry,
+                        exit_status_field: "SUBMITTED",
+                        f"{route_key}_profit_exit_price": mark_price,
+                        f"{route_key}_profit_exit_roi": info.get("current_roi"),
+                        f"{route_key}_profit_exit_reason": info.get("reason"),
                     },
                 )
                 send_telegram_message(
                     f"{config.TELEGRAM_MESSAGE_PREFIX}\n"
-                    f"{symbol} reversal profit protected\n"
+                    f"{symbol} {route_key} profit protected\n"
                     f"ROI: {info.get('current_roi')}%\n"
                     f"Peak ROI: {info.get('peak_roi')}%\n"
                     f"Protection floor: {info.get('floor_roi')}%"
                 )
                 return True
 
-            log_error(f"{symbol} reversal profit exit order failed")
+            log_error(f"{symbol} {route_key} profit exit order failed")
             update_position_runtime_fields(
                 state,
                 symbol,
-                {"reversal_profit_exit_status": "FAILED"},
+                {exit_status_field: "FAILED"},
             )
 
             with self.protection_lock:
-                self.reversal_exit_pending.discard(symbol)
+                pending.discard(symbol)
 
             return True
 
         except Exception as e:
-            log_error(f"{symbol} reversal profit protection error: {e}")
+            log_error(f"{symbol} {route_key} profit protection error: {e}")
 
             with self.protection_lock:
-                self.reversal_exit_pending.discard(symbol)
+                pending.discard(symbol)
 
             return True
 
@@ -2702,6 +2821,14 @@ def calculate_signal_rank(candidate):
     rank += _safe_float(side_data.get("participation_score")) * config.SIGNAL_RANKING_FLOW_WEIGHT
     rank += _safe_float(side_data.get("smc_score")) * config.SIGNAL_RANKING_SMC_WEIGHT
     rank += _safe_float(side_data.get("regime_score")) * config.SIGNAL_RANKING_REGIME_WEIGHT
+
+    if (side_data.get("intraday_entry") or {}).get("active"):
+        rank += max(
+            _safe_float(
+                getattr(config, "INTRADAY_ENTRY_RANK_BONUS", 1.5)
+            ),
+            0,
+        )
 
     if (side_data.get("trend_timing_rescue") or {}).get("active"):
         rank -= max(
@@ -2968,11 +3095,23 @@ def execute_entry_candidate(
         continuation_pullback = (
             side_analysis.get("continuation_pullback") or {}
         )
+        intraday_entry = side_analysis.get("intraday_entry") or {}
         timing_rescue_active = bool(timing_rescue.get("active"))
         continuation_pullback_active = bool(
             continuation_pullback.get("active")
         )
+        intraday_entry_active = bool(intraday_entry.get("active"))
         require_both_live = (
+            (
+                intraday_entry_active and
+                bool(
+                    getattr(
+                        config,
+                        "INTRADAY_REQUIRE_BOTH_LIVE_TIMEFRAMES",
+                        False
+                    )
+                )
+            ) or
             (
                 timing_rescue_active and
                 bool(
@@ -3018,6 +3157,16 @@ def execute_entry_candidate(
                 f"{symbol} CONTINUATION PULLBACK EXECUTION | "
                 f"EMA20_DISTANCE_ATR="
                 f"{continuation_pullback.get('ema20_distance_atr')} | "
+                f"REQUIRE_BOTH_LIVE={require_both_live}"
+            )
+
+        if intraday_entry_active:
+            setup = intraday_entry.get("setup") or {}
+            trigger = intraday_entry.get("trigger") or {}
+            log_info(
+                f"{symbol} INTRADAY ENTRY EXECUTION | "
+                f"SETUP={setup.get('type')}:{setup.get('points')} | "
+                f"TRIGGER={trigger.get('points')} | "
                 f"REQUIRE_BOTH_LIVE={require_both_live}"
             )
 

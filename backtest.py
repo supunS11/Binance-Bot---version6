@@ -15,7 +15,7 @@ from indicators import apply_indicators
 from strategy import (
     analyze_signal,
     evaluate_route_early_invalidation,
-    evaluate_reversal_profit_protection,
+    evaluate_route_profit_protection,
     validate_adverse_zone_level,
     validate_dca_continuation_guard,
     validate_entry_profit_room,
@@ -446,27 +446,55 @@ def calculate_btc_context(symbol, trend_df, btc_df):
         return 0.0, 0.0
 
     try:
-        coin_close = trend_df.iloc[:-1]["close"].tail(100).reset_index(drop=True)
-        btc_close = btc_df.iloc[:-1]["close"].tail(100).reset_index(drop=True)
+        correlation_lookback = max(
+            int(getattr(config, "BTC_CONTEXT_CORRELATION_LOOKBACK", 72)),
+            20,
+        )
+        rs_lookback = max(
+            int(getattr(config, "BTC_CONTEXT_RS_LOOKBACK", 24)),
+            2,
+        )
+        required_rows = max(correlation_lookback, rs_lookback)
+        coin_close = (
+            trend_df.iloc[:-1]["close"]
+            .tail(required_rows)
+            .reset_index(drop=True)
+        )
+        btc_close = (
+            btc_df.iloc[:-1]["close"]
+            .tail(required_rows)
+            .reset_index(drop=True)
+        )
         length = min(len(coin_close), len(btc_close))
 
         if length < 20:
             btc_corr = 0.0
         else:
-            coin_ret = coin_close.tail(length).pct_change().dropna()
-            btc_ret = btc_close.tail(length).pct_change().dropna()
+            correlation_rows = min(length, correlation_lookback)
+            coin_ret = (
+                coin_close.tail(correlation_rows).pct_change().dropna()
+            )
+            btc_ret = (
+                btc_close.tail(correlation_rows).pct_change().dropna()
+            )
             btc_corr = coin_ret.corr(btc_ret)
 
             if btc_corr != btc_corr:
                 btc_corr = 0.0
 
-        if length < 10:
+        if length < rs_lookback:
             rs = 0.0
         else:
             coin_tail = coin_close.tail(length)
             btc_tail = btc_close.tail(length)
-            coin_r = ((coin_tail.iloc[-1] - coin_tail.iloc[-10]) / coin_tail.iloc[-10]) * 100
-            btc_r = ((btc_tail.iloc[-1] - btc_tail.iloc[-10]) / btc_tail.iloc[-10]) * 100
+            coin_r = (
+                (coin_tail.iloc[-1] - coin_tail.iloc[-rs_lookback]) /
+                coin_tail.iloc[-rs_lookback]
+            ) * 100
+            btc_r = (
+                (btc_tail.iloc[-1] - btc_tail.iloc[-rs_lookback]) /
+                btc_tail.iloc[-rs_lookback]
+            ) * 100
             rs = coin_r - btc_r
 
         return round(float(btc_corr), 2), round(float(rs), 2)
@@ -793,7 +821,8 @@ def simulate_trade(
     )
     max_seen_adverse_roi = 0.0
     max_seen_favorable_roi = 0.0
-    reversal_profit_floor_roi = 0.0
+    profit_protection_peak_roi = 0.0
+    profit_protection_floor_roi = 0.0
     exit_candle = None
     exit_reason = "OPEN_AT_DATA_END"
     exit_price = None
@@ -966,6 +995,8 @@ def simulate_trade(
             })
             dca_count += 1
             avg_entry = position_average_entry(fills)
+            profit_protection_peak_roi = 0.0
+            profit_protection_floor_roi = 0.0
 
             if getattr(config, "DCA_REPRICE_TP_AFTER_FILL", True):
                 trend_slice = closed_slice(
@@ -1007,18 +1038,43 @@ def simulate_trade(
             if side == "BUY"
             else float(candle["low"])
         )
-        profit_info = evaluate_reversal_profit_protection(
-            side,
-            avg_entry,
-            favorable_price,
-            peak_roi=max_seen_favorable_roi,
-            leverage=config.LEVERAGE,
+        favorable_roi = (
+            ((favorable_price - avg_entry) / avg_entry) *
+            float(config.LEVERAGE) *
+            100
+            if side == "BUY"
+            else ((avg_entry - favorable_price) / avg_entry) *
+            float(config.LEVERAGE) *
+            100
         )
         max_seen_favorable_roi = max(
             max_seen_favorable_roi,
+            favorable_roi,
+            0,
+        )
+        profit_protection_peak_roi = max(
+            profit_protection_peak_roi,
+            favorable_roi,
+            0,
+        )
+        route = (
+            "REVERSAL"
+            if str(confirmation_type or "").upper() == "REVERSAL"
+            else "TREND"
+        )
+        profit_info = evaluate_route_profit_protection(
+            side,
+            avg_entry,
+            favorable_price,
+            peak_roi=profit_protection_peak_roi,
+            leverage=config.LEVERAGE,
+            confirmation_type=route,
+        )
+        profit_protection_peak_roi = max(
+            profit_protection_peak_roi,
             float(profit_info.get("peak_roi", 0) or 0),
         )
-        reversal_profit_floor_roi = float(
+        profit_protection_floor_roi = float(
             profit_info.get("floor_roi", 0) or 0
         )
 
@@ -1029,13 +1085,12 @@ def simulate_trade(
             break
 
         if (
-            str(confirmation_type or "").upper() == "REVERSAL" and
             profit_info.get("armed")
         ):
             profit_floor_price = roi_to_price(
                 side,
                 avg_entry,
-                reversal_profit_floor_roi,
+                profit_protection_floor_roi,
             )
             profit_floor_hit = (
                 float(candle["low"]) <= profit_floor_price
@@ -1046,7 +1101,7 @@ def simulate_trade(
             if profit_floor_hit:
                 exit_price = apply_exit_slippage(side, profit_floor_price)
                 exit_candle = candle
-                exit_reason = "REVERSAL_PROFIT_PROTECTION"
+                exit_reason = f"{route}_PROFIT_PROTECTION"
                 break
 
         if candle_hits_tp(side, candle, tp_price):
@@ -1101,7 +1156,22 @@ def simulate_trade(
         "duration_hours": round(duration_hours, 2),
         "max_adverse_roi": round(max_seen_adverse_roi, 2),
         "max_favorable_roi": round(max_seen_favorable_roi, 2),
-        "reversal_profit_floor_roi": round(reversal_profit_floor_roi, 2),
+        "profit_protection_floor_roi": round(
+            profit_protection_floor_roi,
+            2,
+        ),
+        "reversal_profit_floor_roi": round(
+            profit_protection_floor_roi
+            if str(confirmation_type or "").upper() == "REVERSAL"
+            else 0,
+            2,
+        ),
+        "trend_profit_floor_roi": round(
+            profit_protection_floor_roi
+            if str(confirmation_type or "").upper() != "REVERSAL"
+            else 0,
+            2,
+        ),
         "dca_blocked_count": dca_blocked_count,
         "last_dca_block_reason": last_dca_block_reason,
         "early_invalidation_reason": early_invalidation_reason,
@@ -1200,6 +1270,23 @@ def generate_symbol_trades(
 
         btc_trend = btc_trend_from_slice(btc_slice)
         btc_corr, rs = calculate_btc_context(symbol, trend_slice, btc_slice)
+        participation = None
+
+        if getattr(
+            config,
+            "BACKTEST_ASSUME_NEUTRAL_FUTURES_CONTEXT",
+            True,
+        ):
+            participation = {
+                "available": True,
+                "source": "backtest_neutral",
+                "oi_change_pct": None,
+                "taker_buy_sell_ratio": None,
+                "global_long_short_ratio": None,
+                "top_long_short_ratio": None,
+                "funding_rate": None,
+            }
+
         analysis = analyze_signal(
             trend_slice,
             confirm_slice,
@@ -1207,7 +1294,7 @@ def generate_symbol_trades(
             btc_trend,
             btc_corr,
             rs,
-            participation=None,
+            participation=participation,
             log_details=False,
         )
         record_reversal_diagnostics(reversal_diagnostics, analysis)
@@ -1549,7 +1636,7 @@ def apply_runtime_options(args):
         )
 
         if not args.exit_timeframe:
-            config.BACKTEST_EXIT_TIMEFRAME = "4h"
+            config.BACKTEST_EXIT_TIMEFRAME = config.ENTRY_TIMEFRAME
 
     if args.signal_step is not None:
         config.BACKTEST_SIGNAL_STEP_CANDLES = max(int(args.signal_step), 1)
@@ -1657,6 +1744,13 @@ def run_backtest(args):
             "exit_timeframe": getattr(config, "BACKTEST_EXIT_TIMEFRAME", config.ENTRY_TIMEFRAME),
             "slice_max_rows": int(getattr(config, "BACKTEST_SLICE_MAX_ROWS", 0) or 0),
             "use_btc_context": bool(getattr(config, "BACKTEST_USE_BTC_CONTEXT", True)),
+            "neutral_futures_context": bool(
+                getattr(
+                    config,
+                    "BACKTEST_ASSUME_NEUTRAL_FUTURES_CONTEXT",
+                    True,
+                )
+            ),
             "use_dca": bool(getattr(config, "BACKTEST_USE_DCA", False)),
             "trend_sl_enabled": bool(
                 getattr(config, "TREND_SL_ENABLED", getattr(config, "SL_ENABLED", False))
@@ -1684,6 +1778,18 @@ def run_backtest(args):
             ),
             "reversal_profit_retrace_pct": float(
                 getattr(config, "REVERSAL_PROFIT_PROTECTION_RETRACE_PCT", 50)
+            ),
+            "trend_profit_protection_enabled": bool(
+                getattr(config, "TREND_PROFIT_PROTECTION_ENABLED", False)
+            ),
+            "trend_profit_trigger_roi": float(
+                getattr(config, "TREND_PROFIT_PROTECTION_TRIGGER_ROI", 15)
+            ),
+            "trend_profit_lock_roi": float(
+                getattr(config, "TREND_PROFIT_PROTECTION_LOCK_ROI", 5)
+            ),
+            "trend_profit_retrace_pct": float(
+                getattr(config, "TREND_PROFIT_PROTECTION_RETRACE_PCT", 45)
             ),
             "reversal_entry_enabled": bool(
                 getattr(config, "REVERSAL_ENTRY_ENABLED", True)

@@ -36,6 +36,22 @@ def get_config_int(name, default):
         return default
 
 
+def _role_timeframe(role):
+    role_name = str(role or "").strip().lower()
+    return {
+        "trend": str(getattr(config, "TREND_TIMEFRAME", "1h")),
+        "confirm": str(getattr(config, "CONFIRMATION_TIMEFRAME", "30m")),
+        "entry": str(getattr(config, "ENTRY_TIMEFRAME", "15m")),
+    }.get(role_name, role_name or "unknown")
+
+
+def _role_level_weight(role):
+    if str(role or "").strip().lower() == "trend":
+        return get_config_float("STRUCTURE_TREND_LEVEL_WEIGHT", 2.0)
+
+    return get_config_float("STRUCTURE_CONFIRM_LEVEL_WEIGHT", 1.25)
+
+
 def latest_closed(df):
     return df.iloc[-2] if len(df) > 1 else df.iloc[-1]
 
@@ -87,12 +103,43 @@ def get_structure_stop_loss(df, side):
         return None
 
 
-def detect_market_structure(df):
+def detect_market_structure(df, role="confirm"):
     try:
-        recent_high = df["high"].iloc[-30:-5].max()
-        recent_low = df["low"].iloc[-30:-5].min()
-        prev_high = df["high"].iloc[-60:-30].max()
-        prev_low = df["low"].iloc[-60:-30].min()
+        role_name = str(role or "confirm").strip().lower()
+        window_name = {
+            "trend": "TREND_STRUCTURE_WINDOW",
+            "confirm": "CONFIRM_STRUCTURE_WINDOW",
+            "entry": "ENTRY_STRUCTURE_WINDOW",
+        }.get(role_name, "CONFIRM_STRUCTURE_WINDOW")
+        default_window = {
+            "trend": 48,
+            "confirm": 24,
+            "entry": 12,
+        }.get(role_name, 24)
+        window = max(get_config_int(window_name, default_window), 4)
+        exclude = max(
+            get_config_int("STRUCTURE_BREAK_EXCLUDE_CANDLES", 2),
+            1
+        )
+        closed = df.iloc[:-1] if len(df) > 1 else df
+        history = closed.iloc[:-exclude] if len(closed) > exclude else closed.iloc[0:0]
+
+        if len(history) < 8:
+            raise ValueError("insufficient structure history")
+
+        effective_window = min(window, max(len(history) // 2, 4))
+        recent = history.iloc[-effective_window:]
+        previous = history.iloc[-(effective_window * 2):-effective_window]
+
+        if previous.empty:
+            midpoint = max(len(history) // 2, 1)
+            previous = history.iloc[:midpoint]
+            recent = history.iloc[midpoint:]
+
+        recent_high = recent["high"].max()
+        recent_low = recent["low"].min()
+        prev_high = previous["high"].max()
+        prev_low = previous["low"].min()
         close = latest_closed(df)["close"]
 
         return {
@@ -100,6 +147,12 @@ def detect_market_structure(df):
             "bearish_structure": recent_high < prev_high and recent_low < prev_low,
             "bullish_breakout": close > recent_high,
             "bearish_breakdown": close < recent_low,
+            "recent_high": _safe_float(recent_high),
+            "recent_low": _safe_float(recent_low),
+            "previous_high": _safe_float(prev_high),
+            "previous_low": _safe_float(prev_low),
+            "role": role_name,
+            "window": effective_window,
         }
 
     except Exception:
@@ -108,6 +161,12 @@ def detect_market_structure(df):
             "bearish_structure": False,
             "bullish_breakout": False,
             "bearish_breakdown": False,
+            "recent_high": None,
+            "recent_low": None,
+            "previous_high": None,
+            "previous_low": None,
+            "role": str(role or "confirm"),
+            "window": 0,
         }
 
 
@@ -495,14 +554,30 @@ def find_structure_take_profit(side, entry_price, trend_df, confirm_df, leverage
     max_roi = get_config_float("STRUCTURE_TP_MAX_ROI", 120)
     min_score = get_config_float("STRUCTURE_TP_MIN_SCORE", 2.0)
     buffer = _take_profit_buffer(entry_price, trend_df, confirm_df)
+    trend_label = _role_timeframe("trend")
+    confirm_label = _role_timeframe("confirm")
+    trend_weight = _role_level_weight("trend")
+    confirm_weight = _role_level_weight("confirm")
 
     candidates = []
-    candidates.extend(_collect_pivot_levels(trend_df, target_side, "1d", 2.0))
-    candidates.extend(_collect_pivot_levels(confirm_df, target_side, "4h", 1.25))
-    candidates.extend(_collect_range_levels(trend_df, target_side, "1d", 2.0))
-    candidates.extend(_collect_range_levels(confirm_df, target_side, "4h", 1.25))
-    candidates.extend(_collect_ema_levels(trend_df, target_side, "1d", 2.0))
-    candidates.extend(_collect_ema_levels(confirm_df, target_side, "4h", 1.25))
+    candidates.extend(_collect_pivot_levels(
+        trend_df, target_side, trend_label, trend_weight
+    ))
+    candidates.extend(_collect_pivot_levels(
+        confirm_df, target_side, confirm_label, confirm_weight
+    ))
+    candidates.extend(_collect_range_levels(
+        trend_df, target_side, trend_label, trend_weight
+    ))
+    candidates.extend(_collect_range_levels(
+        confirm_df, target_side, confirm_label, confirm_weight
+    ))
+    candidates.extend(_collect_ema_levels(
+        trend_df, target_side, trend_label, trend_weight
+    ))
+    candidates.extend(_collect_ema_levels(
+        confirm_df, target_side, confirm_label, confirm_weight
+    ))
 
     tolerance = max(_level_tolerance(trend_df), _level_tolerance(confirm_df))
     candidates = _dedupe_levels(candidates, tolerance)
@@ -580,14 +655,30 @@ def find_nearest_profit_room_level(side, entry_price, trend_df, confirm_df, leve
         get_config_float("STRUCTURE_TP_MIN_SCORE", 2.0)
     )
     buffer = _take_profit_buffer(entry_price, trend_df, confirm_df)
+    trend_label = _role_timeframe("trend")
+    confirm_label = _role_timeframe("confirm")
+    trend_weight = _role_level_weight("trend")
+    confirm_weight = _role_level_weight("confirm")
 
     candidates = []
-    candidates.extend(_collect_pivot_levels(trend_df, target_side, "1d", 2.0))
-    candidates.extend(_collect_pivot_levels(confirm_df, target_side, "4h", 1.25))
-    candidates.extend(_collect_range_levels(trend_df, target_side, "1d", 2.0))
-    candidates.extend(_collect_range_levels(confirm_df, target_side, "4h", 1.25))
-    candidates.extend(_collect_ema_levels(trend_df, target_side, "1d", 2.0))
-    candidates.extend(_collect_ema_levels(confirm_df, target_side, "4h", 1.25))
+    candidates.extend(_collect_pivot_levels(
+        trend_df, target_side, trend_label, trend_weight
+    ))
+    candidates.extend(_collect_pivot_levels(
+        confirm_df, target_side, confirm_label, confirm_weight
+    ))
+    candidates.extend(_collect_range_levels(
+        trend_df, target_side, trend_label, trend_weight
+    ))
+    candidates.extend(_collect_range_levels(
+        confirm_df, target_side, confirm_label, confirm_weight
+    ))
+    candidates.extend(_collect_ema_levels(
+        trend_df, target_side, trend_label, trend_weight
+    ))
+    candidates.extend(_collect_ema_levels(
+        confirm_df, target_side, confirm_label, confirm_weight
+    ))
 
     tolerance = max(_level_tolerance(trend_df), _level_tolerance(confirm_df))
     candidates = _dedupe_levels(candidates, tolerance)
@@ -1282,8 +1373,18 @@ def _collect_order_blocks(df, side, label, timeframe_weight):
 def find_order_block_confirmation(side, entry_price, trend_df, confirm_df, leverage=None):
     zone_min, zone_max = _adverse_zone(side, entry_price, leverage)
     candidates = []
-    candidates.extend(_collect_order_blocks(trend_df, side, "1d", 2.0))
-    candidates.extend(_collect_order_blocks(confirm_df, side, "4h", 1.25))
+    candidates.extend(_collect_order_blocks(
+        trend_df,
+        side,
+        _role_timeframe("trend"),
+        _role_level_weight("trend")
+    ))
+    candidates.extend(_collect_order_blocks(
+        confirm_df,
+        side,
+        _role_timeframe("confirm"),
+        _role_level_weight("confirm")
+    ))
     valid = []
 
     for candidate in candidates:
@@ -1405,8 +1506,8 @@ def find_fvg_confirmation(side, entry_price, trend_df, confirm_df, leverage=None
     zone_min, zone_max = _adverse_zone(side, entry_price, leverage)
     target_price = _estimated_tp_price(side, entry_price, trend_df, confirm_df)
     fvgs = []
-    fvgs.extend(_collect_fvgs(trend_df, "1d"))
-    fvgs.extend(_collect_fvgs(confirm_df, "4h"))
+    fvgs.extend(_collect_fvgs(trend_df, _role_timeframe("trend")))
+    fvgs.extend(_collect_fvgs(confirm_df, _role_timeframe("confirm")))
     supportive = []
     blocking = []
 
@@ -1462,10 +1563,22 @@ def _smc_context_score(side, trend_df, confirm_df, entry_df):
         "fvg_block": None,
     }
 
-    entry_sweep = detect_liquidity_sweep(side, entry_df, "1h")
-    confirm_sweep = detect_liquidity_sweep(side, confirm_df, "4h")
+    entry_sweep = detect_liquidity_sweep(
+        side,
+        entry_df,
+        _role_timeframe("entry")
+    )
+    confirm_sweep = detect_liquidity_sweep(
+        side,
+        confirm_df,
+        _role_timeframe("confirm")
+    )
     opposite_side = "SELL" if side == "BUY" else "BUY"
-    opposite_sweep = detect_liquidity_sweep(opposite_side, entry_df, "1h")
+    opposite_sweep = detect_liquidity_sweep(
+        opposite_side,
+        entry_df,
+        _role_timeframe("entry")
+    )
 
     if entry_sweep:
         context["liquidity_sweep"] = entry_sweep
@@ -1518,14 +1631,16 @@ def find_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverage=No
     )
     max_adverse_roi = max(max_adverse_roi, 0.01)
     max_price_move = (max_adverse_roi / max(leverage_to_use, 1)) / 100
-    use_1d_only = bool(getattr(config, "ADVERSE_REVERSAL_USE_1D_ONLY", True))
+    use_1d_only = bool(
+        getattr(config, "ADVERSE_REVERSAL_USE_1D_ONLY", False)
+    )
     include_range = bool(getattr(config, "ADVERSE_REVERSAL_INCLUDE_RANGE", True))
     include_ema = bool(getattr(config, "ADVERSE_REVERSAL_INCLUDE_EMA", True))
     trend_label = str(
         getattr(
             config,
             "ADVERSE_REVERSAL_TIMEFRAME",
-            getattr(config, "TREND_TIMEFRAME", "1d")
+            getattr(config, "TREND_TIMEFRAME", "1h")
         )
     )
 
@@ -1537,23 +1652,35 @@ def find_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverage=No
         zone_max = entry_price * (1 + max_price_move)
 
     candidates = []
-    candidates.extend(_collect_pivot_levels(trend_df, side, trend_label, 2.0))
+    candidates.extend(_collect_pivot_levels(
+        trend_df, side, trend_label, _role_level_weight("trend")
+    ))
 
     if include_range:
-        candidates.extend(_collect_range_levels(trend_df, side, trend_label, 2.0))
+        candidates.extend(_collect_range_levels(
+            trend_df, side, trend_label, _role_level_weight("trend")
+        ))
 
     if include_ema:
-        candidates.extend(_collect_ema_levels(trend_df, side, trend_label, 2.0))
+        candidates.extend(_collect_ema_levels(
+            trend_df, side, trend_label, _role_level_weight("trend")
+        ))
 
     if not use_1d_only and confirm_df is not None:
-        confirm_label = str(getattr(config, "CONFIRMATION_TIMEFRAME", "4h"))
-        candidates.extend(_collect_pivot_levels(confirm_df, side, confirm_label, 1.25))
+        confirm_label = str(getattr(config, "CONFIRMATION_TIMEFRAME", "30m"))
+        candidates.extend(_collect_pivot_levels(
+            confirm_df, side, confirm_label, _role_level_weight("confirm")
+        ))
 
         if include_range:
-            candidates.extend(_collect_range_levels(confirm_df, side, confirm_label, 1.25))
+            candidates.extend(_collect_range_levels(
+                confirm_df, side, confirm_label, _role_level_weight("confirm")
+            ))
 
         if include_ema:
-            candidates.extend(_collect_ema_levels(confirm_df, side, confirm_label, 1.25))
+            candidates.extend(_collect_ema_levels(
+                confirm_df, side, confirm_label, _role_level_weight("confirm")
+            ))
 
     tolerance = _level_tolerance(trend_df)
 
@@ -1632,7 +1759,7 @@ def validate_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverag
                 getattr(
                     config,
                     "ADVERSE_REVERSAL_TIMEFRAME",
-                    getattr(config, "TREND_TIMEFRAME", "1d")
+                    getattr(config, "TREND_TIMEFRAME", "1h")
                 )
             ),
             "level_check_disabled": True,
@@ -1658,7 +1785,7 @@ def validate_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverag
         getattr(
             config,
             "ADVERSE_REVERSAL_TIMEFRAME",
-            getattr(config, "TREND_TIMEFRAME", "1d")
+            getattr(config, "TREND_TIMEFRAME", "1h")
         )
     ).upper()
     return False, {
@@ -1727,50 +1854,70 @@ def _normalise_dca_level(side, current_price, candidate, tolerance, leverage=Non
 
 def _collect_dca_structure_candidates(side, trend_df, confirm_df):
     candidates = []
+    trend_label = _role_timeframe("trend")
+    confirm_label = _role_timeframe("confirm")
+    trend_weight = _role_level_weight("trend")
+    confirm_weight = _role_level_weight("confirm")
 
-    for item in _collect_pivot_levels(trend_df, side, "1d", 2.0):
+    for item in _collect_pivot_levels(
+        trend_df, side, trend_label, trend_weight
+    ):
         candidate = item.copy()
         candidate["kind"] = "pivot"
         candidates.append(candidate)
 
-    for item in _collect_pivot_levels(confirm_df, side, "4h", 1.25):
+    for item in _collect_pivot_levels(
+        confirm_df, side, confirm_label, confirm_weight
+    ):
         candidate = item.copy()
         candidate["kind"] = "pivot"
         candidates.append(candidate)
 
-    for item in _collect_range_levels(trend_df, side, "1d", 2.0):
+    for item in _collect_range_levels(
+        trend_df, side, trend_label, trend_weight
+    ):
         candidate = item.copy()
         candidate["kind"] = "range"
         candidates.append(candidate)
 
-    for item in _collect_range_levels(confirm_df, side, "4h", 1.25):
+    for item in _collect_range_levels(
+        confirm_df, side, confirm_label, confirm_weight
+    ):
         candidate = item.copy()
         candidate["kind"] = "range"
         candidates.append(candidate)
 
-    for item in _collect_ema_levels(trend_df, side, "1d", 2.0):
+    for item in _collect_ema_levels(
+        trend_df, side, trend_label, trend_weight
+    ):
         candidate = item.copy()
         candidate["kind"] = "ema"
         candidates.append(candidate)
 
-    for item in _collect_ema_levels(confirm_df, side, "4h", 1.25):
+    for item in _collect_ema_levels(
+        confirm_df, side, confirm_label, confirm_weight
+    ):
         candidate = item.copy()
         candidate["kind"] = "ema"
         candidates.append(candidate)
 
-    for item in _collect_order_blocks(trend_df, side, "1d", 2.0):
+    for item in _collect_order_blocks(
+        trend_df, side, trend_label, trend_weight
+    ):
         candidate = item.copy()
         candidate["kind"] = "order_block"
         candidate["score"] = float(candidate.get("score", 0)) + 0.5
         candidates.append(candidate)
 
-    for item in _collect_order_blocks(confirm_df, side, "4h", 1.25):
+    for item in _collect_order_blocks(
+        confirm_df, side, confirm_label, confirm_weight
+    ):
         candidate = item.copy()
         candidate["kind"] = "order_block"
         candidate["score"] = float(candidate.get("score", 0)) + 0.5
         candidates.append(candidate)
 
-    for fvg in _collect_fvgs(trend_df, "1d"):
+    for fvg in _collect_fvgs(trend_df, trend_label):
         if side == "BUY" and fvg["type"] != "bullish_fvg":
             continue
 
@@ -1782,7 +1929,7 @@ def _collect_dca_structure_candidates(side, trend_df, confirm_df):
         candidate["score"] = float(candidate.get("score", 0)) + 0.25
         candidates.append(candidate)
 
-    for fvg in _collect_fvgs(confirm_df, "4h"):
+    for fvg in _collect_fvgs(confirm_df, confirm_label):
         if side == "BUY" and fvg["type"] != "bullish_fvg":
             continue
 
@@ -2045,11 +2192,11 @@ def _market_regime_score(side, trend_df, confirm_df, entry_df):
     trend = latest_closed(trend_df)
     confirm = latest_closed(confirm_df)
     entry = latest_closed(entry_df)
-    confirm_structure = detect_market_structure(confirm_df)
+    confirm_structure = detect_market_structure(confirm_df, "confirm")
     trend_adx = _safe_float(trend.get("adx"))
     confirm_adx = _safe_float(confirm.get("adx"))
-    sideways_adx = get_config_float("SIDEWAYS_ADX", 15)
-    trending_adx = get_config_float("TRENDING_ADX", 25)
+    sideways_adx = get_config_float("SIDEWAYS_ADX", 16)
+    trending_adx = get_config_float("TRENDING_ADX", 23)
     atr = max(_safe_float(entry.get("atr")), 1e-10)
     entry_close = _safe_float(entry.get("close"))
     entry_ema20 = _safe_float(entry.get("ema20"))
@@ -2175,8 +2322,8 @@ def _ema_gap_score(side, candle):
 def _trend_bias_score(side, trend_df):
     trend = latest_closed(trend_df)
     prev = previous_closed(trend_df)
-    structure = detect_market_structure(trend_df)
-    min_adx = get_config_float("LONG_TERM_MIN_ADX", 14)
+    structure = detect_market_structure(trend_df, "trend")
+    min_adx = get_config_float("LONG_TERM_MIN_ADX", 17)
     score = 0
     hard_ok = False
 
@@ -2216,8 +2363,8 @@ def _trend_bias_score(side, trend_df):
 def _confirmation_score(side, confirm_df):
     confirm = latest_closed(confirm_df)
     prev = previous_closed(confirm_df)
-    structure = detect_market_structure(confirm_df)
-    min_adx = get_config_float("LONG_TERM_MIN_ADX", 14)
+    structure = detect_market_structure(confirm_df, "confirm")
+    min_adx = get_config_float("LONG_TERM_MIN_ADX", 17)
     max_ema_distance = get_config_float("MAX_SIGNAL_EMA20_DISTANCE_PCT", 1.2)
     score = 0
     hard_ok = False
@@ -2499,7 +2646,7 @@ def _trend_timing_rescue_context(
         reasons.append("LIVE_DIRECTION_SUPPORT_REQUIRED")
 
     if not trend_ok:
-        reasons.append("DAILY_TREND_HARD_CHECK_FAILED")
+        reasons.append("TREND_REGIME_HARD_CHECK_FAILED")
 
     if not level_ok:
         reasons.append("ADVERSE_LEVEL_CHECK_FAILED")
@@ -2658,7 +2805,7 @@ def _continuation_pullback_context(
     if entry_ok:
         reasons.append("NORMAL_ENTRY_ALREADY_VALID")
     if not trend_ok:
-        reasons.append("DAILY_TREND_HARD_CHECK_FAILED")
+        reasons.append("TREND_REGIME_HARD_CHECK_FAILED")
     if not confirm_ok:
         reasons.append("CONFIRMATION_HARD_CHECK_FAILED")
     if not level_ok:
@@ -2873,6 +3020,584 @@ def _continuation_pullback_context(
                 "CONTINUATION_PULLBACK_AWAITING_FUTURES"
                 if eligible and not participation_available
                 else "CONTINUATION_PULLBACK_BLOCKED"
+            )
+        ),
+    })
+    return context
+
+
+def _trend_health_context(
+    side,
+    trend_df,
+    confirm_df,
+    participation_score=0,
+    participation=None,
+):
+    enabled = bool(getattr(config, "TREND_HEALTH_ENABLED", True))
+    context = {
+        "enabled": enabled,
+        "healthy": True,
+        "hard_failure": False,
+        "warning_points": 0,
+        "warnings": [],
+        "score": 0,
+    }
+
+    if not enabled:
+        context["reason"] = "TREND_HEALTH_DISABLED"
+        return context
+
+    trend = latest_closed(trend_df)
+    confirm = latest_closed(confirm_df)
+    confirm_structure = detect_market_structure(confirm_df, "confirm")
+    min_efficiency = get_config_float(
+        "TREND_HEALTH_MIN_EFFICIENCY_RATIO",
+        0.18,
+    )
+    min_adx_slope = get_config_float("TREND_HEALTH_MIN_ADX_SLOPE", -1.5)
+    max_warning_points = get_config_float(
+        "TREND_HEALTH_MAX_WARNING_POINTS",
+        4.5,
+    )
+    hard_block_points = max(
+        get_config_float("TREND_HEALTH_HARD_BLOCK_POINTS", 6),
+        max_warning_points,
+    )
+    efficiency = _safe_float(trend.get("efficiency_ratio"))
+    adx = _safe_float(trend.get("adx"))
+    adx_slope = _safe_float(trend.get("adx_slope"))
+    di_spread = _safe_float(trend.get("di_spread"))
+    confirm_ema50 = _safe_float(confirm.get("ema50"))
+    confirm_vwap = _safe_float(confirm.get("session_vwap"))
+    confirm_close = _safe_float(confirm.get("close"))
+    confirm_macd_hist = _safe_float(confirm.get("macd_hist"))
+    participation_available = bool(
+        participation and participation.get("available")
+    )
+    warnings = []
+
+    def warn(name, active, points):
+        if active:
+            warnings.append({
+                "name": name,
+                "points": float(points),
+            })
+
+    if side == "BUY":
+        trend_direction_ok = (
+            _safe_float(trend.get("close")) > _safe_float(trend.get("ema50"))
+            and (
+                _safe_float(trend.get("ema20")) >=
+                _safe_float(trend.get("ema50"))
+                or
+                _safe_float(trend.get("ema50")) >=
+                _safe_float(trend.get("ema200"))
+            )
+        )
+        confirm_ema_lost = confirm_ema50 > 0 and confirm_close < confirm_ema50
+        opposite_structure = bool(confirm_structure.get("bearish_breakdown"))
+        vwap_conflict = (
+            confirm_vwap > 0
+            and confirm_close < confirm_vwap
+            and confirm_macd_hist < 0
+        )
+        di_conflict = di_spread < 0
+    else:
+        trend_direction_ok = (
+            _safe_float(trend.get("close")) < _safe_float(trend.get("ema50"))
+            and (
+                _safe_float(trend.get("ema20")) <=
+                _safe_float(trend.get("ema50"))
+                or
+                _safe_float(trend.get("ema50")) <=
+                _safe_float(trend.get("ema200"))
+            )
+        )
+        confirm_ema_lost = confirm_ema50 > 0 and confirm_close > confirm_ema50
+        opposite_structure = bool(confirm_structure.get("bullish_breakout"))
+        vwap_conflict = (
+            confirm_vwap > 0
+            and confirm_close > confirm_vwap
+            and confirm_macd_hist > 0
+        )
+        di_conflict = di_spread > 0
+
+    warn("LOW_DIRECTIONAL_EFFICIENCY", efficiency < min_efficiency, 1.0)
+    warn("ADX_FALLING", adx_slope < min_adx_slope, 1.0)
+    warn(
+        "WEAK_AND_FALLING_ADX",
+        adx < get_config_float("LONG_TERM_MIN_ADX", 16) and adx_slope < 0,
+        1.0,
+    )
+    warn("DIRECTIONAL_INDEX_CONFLICT", di_conflict, 1.0)
+    warn("CONFIRMATION_EMA50_LOST", confirm_ema_lost, 1.5)
+    warn("OPPOSITE_CONFIRMATION_STRUCTURE", opposite_structure, 2.5)
+    warn("VWAP_MACD_CONFLICT", vwap_conflict, 1.0)
+    warn(
+        "FUTURES_FLOW_CONFLICT",
+        participation_available and _safe_float(participation_score) < 0,
+        2.0,
+    )
+
+    warning_points = round(
+        sum(item["points"] for item in warnings),
+        2,
+    )
+    hard_failure = bool(
+        not trend_direction_ok
+        or warning_points >= hard_block_points
+        or (opposite_structure and confirm_ema_lost)
+    )
+    healthy = bool(
+        not hard_failure and warning_points < max_warning_points
+    )
+    bonus = get_config_float("TREND_HEALTH_SCORE_BONUS", 1.0)
+    penalty = get_config_float("TREND_HEALTH_SCORE_PENALTY", 0.35)
+
+    if healthy and efficiency >= min_efficiency and adx_slope >= min_adx_slope:
+        score = bonus
+    else:
+        score = -min(warning_points * penalty, 2.5)
+
+    context.update({
+        "healthy": healthy,
+        "hard_failure": hard_failure,
+        "warning_points": warning_points,
+        "warnings": warnings,
+        "score": round(float(score), 2),
+        "efficiency_ratio": round(float(efficiency), 3),
+        "minimum_efficiency_ratio": min_efficiency,
+        "adx": round(float(adx), 2),
+        "adx_slope": round(float(adx_slope), 2),
+        "di_spread": round(float(di_spread), 2),
+        "trend_direction_ok": trend_direction_ok,
+        "confirm_ema50_lost": confirm_ema_lost,
+        "opposite_structure": opposite_structure,
+        "vwap_conflict": vwap_conflict,
+        "participation_available": participation_available,
+        "reason": (
+            "TREND_HEALTH_OK"
+            if healthy
+            else "TREND_HEALTH_BLOCKED"
+        ),
+    })
+    return context
+
+
+def _intraday_setup_context(side, confirm_df):
+    closed = confirm_df.iloc[:-1] if len(confirm_df) > 1 else confirm_df
+    setup_lookback = max(get_config_int("INTRADAY_SETUP_LOOKBACK", 4), 1)
+    structure_lookback = max(
+        get_config_int("INTRADAY_SETUP_STRUCTURE_LOOKBACK", 8),
+        4,
+    )
+    min_points = get_config_float("INTRADAY_SETUP_MIN_POINTS", 5)
+    touch_atr = max(
+        get_config_float("INTRADAY_PULLBACK_TOUCH_ATR", 0.35),
+        0,
+    )
+    ema50_buffer_atr = max(
+        get_config_float("INTRADAY_PULLBACK_EMA50_BUFFER_ATR", 0.25),
+        0,
+    )
+    max_volume_mult = get_config_float(
+        "INTRADAY_PULLBACK_MAX_VOLUME_MULT",
+        1.35,
+    )
+    best = None
+
+    if len(closed) < structure_lookback + 2:
+        return {
+            "valid": False,
+            "reason": "INTRADAY_SETUP_DATA_UNAVAILABLE",
+            "points": 0,
+        }
+
+    for age in range(min(setup_lookback, len(closed))):
+        position = len(closed) - 1 - age
+
+        if position <= structure_lookback:
+            continue
+
+        candle = closed.iloc[position]
+        prior = closed.iloc[position - structure_lookback:position]
+        subsequent = closed.iloc[position:]
+        close = _safe_float(candle.get("close"))
+        high = _safe_float(candle.get("high"))
+        low = _safe_float(candle.get("low"))
+        atr = max(_safe_float(candle.get("atr")), 1e-10)
+        ema20 = _safe_float(candle.get("ema20"))
+        ema50 = _safe_float(candle.get("ema50"))
+        vwap = _safe_float(candle.get("session_vwap"))
+        macd_hist = _safe_float(candle.get("macd_hist"))
+        volume_mult = _safe_float(candle.get("volume_ratio"))
+
+        if volume_mult <= 0:
+            volume = _safe_float(candle.get("volume"))
+            volume_sma = _safe_float(candle.get("volume_sma"))
+            volume_mult = volume / volume_sma if volume_sma > 0 else 0
+
+        touch_buffer = touch_atr * atr
+        ema50_buffer = ema50_buffer_atr * atr
+        prior_high = _safe_float(prior["high"].max())
+        prior_low = _safe_float(prior["low"].min())
+        touched_ema20 = (
+            ema20 > 0
+            and low <= ema20 + touch_buffer
+            and high >= ema20 - touch_buffer
+        )
+        touched_vwap = (
+            vwap > 0
+            and low <= vwap + touch_buffer
+            and high >= vwap - touch_buffer
+        )
+
+        if side == "BUY":
+            ema_stack_ok = ema20 >= ema50 > 0
+            ema50_hold = close >= ema50 - ema50_buffer
+            vwap_aligned = vwap <= 0 or close >= vwap
+            breakout_retest = (
+                prior_high > 0
+                and close > prior_high
+                and low <= prior_high + touch_buffer
+            )
+            structure_invalidated = bool(
+                prior_low > 0
+                and any(
+                    _safe_float(row.get("close")) <
+                    _safe_float(row.get("ema50")) - ema50_buffer
+                    for _, row in subsequent.iterrows()
+                )
+            )
+            rsi_ok = 42 <= _safe_float(candle.get("rsi"), 50) <= 72
+            macd_support = macd_hist >= 0
+        else:
+            ema_stack_ok = ema20 <= ema50 and ema50 > 0
+            ema50_hold = close <= ema50 + ema50_buffer
+            vwap_aligned = vwap <= 0 or close <= vwap
+            breakout_retest = (
+                prior_low > 0
+                and close < prior_low
+                and high >= prior_low - touch_buffer
+            )
+            structure_invalidated = bool(
+                prior_high > 0
+                and any(
+                    _safe_float(row.get("close")) >
+                    _safe_float(row.get("ema50")) + ema50_buffer
+                    for _, row in subsequent.iterrows()
+                )
+            )
+            rsi_ok = 28 <= _safe_float(candle.get("rsi"), 50) <= 58
+            macd_support = macd_hist <= 0
+
+        location_ok = touched_ema20 or touched_vwap or breakout_retest
+        controlled_volume = (
+            volume_mult <= 0 or volume_mult <= max_volume_mult
+        )
+        points = 0
+        points = add_score(points, ema_stack_ok, 1)
+        points = add_score(points, ema50_hold, 1)
+        points = add_score(points, location_ok, 2)
+        points = add_score(points, vwap_aligned, 1)
+        points = add_score(points, macd_support, 1)
+        points = add_score(points, controlled_volume, 1)
+        points = add_score(points, rsi_ok, 1)
+        valid = bool(
+            location_ok
+            and ema_stack_ok
+            and ema50_hold
+            and controlled_volume
+            and rsi_ok
+            and not structure_invalidated
+            and points >= min_points
+        )
+        setup_type = (
+            "BREAKOUT_RETEST"
+            if breakout_retest
+            else "CONTROLLED_PULLBACK"
+        )
+        item = {
+            "valid": valid,
+            "type": setup_type,
+            "age_candles": age,
+            "points": round(float(points), 2),
+            "minimum_points": min_points,
+            "ema_stack_ok": ema_stack_ok,
+            "ema50_hold": ema50_hold,
+            "touched_ema20": touched_ema20,
+            "touched_vwap": touched_vwap,
+            "breakout_retest": breakout_retest,
+            "vwap_aligned": vwap_aligned,
+            "macd_support": macd_support,
+            "controlled_volume": controlled_volume,
+            "volume_mult": round(float(volume_mult), 2),
+            "rsi_ok": rsi_ok,
+            "structure_invalidated": structure_invalidated,
+            "reason": (
+                "INTRADAY_SETUP_VALID"
+                if valid
+                else "INTRADAY_SETUP_NOT_READY"
+            ),
+        }
+
+        if best is None or (
+            item["valid"],
+            item["points"],
+            -item["age_candles"],
+        ) > (
+            best["valid"],
+            best["points"],
+            -best["age_candles"],
+        ):
+            best = item
+
+    return best or {
+        "valid": False,
+        "reason": "INTRADAY_SETUP_NOT_FOUND",
+        "points": 0,
+    }
+
+
+def _intraday_trigger_context(side, entry_df):
+    closed = entry_df.iloc[:-1] if len(entry_df) > 1 else entry_df
+    lookback = max(
+        get_config_int("INTRADAY_TRIGGER_STRUCTURE_LOOKBACK", 8),
+        4,
+    )
+
+    if len(closed) < lookback + 2:
+        return {
+            "valid": False,
+            "reason": "INTRADAY_TRIGGER_DATA_UNAVAILABLE",
+            "points": 0,
+        }
+
+    candle = closed.iloc[-1]
+    previous = closed.iloc[-2]
+    prior = closed.iloc[-lookback - 1:-1]
+    close = _safe_float(candle.get("close"))
+    open_price = _safe_float(candle.get("open"))
+    high = _safe_float(candle.get("high"))
+    low = _safe_float(candle.get("low"))
+    atr = max(_safe_float(candle.get("atr")), 1e-10)
+    ema20 = _safe_float(candle.get("ema20"))
+    previous_ema20 = _safe_float(previous.get("ema20"))
+    vwap = _safe_float(candle.get("session_vwap"))
+    macd_hist = _safe_float(candle.get("macd_hist"))
+    previous_macd_hist = _safe_float(previous.get("macd_hist"))
+    volume_mult = _safe_float(candle.get("volume_ratio"))
+
+    if volume_mult <= 0:
+        volume = _safe_float(candle.get("volume"))
+        volume_sma = _safe_float(candle.get("volume_sma"))
+        volume_mult = volume / volume_sma if volume_sma > 0 else 0
+
+    candle_range = max(high - low, 1e-10)
+    directional_body = (
+        close - open_price
+        if side == "BUY"
+        else open_price - close
+    )
+    body_atr = directional_body / atr
+    close_position = (close - low) / candle_range
+    directional_close = close_position if side == "BUY" else 1 - close_position
+    prior_high = _safe_float(prior["high"].max())
+    prior_low = _safe_float(prior["low"].min())
+    min_body_atr = get_config_float("INTRADAY_TRIGGER_MIN_BODY_ATR", 0.20)
+    min_close_position = get_config_float(
+        "INTRADAY_TRIGGER_MIN_CLOSE_POSITION",
+        0.58,
+    )
+    min_points = get_config_float("INTRADAY_TRIGGER_MIN_POINTS", 4)
+    max_chase_atr = get_config_float("INTRADAY_MAX_CHASE_ATR", 1.0)
+    chase_atr = abs(close - ema20) / atr if ema20 > 0 else 0
+    directional = bool(
+        directional_body > 0
+        and body_atr >= min_body_atr
+        and directional_close >= min_close_position
+    )
+
+    if side == "BUY":
+        local_break = prior_high > 0 and close > prior_high
+        sweep_reclaim = prior_low > 0 and low < prior_low and close > prior_low
+        ema_reclaim = (
+            ema20 > 0
+            and close > ema20
+            and (
+                _safe_float(previous.get("close")) <= previous_ema20
+                or low <= ema20 + (atr * 0.15)
+            )
+        )
+        vwap_aligned = vwap <= 0 or close >= vwap
+        macd_improving = macd_hist > previous_macd_hist
+    else:
+        local_break = prior_low > 0 and close < prior_low
+        sweep_reclaim = prior_high > 0 and high > prior_high and close < prior_high
+        ema_reclaim = (
+            ema20 > 0
+            and close < ema20
+            and (
+                _safe_float(previous.get("close")) >= previous_ema20
+                or high >= ema20 - (atr * 0.15)
+            )
+        )
+        vwap_aligned = vwap <= 0 or close <= vwap
+        macd_improving = macd_hist < previous_macd_hist
+
+    trigger_event = local_break or sweep_reclaim or ema_reclaim
+    volume_support = volume_mult <= 0 or volume_mult >= 0.9
+    not_chasing = max_chase_atr <= 0 or chase_atr <= max_chase_atr
+    points = 0
+    points = add_score(points, directional, 2)
+    points = add_score(points, local_break or sweep_reclaim, 2)
+    points = add_score(points, ema_reclaim, 1)
+    points = add_score(points, vwap_aligned, 1)
+    points = add_score(points, macd_improving, 1)
+    points = add_score(points, volume_support, 1)
+    valid = bool(
+        directional
+        and trigger_event
+        and vwap_aligned
+        and not_chasing
+        and points >= min_points
+    )
+
+    return {
+        "valid": valid,
+        "points": round(float(points), 2),
+        "minimum_points": min_points,
+        "directional": directional,
+        "local_break": local_break,
+        "sweep_reclaim": sweep_reclaim,
+        "ema_reclaim": ema_reclaim,
+        "vwap_aligned": vwap_aligned,
+        "macd_improving": macd_improving,
+        "volume_support": volume_support,
+        "body_atr": round(float(body_atr), 2),
+        "directional_close": round(float(directional_close), 2),
+        "chase_atr": round(float(chase_atr), 2),
+        "not_chasing": not_chasing,
+        "reason": (
+            "INTRADAY_TRIGGER_VALID"
+            if valid
+            else "INTRADAY_TRIGGER_NOT_READY"
+        ),
+    }
+
+
+def _intraday_entry_context(
+    side,
+    confirm_df,
+    entry_df,
+    trend_ok,
+    level_ok,
+    trend_score,
+    confirm_score,
+    trend_confidence,
+    entry_quality,
+    trend_health,
+    participation_score,
+    participation,
+    futures_ok,
+):
+    enabled = bool(getattr(config, "INTRADAY_ENTRY_ENABLED", True))
+    context = {
+        "enabled": enabled,
+        "eligible": False,
+        "active": False,
+        "reasons": [],
+    }
+
+    if not enabled:
+        context["reason"] = "INTRADAY_ENTRY_DISABLED"
+        return context
+
+    setup = _intraday_setup_context(side, confirm_df)
+    trigger = _intraday_trigger_context(side, entry_df)
+    reasons = []
+
+    if not trend_ok:
+        reasons.append("TREND_REGIME_HARD_CHECK_FAILED")
+    if not level_ok:
+        reasons.append("ADVERSE_LEVEL_CHECK_FAILED")
+    if not bool((trend_health or {}).get("healthy", True)):
+        reasons.append("TREND_HEALTH_BLOCKED")
+    if not bool(entry_quality.get("late_entry_ok", True)):
+        reasons.append("LATE_ENTRY_HARD_BLOCK")
+
+    minimum_checks = (
+        (
+            "CONFIDENCE",
+            trend_confidence,
+            get_config_float("INTRADAY_MIN_CONFIDENCE", 74),
+        ),
+        (
+            "TREND",
+            trend_score,
+            get_config_float("INTRADAY_MIN_TREND_SCORE", 7.5),
+        ),
+        (
+            "CONFIRM",
+            confirm_score,
+            get_config_float("INTRADAY_MIN_CONFIRM_SCORE", 6.5),
+        ),
+    )
+
+    for label, value, minimum in minimum_checks:
+        if _safe_float(value) < _safe_float(minimum):
+            reasons.append(
+                f"{label}={round(_safe_float(value), 2)} < {minimum}"
+            )
+
+    if not setup.get("valid"):
+        reasons.append(setup.get("reason", "INTRADAY_SETUP_NOT_READY"))
+    if not trigger.get("valid"):
+        reasons.append(trigger.get("reason", "INTRADAY_TRIGGER_NOT_READY"))
+
+    eligible = not reasons
+    participation_available = bool(
+        participation and participation.get("available")
+    )
+    require_futures = bool(
+        getattr(config, "INTRADAY_REQUIRE_FUTURES", True)
+    )
+    min_futures = get_config_float("INTRADAY_MIN_FUTURES_SCORE", 0)
+    futures_score = _safe_float(participation_score)
+    futures_supports = futures_ok and futures_score >= min_futures
+    active = eligible
+
+    if require_futures:
+        if not participation_available:
+            active = False
+            reasons.append("FUTURES_CONTEXT_REQUIRED")
+        elif not futures_supports:
+            active = False
+            reasons.append(
+                f"FUTURES_SCORE={round(futures_score, 2)} < {min_futures}"
+            )
+    elif participation_available and not futures_supports:
+        active = False
+        reasons.append(
+            f"FUTURES_SCORE={round(futures_score, 2)} < {min_futures}"
+        )
+
+    context.update({
+        "eligible": eligible,
+        "active": active,
+        "reasons": reasons,
+        "setup": setup,
+        "trigger": trigger,
+        "participation_available": participation_available,
+        "futures_score": round(float(futures_score), 2),
+        "min_futures_score": min_futures,
+        "reason": (
+            "INTRADAY_ENTRY_ACTIVE"
+            if active
+            else (
+                "INTRADAY_ENTRY_AWAITING_FUTURES"
+                if eligible and not participation_available
+                else "INTRADAY_ENTRY_BLOCKED"
             )
         ),
     })
@@ -3657,24 +4382,36 @@ def _reversal_futures_confirmation_context(
     }
 
 
-def evaluate_reversal_profit_protection(
+def evaluate_route_profit_protection(
     side,
     avg_entry,
     current_price,
     peak_roi=0,
     leverage=None,
+    confirmation_type="REVERSAL",
 ):
+    route = (
+        "REVERSAL"
+        if str(confirmation_type or "").upper() == "REVERSAL"
+        else "TREND"
+    )
+    prefix = f"{route}_PROFIT_PROTECTION"
     enabled = bool(
-        getattr(config, "REVERSAL_PROFIT_PROTECTION_ENABLED", True)
+        getattr(
+            config,
+            f"{prefix}_ENABLED",
+            route == "REVERSAL",
+        )
     )
     info = {
+        "route": route,
         "enabled": enabled,
         "armed": False,
         "should_exit": False,
         "current_roi": 0.0,
         "peak_roi": max(_safe_float(peak_roi), 0),
         "floor_roi": 0.0,
-        "reason": "REVERSAL_PROFIT_PROTECTION_DISABLED",
+        "reason": f"{prefix}_DISABLED",
     }
 
     if not enabled:
@@ -3688,7 +4425,7 @@ def evaluate_reversal_profit_protection(
     )
 
     if side not in ("BUY", "SELL") or avg_entry <= 0 or current_price <= 0:
-        info["reason"] = "REVERSAL_PROFIT_PROTECTION_INVALID_PRICE"
+        info["reason"] = f"{prefix}_INVALID_PRICE"
         return info
 
     if side == "BUY":
@@ -3702,18 +4439,24 @@ def evaluate_reversal_profit_protection(
 
     peak_roi = max(_safe_float(peak_roi), current_roi, 0)
     trigger_roi = max(
-        get_config_float("REVERSAL_PROFIT_PROTECTION_TRIGGER_ROI", 12),
+        get_config_float(
+            f"{prefix}_TRIGGER_ROI",
+            12 if route == "REVERSAL" else 15,
+        ),
         0,
     )
     lock_roi = max(
-        get_config_float("REVERSAL_PROFIT_PROTECTION_LOCK_ROI", 3),
+        get_config_float(
+            f"{prefix}_LOCK_ROI",
+            3 if route == "REVERSAL" else 5,
+        ),
         0,
     )
     retrace_pct = min(
         max(
             get_config_float(
-                "REVERSAL_PROFIT_PROTECTION_RETRACE_PCT",
-                50,
+                f"{prefix}_RETRACE_PCT",
+                50 if route == "REVERSAL" else 45,
             ),
             0,
         ),
@@ -3737,16 +4480,50 @@ def evaluate_reversal_profit_protection(
         "lock_roi": lock_roi,
         "retrace_pct": retrace_pct,
         "reason": (
-            "REVERSAL_PROFIT_RETRACE_EXIT"
+            f"{route}_PROFIT_RETRACE_EXIT"
             if should_exit
             else (
-                "REVERSAL_PROFIT_PROTECTION_ARMED"
+                f"{prefix}_ARMED"
                 if armed
-                else "REVERSAL_PROFIT_TRIGGER_NOT_REACHED"
+                else f"{route}_PROFIT_TRIGGER_NOT_REACHED"
             )
         ),
     })
     return info
+
+
+def evaluate_reversal_profit_protection(
+    side,
+    avg_entry,
+    current_price,
+    peak_roi=0,
+    leverage=None,
+):
+    return evaluate_route_profit_protection(
+        side,
+        avg_entry,
+        current_price,
+        peak_roi=peak_roi,
+        leverage=leverage,
+        confirmation_type="REVERSAL",
+    )
+
+
+def evaluate_trend_profit_protection(
+    side,
+    avg_entry,
+    current_price,
+    peak_roi=0,
+    leverage=None,
+):
+    return evaluate_route_profit_protection(
+        side,
+        avg_entry,
+        current_price,
+        peak_roi=peak_roi,
+        leverage=leverage,
+        confirmation_type="TREND",
+    )
 
 
 def _refresh_side_decision(side_data):
@@ -3992,6 +4769,14 @@ def _side_signal_score(
         confirm_df,
         entry_df
     )
+    trend_health = _trend_health_context(
+        side,
+        trend_df,
+        confirm_df,
+        participation_score,
+        participation,
+    )
+    trend_health_score = _safe_float(trend_health.get("score"))
     quality_score = round(
         float(confirm_quality.get("score", 0)) +
         float(entry_quality.get("score", 0)),
@@ -4016,7 +4801,8 @@ def _side_signal_score(
         smc_score +
         momentum_score +
         participation_score +
-        regime_score
+        regime_score +
+        trend_health_score
     )
     score = max(0, total)
     trend_confidence = score_to_confidence(score)
@@ -4030,7 +4816,8 @@ def _side_signal_score(
         entry_ok and
         level_ok and
         module_gates_ok and
-        futures_ok
+        futures_ok and
+        trend_health.get("healthy", True)
     )
     trend_timing_rescue = _trend_timing_rescue_context(
         trend_ok,
@@ -4067,10 +4854,30 @@ def _side_signal_score(
         participation,
         futures_ok
     )
-    trend_following_ok = (
+    legacy_trend_following_ok = (
         normal_trend_following_ok or
         trend_timing_rescue.get("active", False) or
         continuation_pullback.get("active", False)
+    )
+    intraday_entry = _intraday_entry_context(
+        side,
+        confirm_df,
+        entry_df,
+        trend_ok,
+        level_ok,
+        trend_score,
+        confirm_score,
+        trend_confidence,
+        entry_quality,
+        trend_health,
+        participation_score,
+        participation,
+        futures_ok,
+    )
+    trend_following_ok = (
+        bool(intraday_entry.get("active"))
+        if getattr(config, "INTRADAY_ENTRY_ENABLED", True)
+        else legacy_trend_following_ok
     )
     reversal_ok, reversal_reasons, reversal_context = _reversal_signal_check(
         side,
@@ -4129,7 +4936,14 @@ def _side_signal_score(
         "score": score,
         "trend_confidence": trend_confidence,
         "reversal_confidence": reversal_confidence,
-        "base_score": trend_score + confirm_score + entry_score + btc_score + level_score,
+        "base_score": (
+            trend_score +
+            confirm_score +
+            entry_score +
+            btc_score +
+            level_score +
+            trend_health_score
+        ),
         "trend_score": trend_score,
         "confirm_score": confirm_score,
         "entry_score": entry_score,
@@ -4144,6 +4958,8 @@ def _side_signal_score(
         "entry_quality": entry_quality,
         "regime_score": regime_score,
         "regime_context": regime_context,
+        "trend_health_score": trend_health_score,
+        "trend_health": trend_health,
         "participation_score": participation_score,
         "participation_available": bool(
             participation and participation.get("available")
@@ -4151,9 +4967,11 @@ def _side_signal_score(
         "futures_context_ok": futures_ok,
         "futures_gate_reasons": futures_gate_reasons,
         "trend_following_ok": trend_following_ok,
+        "legacy_trend_following_ok": legacy_trend_following_ok,
         "normal_trend_following_ok": normal_trend_following_ok,
         "trend_timing_rescue": trend_timing_rescue,
         "continuation_pullback": continuation_pullback,
+        "intraday_entry": intraday_entry,
         "reversal_ok": reversal_ok,
         "reversal_confirmed": reversal_confirmed,
         "reversal_reasons": reversal_reasons,
@@ -4253,6 +5071,7 @@ def log_signal_analysis(analysis):
         f"quality={buy.get('quality_score', 0)} "
         f"regime={buy.get('regime_context', {}).get('regime', '')}:"
         f"{buy.get('regime_score', 0)} "
+        f"health={buy.get('trend_health_score', 0)} "
         f"smc={buy.get('smc_score', 0)} "
         f"momentum={buy.get('momentum_score', 0)} "
         f"futures={buy.get('participation_score', 0)} "
@@ -4265,6 +5084,7 @@ def log_signal_analysis(analysis):
         f"quality={sell.get('quality_score', 0)} "
         f"regime={sell.get('regime_context', {}).get('regime', '')}:"
         f"{sell.get('regime_score', 0)} "
+        f"health={sell.get('trend_health_score', 0)} "
         f"smc={sell.get('smc_score', 0)} "
         f"momentum={sell.get('momentum_score', 0)} "
         f"futures={sell.get('participation_score', 0)} "
@@ -4274,6 +5094,8 @@ def log_signal_analysis(analysis):
     for side_data in (buy, sell):
         rescue = side_data.get("trend_timing_rescue") or {}
         pullback = side_data.get("continuation_pullback") or {}
+        intraday = side_data.get("intraday_entry") or {}
+        trend_health = side_data.get("trend_health") or {}
         reversal_futures = (
             (side_data.get("reversal_context") or {}).get(
                 "futures_confirmation",
@@ -4313,6 +5135,34 @@ def log_signal_analysis(analysis):
                 f"{side_data.get('side')} CONTINUATION PULLBACK WAITING | "
                 f"EMA20_DISTANCE_ATR={pullback.get('ema20_distance_atr')} | "
                 f"REASON={pullback.get('reason')}"
+            )
+
+        if intraday.get("active"):
+            setup = intraday.get("setup") or {}
+            trigger = intraday.get("trigger") or {}
+            log_info(
+                f"{side_data.get('side')} INTRADAY ENTRY ACTIVE | "
+                f"SETUP={setup.get('type')}:{setup.get('points')} | "
+                f"TRIGGER={trigger.get('points')} | "
+                f"FUTURES={intraday.get('futures_score')}"
+            )
+        elif (
+            intraday.get("reason") ==
+            "INTRADAY_ENTRY_AWAITING_FUTURES"
+        ):
+            log_info(
+                f"{side_data.get('side')} INTRADAY ENTRY WAITING | "
+                f"SETUP={(intraday.get('setup') or {}).get('type')} | "
+                f"TRIGGER={(intraday.get('trigger') or {}).get('points')} | "
+                f"REASON={intraday.get('reason')}"
+            )
+
+        if trend_health.get("enabled") and not trend_health.get("healthy"):
+            log_warning(
+                f"{side_data.get('side')} TREND HEALTH BLOCKED | "
+                f"POINTS={trend_health.get('warning_points')} | "
+                f"WARNINGS="
+                f"{','.join(item.get('name', '') for item in trend_health.get('warnings', []))}"
             )
 
         if (
@@ -4447,7 +5297,9 @@ def log_signal_analysis(analysis):
     if analysis["signal"]:
         signal_details = analysis[analysis["signal"].lower()]
         log_info(
-            f"FINAL LONG-TERM {analysis['signal']} "
+            f"FINAL {config.TREND_TIMEFRAME}/"
+            f"{config.CONFIRMATION_TIMEFRAME}/"
+            f"{config.ENTRY_TIMEFRAME} {analysis['signal']} "
             f"TYPE={signal_details.get('confirmation_type', 'NONE')} "
             f"CONFIDENCE: "
             f"{signal_details.get('confidence', 0)}"
@@ -4651,6 +5503,15 @@ def should_fetch_futures_context(analysis):
     sell = analysis.get("sell", {})
 
     if any(
+        (side_data.get("intraday_entry") or {}).get("eligible")
+        and not (side_data.get("intraday_entry") or {}).get(
+            "participation_available"
+        )
+        for side_data in (buy, sell)
+    ):
+        return True
+
+    if any(
         (side_data.get("continuation_pullback") or {}).get("eligible")
         and not (side_data.get("continuation_pullback") or {}).get(
             "participation_available"
@@ -4760,6 +5621,12 @@ def futures_context_priority(analysis):
         if (side_data.get("continuation_pullback") or {}).get("eligible"):
             priority += get_config_float(
                 "FUTURES_CONTEXT_PRIORITY_PULLBACK_BONUS",
+                8,
+            )
+
+        if (side_data.get("intraday_entry") or {}).get("eligible"):
+            priority += get_config_float(
+                "FUTURES_CONTEXT_PRIORITY_INTRADAY_BONUS",
                 8,
             )
 
