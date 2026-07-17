@@ -1266,6 +1266,12 @@ def manage_dca_position(
         return
 
     trigger_entry = get_dca_trigger_entry(position_state, avg_entry)
+    spacing_anchor_price = float(
+        position_state.get("last_dca_price") or
+        position_state.get("initial_entry") or
+        trigger_entry or
+        avg_entry
+    )
     position_adverse_roi = get_position_adverse_roi(
         side,
         avg_entry,
@@ -1279,6 +1285,16 @@ def manage_dca_position(
             f"LEVEL={dca_count + 1} | "
             f"LADDER_ROI={adverse_roi}% < TRIGGER={trigger_roi}% | "
             f"POSITION_ROI={position_adverse_roi}%"
+        )
+        return
+
+    if (
+        config.DCA_MAX_ADVERSE_ROI > 0 and
+        adverse_roi > config.DCA_MAX_ADVERSE_ROI
+    ):
+        log_warning(
+            f"{symbol} DCA skipped | maximum risk boundary exceeded | "
+            f"ROI={adverse_roi}% > MAX={config.DCA_MAX_ADVERSE_ROI}%"
         )
         return
 
@@ -1322,7 +1338,11 @@ def manage_dca_position(
     confirm_df = None
     entry_df = None
 
-    if getattr(config, "DCA_STRICT_GUARD_ENABLED", True):
+    if (
+        getattr(config, "DCA_STRICT_GUARD_ENABLED", True) or
+        getattr(config, "DCA_TRIGGER_MODE", "static_roi") ==
+        "adaptive_hybrid"
+    ):
         trend_df, confirm_df, entry_df = get_signal_frames(symbol, btc_trend_df)
         guard_ok, guard_info = validate_dca_continuation_guard(
             side,
@@ -1335,7 +1355,9 @@ def manage_dca_position(
             confirmation_type=position_state.get("confirmation_type"),
             dca_level=dca_count + 1,
             adverse_roi=adverse_roi,
-            position_adverse_roi=position_adverse_roi
+            position_adverse_roi=position_adverse_roi,
+            trigger_roi=trigger_roi,
+            spacing_anchor_price=spacing_anchor_price,
         )
 
         if not guard_ok:
@@ -1352,8 +1374,11 @@ def manage_dca_position(
             f"PRESSURE={guard_info.get('pressure_score')} | "
             f"RECOVERY={guard_info.get('recovery_score')} | "
             f"TYPE={guard_info.get('trade_type')} | "
-            f"STRUCTURE={guard_info.get('structure', {}).get('reason')}"
+            f"STRUCTURE={guard_info.get('structure', {}).get('reason')} | "
+            f"ADAPTIVE={guard_info.get('adaptive', {}).get('reason')} | "
+            f"GAP_ATR={guard_info.get('adaptive', {}).get('gap_atr')}"
         )
+        level_info["dca_guard"] = guard_info
 
     balance = get_balance()
     quantity = calculate_position_size(
@@ -1785,6 +1810,13 @@ def dca_tick_ready(symbol, mark_price, state=None):
         return False
 
     adverse_roi = get_position_adverse_roi(side, trigger_entry, mark_price)
+
+    if (
+        config.DCA_MAX_ADVERSE_ROI > 0 and
+        adverse_roi > config.DCA_MAX_ADVERSE_ROI
+    ):
+        return False
+
     return adverse_roi >= trigger_roi
 
 
