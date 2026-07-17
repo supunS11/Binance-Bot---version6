@@ -7,6 +7,39 @@ from pathlib import Path
 
 import config
 from logger import log_error, log_info, log_warning
+from multi_tp import build_multi_tp_state, MULTI_TP_DISABLED
+
+
+_MULTI_TP_FIELDS = {
+    "multi_tp_active",
+    "multi_tp_stage",
+    "tp1_price",
+    "tp1_close_pct",
+    "tp1_quantity",
+    "tp1_base_quantity",
+    "tp1_order_id",
+    "initial_sl_order_id",
+    "tp1_filled_at",
+    "tp1_fill_price",
+    "runner_basis_price",
+    "runner_quantity",
+    "runner_tp_price",
+    "runner_tp_mode",
+    "runner_tp_context",
+    "runner_tp_order_id",
+    "runner_sl_price",
+    "runner_sl_mode",
+    "runner_sl_order_id",
+    "runner_protection_error",
+}
+
+
+def apply_multi_tp_protection_state(item, tp_info):
+    for field in _MULTI_TP_FIELDS:
+        item.pop(field, None)
+
+    item.update(build_multi_tp_state(tp_info))
+    return item
 
 
 def _state_path():
@@ -172,6 +205,8 @@ def update_position_tp_status(state, symbol, tp_info, context=""):
                 item["sl_price"] = tp_info.get("sl_price")
                 item["sl_source"] = context
 
+            apply_multi_tp_protection_state(item, tp_info)
+
             latest_state.setdefault("positions", {})[symbol] = item
             _save_trade_state_unlocked(latest_state)
             state["positions"] = latest_state.get("positions", {})
@@ -265,6 +300,8 @@ def create_position_state(
         "trend_peak_roi": 0,
         "trend_profit_basis_entry": entry_price,
         "trend_profit_exit_status": "",
+        "multi_tp_active": False,
+        "multi_tp_stage": MULTI_TP_DISABLED,
     }
 
 

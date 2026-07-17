@@ -12,6 +12,7 @@ import requests
 
 import config
 from indicators import apply_indicators
+from multi_tp import calculate_runner_stop
 from strategy import (
     analyze_signal,
     evaluate_route_early_invalidation,
@@ -661,7 +662,7 @@ def position_average_entry(fills):
     return sum(item["qty"] * item["price"] for item in fills) / qty
 
 
-def calculate_trade_pnl(side, fills, exit_price):
+def calculate_trade_pnl(side, fills, exit_price, partial_exits=None):
     fee_rate = float(getattr(config, "BACKTEST_FEE_RATE", 0.0004))
     gross = 0.0
     entry_fees = 0.0
@@ -678,11 +679,44 @@ def calculate_trade_pnl(side, fills, exit_price):
         entry_fees += qty * fill["price"] * fee_rate
         exit_fees += qty * exit_price * fee_rate
 
+    for partial in partial_exits or []:
+        qty = float(partial["qty"])
+        entry = float(partial["entry_price"])
+        partial_exit = float(partial["exit_price"])
+
+        if side == "BUY":
+            gross += qty * (partial_exit - entry)
+        else:
+            gross += qty * (entry - partial_exit)
+
+        entry_fees += qty * entry * fee_rate
+        exit_fees += qty * partial_exit * fee_rate
+
     fees = entry_fees + exit_fees
     margin = sum(item["margin"] for item in fills)
     net = gross - fees
     roi = (net / margin * 100) if margin > 0 else 0.0
     return gross, fees, net, roi
+
+
+def realize_partial_exit(fills, close_pct, exit_price):
+    fraction = min(max(float(close_pct) / 100, 0), 1)
+    partial_exits = []
+
+    if fraction <= 0 or fraction >= 1:
+        return partial_exits
+
+    for fill in fills:
+        quantity = float(fill["qty"])
+        close_quantity = quantity * fraction
+        fill["qty"] = quantity - close_quantity
+        partial_exits.append({
+            "qty": close_quantity,
+            "entry_price": float(fill["price"]),
+            "exit_price": float(exit_price),
+        })
+
+    return partial_exits
 
 
 def compute_take_profit(
@@ -744,6 +778,48 @@ def compute_take_profit(
         roi = min(roi, reversal_max_roi)
 
     return roi_to_price(side, avg_entry, roi), f"FALLBACK_ROI_{roi}%"
+
+
+def compute_runner_take_profit(
+    side,
+    basis_price,
+    trend_df,
+    confirm_df,
+    confirmation_type=None,
+):
+    ok, target = validate_structure_take_profit(
+        side,
+        basis_price,
+        trend_df,
+        confirm_df,
+        leverage=config.LEVERAGE,
+    )
+    reversal = str(confirmation_type or "").upper() == "REVERSAL"
+    reversal_max_roi = max(
+        float(getattr(config, "REVERSAL_TP_MAX_ROI", 45)),
+        0,
+    )
+
+    if ok and target.get("target_price"):
+        target_roi = float(target.get("target_roi") or 0)
+
+        if reversal and reversal_max_roi > 0 and target_roi > reversal_max_roi:
+            return (
+                roi_to_price(side, basis_price, reversal_max_roi),
+                f"TP2_REVERSAL_STRUCTURE_CAPPED_{reversal_max_roi}%",
+            )
+
+        return float(target["target_price"]), f"TP2_STRUCTURE_{target['source']}"
+
+    fallback_roi = max(float(getattr(config, "TP2_FALLBACK_ROI", 35)), 0)
+
+    if reversal and reversal_max_roi > 0:
+        fallback_roi = min(fallback_roi, reversal_max_roi)
+
+    return (
+        roi_to_price(side, basis_price, fallback_roi),
+        f"TP2_FALLBACK_ROI_{fallback_roi}%",
+    )
 
 
 def candle_hits_tp(side, candle, tp_price):
@@ -813,6 +889,20 @@ def simulate_trade(
         decision_confirm,
         confirmation_type=confirmation_type,
     )
+    tp1_close_pct = float(getattr(config, "TP1_CLOSE_POSITION_PCT", 50))
+    multi_tp_enabled = bool(
+        getattr(config, "BACKTEST_MULTI_TP_ENABLED", False) and
+        getattr(config, "MULTI_TP_ENABLED", False) and
+        0 < tp1_close_pct < 100
+    )
+    tp1_price = float(tp_price)
+    tp1_mode = tp_mode
+    tp1_hit = False
+    tp1_exit_price = None
+    tp1_time = None
+    tp2_price = None
+    tp2_mode = ""
+    partial_exits = []
     sl_price, sl_mode = compute_stop_loss(
         side,
         avg_entry,
@@ -928,7 +1018,7 @@ def simulate_trade(
                     )
                     break
 
-        while True:
+        while not tp1_hit:
             trigger_roi = dca_trigger_roi(dca_count)
             next_margin = dca_margin(dca_count)
 
@@ -1019,6 +1109,8 @@ def simulate_trade(
                         confirmation_type=confirmation_type,
                         dca_context=True,
                     )
+                    tp1_price = float(tp_price)
+                    tp1_mode = tp_mode
                     sl_price, sl_mode = compute_stop_loss(
                         side,
                         avg_entry,
@@ -1081,7 +1173,7 @@ def simulate_trade(
         if candle_hits_sl(side, candle, sl_price):
             exit_price = apply_exit_slippage(side, sl_price)
             exit_candle = candle
-            exit_reason = "SL"
+            exit_reason = "RUNNER_SL" if tp1_hit else "SL"
             break
 
         if (
@@ -1105,9 +1197,56 @@ def simulate_trade(
                 break
 
         if candle_hits_tp(side, candle, tp_price):
+            if multi_tp_enabled and not tp1_hit:
+                tp1_exit_price = apply_exit_slippage(side, tp_price)
+                partial_exits.extend(
+                    realize_partial_exit(
+                        fills,
+                        tp1_close_pct,
+                        tp1_exit_price,
+                    )
+                )
+                tp1_hit = True
+                tp1_time = int(candle["close_time"])
+                trend_slice = closed_slice(
+                    frames["trend"].indicators,
+                    candle_time,
+                    trend_interval,
+                )
+                confirm_slice = closed_slice(
+                    frames["confirm"].indicators,
+                    candle_time,
+                    confirm_interval,
+                )
+                tp2_price, tp2_mode = compute_runner_take_profit(
+                    side,
+                    float(tp_price),
+                    trend_slice,
+                    confirm_slice,
+                    confirmation_type=confirmation_type,
+                )
+                runner_sl, runner_sl_info = calculate_runner_stop(
+                    side,
+                    avg_entry,
+                    float(tp_price),
+                    confirm_slice,
+                    leverage=config.LEVERAGE,
+                )
+
+                if (
+                    getattr(config, "TP1_RUNNER_STOP_ENABLED", True) and
+                    runner_sl is not None
+                ):
+                    sl_price = runner_sl
+                    sl_mode = f"RUNNER_{runner_sl_info.get('source', 'PROFIT_LOCK')}"
+
+                tp_price = float(tp2_price)
+                tp_mode = tp2_mode
+                continue
+
             exit_price = apply_exit_slippage(side, tp_price)
             exit_candle = candle
-            exit_reason = "TP"
+            exit_reason = "TP2" if tp1_hit else "TP"
             break
 
     if exit_price is None:
@@ -1118,9 +1257,22 @@ def simulate_trade(
                 exit_candle = exit_df.iloc[min(start_index, len(exit_df) - 1)]
 
         exit_price = apply_exit_slippage(side, float(exit_candle["close"]))
-        exit_reason = "TIMEOUT" if end_index < len(exit_df) else "DATA_END"
+        exit_reason = (
+            "RUNNER_TIMEOUT"
+            if tp1_hit and end_index < len(exit_df)
+            else "RUNNER_DATA_END"
+            if tp1_hit
+            else "TIMEOUT"
+            if end_index < len(exit_df)
+            else "DATA_END"
+        )
 
-    gross, fees, net, roi = calculate_trade_pnl(side, fills, exit_price)
+    gross, fees, net, roi = calculate_trade_pnl(
+        side,
+        fills,
+        exit_price,
+        partial_exits=partial_exits,
+    )
     exit_time = int(
         exit_time_override
         if exit_time_override is not None
@@ -1142,6 +1294,22 @@ def simulate_trade(
         "exit_price": round(float(exit_price), 8),
         "tp_price": round(float(tp_price), 8),
         "tp_mode": tp_mode,
+        "tp1_hit": tp1_hit,
+        "tp1_price": round(float(tp1_price), 8),
+        "tp1_mode": tp1_mode,
+        "tp1_exit_price": (
+            round(float(tp1_exit_price), 8)
+            if tp1_exit_price is not None
+            else ""
+        ),
+        "tp1_time": ms_to_iso(tp1_time) if tp1_time is not None else "",
+        "tp1_close_pct": (
+            tp1_close_pct
+            if tp1_hit
+            else 0
+        ),
+        "tp2_price": round(float(tp2_price), 8) if tp2_price is not None else "",
+        "tp2_mode": tp2_mode,
         "sl_price": round(float(sl_price), 8) if sl_price is not None else "",
         "sl_mode": sl_mode,
         "exit_reason": exit_reason,
@@ -1486,6 +1654,12 @@ def summarise_trades(trades, skipped_by_limits):
         ),
     ]
 
+    if getattr(config, "BACKTEST_MULTI_TP_ENABLED", False):
+        notes.append(
+            "Multi-stage TP realizes TP1 pro rata, disables later DCA, then "
+            "models TP2 and the runner profit-lock stop from the next candle."
+        )
+
     if (
         getattr(config, "INTRADAY_TRANSITION_ENABLED", True)
         and getattr(config, "BACKTEST_ASSUME_NEUTRAL_FUTURES_CONTEXT", True)
@@ -1729,6 +1903,7 @@ def run_backtest(args):
         f"EXIT_TF={getattr(config, 'BACKTEST_EXIT_TIMEFRAME', config.ENTRY_TIMEFRAME)} | "
         f"SLICE_ROWS={getattr(config, 'BACKTEST_SLICE_MAX_ROWS', 0)} | "
         f"BTC_CONTEXT={getattr(config, 'BACKTEST_USE_BTC_CONTEXT', True)} | "
+        f"MULTI_TP={getattr(config, 'BACKTEST_MULTI_TP_ENABLED', False)} | "
         f"CONFIRMATION_TYPES={','.join(allowed_confirmation_types) if allowed_confirmation_types else 'ALL'}",
         flush=True,
     )
@@ -1810,6 +1985,19 @@ def run_backtest(args):
                 )
             ),
             "use_dca": bool(getattr(config, "BACKTEST_USE_DCA", False)),
+            "multi_tp_enabled": bool(
+                getattr(config, "BACKTEST_MULTI_TP_ENABLED", False) and
+                getattr(config, "MULTI_TP_ENABLED", False)
+            ),
+            "tp1_close_position_pct": float(
+                getattr(config, "TP1_CLOSE_POSITION_PCT", 50)
+            ),
+            "tp2_fallback_roi": float(
+                getattr(config, "TP2_FALLBACK_ROI", 35)
+            ),
+            "runner_min_lock_roi": float(
+                getattr(config, "TP1_RUNNER_MIN_LOCK_ROI", 5)
+            ),
             "trend_sl_enabled": bool(
                 getattr(config, "TREND_SL_ENABLED", getattr(config, "SL_ENABLED", False))
             ),
