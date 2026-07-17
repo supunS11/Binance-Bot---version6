@@ -2822,13 +2822,30 @@ def calculate_signal_rank(candidate):
     rank += _safe_float(side_data.get("smc_score")) * config.SIGNAL_RANKING_SMC_WEIGHT
     rank += _safe_float(side_data.get("regime_score")) * config.SIGNAL_RANKING_REGIME_WEIGHT
 
-    if (side_data.get("intraday_entry") or {}).get("active"):
+    intraday_entry = side_data.get("intraday_entry") or {}
+
+    if intraday_entry.get("active"):
         rank += max(
             _safe_float(
                 getattr(config, "INTRADAY_ENTRY_RANK_BONUS", 1.5)
             ),
             0,
         )
+
+        if intraday_entry.get("route") == "ESTABLISHED":
+            rank += max(
+                _safe_float(
+                    getattr(config, "INTRADAY_ESTABLISHED_RANK_BONUS", 1.0)
+                ),
+                0,
+            )
+        elif intraday_entry.get("route") == "TRANSITION":
+            rank -= max(
+                _safe_float(
+                    getattr(config, "INTRADAY_TRANSITION_RANK_PENALTY", 1.0)
+                ),
+                0,
+            )
 
     if (side_data.get("trend_timing_rescue") or {}).get("active"):
         rank -= max(
@@ -3165,6 +3182,7 @@ def execute_entry_candidate(
             trigger = intraday_entry.get("trigger") or {}
             log_info(
                 f"{symbol} INTRADAY ENTRY EXECUTION | "
+                f"ROUTE={intraday_entry.get('route')} | "
                 f"SETUP={setup.get('type')}:{setup.get('points')} | "
                 f"TRIGGER={trigger.get('points')} | "
                 f"REQUIRE_BOTH_LIVE={require_both_live}"
@@ -3454,6 +3472,20 @@ def execute_entry_candidate(
         )
         position_state["signal_type"] = signal_type or "UNKNOWN"
         position_state["confirmation_type"] = signal_type or "UNKNOWN"
+        intraday_context = side_analysis.get("intraday_entry") or {}
+        setup_context = intraday_context.get("setup") or {}
+        trigger_context = intraday_context.get("trigger") or {}
+        position_state["entry_route"] = (
+            f"INTRADAY_{intraday_context.get('route')}"
+            if signal_type == "TREND" and intraday_context.get("route")
+            else signal_type or "UNKNOWN"
+        )
+        position_state["entry_setup_type"] = setup_context.get("type") or ""
+        position_state["entry_setup_points"] = setup_context.get("points")
+        position_state["entry_trigger_points"] = trigger_context.get("points")
+        position_state["entry_futures_score"] = intraday_context.get(
+            "futures_score"
+        )
         position_state["tp_status"] = "CREATED" if protection_ok else "FAILED"
         position_state["tp_price"] = protection_result.get("tp_price")
         position_state["tp_mode"] = protection_result.get("tp_mode")

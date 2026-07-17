@@ -8,6 +8,7 @@ from strategy import (
     _intraday_entry_context,
     _intraday_setup_context,
     _intraday_trigger_context,
+    _signal_threshold,
     _trend_health_context,
     futures_context_priority,
     should_fetch_futures_context,
@@ -131,24 +132,36 @@ class IntradayEntryTests(unittest.TestCase):
     def setUp(self):
         settings = {
             "TREND_HEALTH_ENABLED": True,
-            "TREND_HEALTH_MIN_EFFICIENCY_RATIO": 0.15,
-            "TREND_HEALTH_MIN_ADX_SLOPE": -2,
-            "TREND_HEALTH_MAX_WARNING_POINTS": 5.5,
-            "TREND_HEALTH_HARD_BLOCK_POINTS": 7,
+            "TREND_HEALTH_MIN_EFFICIENCY_RATIO": 0.18,
+            "TREND_HEALTH_MIN_ADX_SLOPE": -1,
+            "TREND_HEALTH_MAX_WARNING_POINTS": 4.5,
+            "TREND_HEALTH_HARD_BLOCK_POINTS": 6.5,
             "INTRADAY_ENTRY_ENABLED": True,
             "INTRADAY_MIN_CONFIDENCE": 74,
             "INTRADAY_MIN_TREND_SCORE": 7,
             "INTRADAY_MIN_CONFIRM_SCORE": 6,
-            "INTRADAY_SETUP_LOOKBACK": 4,
+            "INTRADAY_SETUP_LOOKBACK": 6,
             "INTRADAY_SETUP_STRUCTURE_LOOKBACK": 8,
             "INTRADAY_SETUP_MIN_POINTS": 5,
             "INTRADAY_TRIGGER_STRUCTURE_LOOKBACK": 8,
             "INTRADAY_TRIGGER_MIN_BODY_ATR": 0.2,
             "INTRADAY_TRIGGER_MIN_CLOSE_POSITION": 0.58,
             "INTRADAY_TRIGGER_MIN_POINTS": 4,
+            "INTRADAY_TRIGGER_MIN_VOLUME_MULT": 1,
+            "INTRADAY_TRIGGER_REQUIRE_MOMENTUM_OR_FLOW": True,
+            "INTRADAY_TRIGGER_FLOW_SUPPORT_SCORE": 0.5,
             "INTRADAY_MAX_CHASE_ATR": 1,
             "INTRADAY_REQUIRE_FUTURES": True,
             "INTRADAY_MIN_FUTURES_SCORE": 0,
+            "INTRADAY_ESTABLISHED_MIN_CONFIDENCE": 72,
+            "INTRADAY_ESTABLISHED_MIN_TREND_SCORE": 7,
+            "INTRADAY_ESTABLISHED_MIN_CONFIRM_SCORE": 6,
+            "INTRADAY_TRANSITION_ENABLED": True,
+            "INTRADAY_TRANSITION_MIN_CONFIDENCE": 76,
+            "INTRADAY_TRANSITION_MIN_TREND_SCORE": 7.5,
+            "INTRADAY_TRANSITION_MIN_CONFIRM_SCORE": 6.5,
+            "INTRADAY_TRANSITION_MIN_FUTURES_SCORE": 0.5,
+            "INTRADAY_TRANSITION_REQUIRE_BREAKOUT_RETEST": True,
         }
         self.config_patches = [
             patch.object(config, name, value)
@@ -194,6 +207,35 @@ class IntradayEntryTests(unittest.TestCase):
         self.assertTrue(result["trigger"]["valid"])
         self.assertTrue(result["eligible"])
         self.assertTrue(result["active"])
+        self.assertEqual(result["route"], "ESTABLISHED")
+
+    def test_established_route_uses_its_route_specific_threshold(self):
+        health = _trend_health_context("BUY", trend_frame(), setup_frame())
+        result = _intraday_entry_context(
+            "BUY",
+            setup_frame(),
+            trigger_frame(),
+            trend_ok=True,
+            level_ok=True,
+            trend_score=8,
+            confirm_score=7,
+            trend_confidence=73,
+            entry_quality={"late_entry_ok": True},
+            trend_health=health,
+            participation_score=0,
+            participation={"available": True},
+            futures_ok=True,
+        )
+
+        self.assertTrue(result["active"])
+        self.assertEqual(result["required_confidence"], 72)
+        self.assertEqual(
+            _signal_threshold({
+                "confirmation_type": "TREND",
+                "intraday_entry": result,
+            }),
+            72,
+        )
 
     def test_eligible_entry_waits_for_futures_context(self):
         health = _trend_health_context("BUY", trend_frame(), setup_frame())
@@ -222,6 +264,146 @@ class IntradayEntryTests(unittest.TestCase):
 
         self.assertFalse(result["valid"])
         self.assertFalse(result["not_chasing"])
+
+    def test_trigger_needs_chart_momentum_or_supportive_futures_flow(self):
+        entry = trigger_frame()
+        current_index = len(entry) - 2
+        previous_index = len(entry) - 3
+        entry.loc[previous_index, "macd_hist"] = 0.02
+        entry.loc[current_index, "macd_hist"] = 0.01
+        entry.loc[current_index, "volume"] = 80
+        entry.loc[current_index, "volume_ratio"] = 0.8
+        health = _trend_health_context("BUY", trend_frame(), setup_frame())
+
+        blocked = _intraday_entry_context(
+            "BUY",
+            setup_frame(),
+            entry,
+            trend_ok=True,
+            level_ok=True,
+            trend_score=9,
+            confirm_score=8,
+            trend_confidence=82,
+            entry_quality={"late_entry_ok": True},
+            trend_health=health,
+            participation_score=0,
+            participation={"available": True},
+            futures_ok=True,
+        )
+        supported = _intraday_entry_context(
+            "BUY",
+            setup_frame(),
+            entry,
+            trend_ok=True,
+            level_ok=True,
+            trend_score=9,
+            confirm_score=8,
+            trend_confidence=82,
+            entry_quality={"late_entry_ok": True},
+            trend_health=health,
+            participation_score=0.75,
+            participation={"available": True},
+            futures_ok=True,
+        )
+
+        self.assertFalse(blocked["eligible"])
+        self.assertIn(
+            "INTRADAY_TRIGGER_MOMENTUM_OR_FLOW_REQUIRED",
+            blocked["reasons"],
+        )
+        self.assertTrue(supported["active"])
+        self.assertTrue(supported["flow_support"])
+
+    def test_transition_route_requires_breakout_retest_and_structure(self):
+        setup = {
+            "valid": True,
+            "reason": "INTRADAY_SETUP_VALID",
+            "breakout_retest": True,
+            "type": "BREAKOUT_RETEST",
+            "points": 6,
+        }
+        trigger = {
+            "valid": True,
+            "reason": "INTRADAY_TRIGGER_VALID",
+            "structural_event": True,
+            "chart_momentum_support": True,
+            "points": 6,
+        }
+        health = {"healthy": True, "market_state": "TRANSITION"}
+
+        with patch(
+            "strategy._intraday_setup_context",
+            return_value=setup,
+        ), patch(
+            "strategy._intraday_trigger_context",
+            return_value=trigger,
+        ):
+            accepted = _intraday_entry_context(
+                "BUY",
+                setup_frame(),
+                trigger_frame(),
+                trend_ok=True,
+                level_ok=True,
+                trend_score=8,
+                confirm_score=7,
+                trend_confidence=78,
+                entry_quality={"late_entry_ok": True},
+                trend_health=health,
+                participation_score=0.75,
+                participation={"available": True},
+                futures_ok=True,
+            )
+
+        with patch(
+            "strategy._intraday_setup_context",
+            return_value={**setup, "breakout_retest": False},
+        ), patch(
+            "strategy._intraday_trigger_context",
+            return_value=trigger,
+        ):
+            blocked = _intraday_entry_context(
+                "BUY",
+                setup_frame(),
+                trigger_frame(),
+                trend_ok=True,
+                level_ok=True,
+                trend_score=8,
+                confirm_score=7,
+                trend_confidence=78,
+                entry_quality={"late_entry_ok": True},
+                trend_health=health,
+                participation_score=0.75,
+                participation={"available": True},
+                futures_ok=True,
+            )
+
+        self.assertTrue(accepted["active"])
+        self.assertEqual(accepted["route"], "TRANSITION")
+        self.assertFalse(blocked["eligible"])
+        self.assertIn(
+            "TRANSITION_BREAKOUT_RETEST_REQUIRED",
+            blocked["reasons"],
+        )
+
+    def test_trend_health_separates_established_and_transition_states(self):
+        established = _trend_health_context(
+            "BUY",
+            trend_frame(),
+            setup_frame(),
+        )
+        partial_stack = trend_frame()
+        closed_index = len(partial_stack) - 2
+        partial_stack.loc[closed_index, "ema200"] = (
+            partial_stack.loc[closed_index, "ema50"] + 0.5
+        )
+        transition = _trend_health_context(
+            "BUY",
+            partial_stack,
+            setup_frame(),
+        )
+
+        self.assertEqual(established["market_state"], "ESTABLISHED")
+        self.assertEqual(transition["market_state"], "TRANSITION")
 
     def test_confirmed_structure_and_ema_failure_blocks_trend_health(self):
         trend = trend_frame()

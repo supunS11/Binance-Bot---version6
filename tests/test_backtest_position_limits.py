@@ -6,6 +6,7 @@ from backtest import (
     apply_position_limits,
     record_reversal_diagnostics,
     reversal_diagnostics_summary,
+    summarise_by_entry_route,
 )
 
 
@@ -92,6 +93,27 @@ class BacktestPositionLimitTests(unittest.TestCase):
                 {"reason": "ENTRY", "count": 1},
             ],
         )
+
+    def test_entry_route_summary_separates_established_and_transition(self):
+        trades = [
+            {
+                "entry_route": "INTRADAY_ESTABLISHED",
+                "result": "WIN",
+                "net_pnl": 2.5,
+            },
+            {
+                "entry_route": "INTRADAY_TRANSITION",
+                "result": "LOSS",
+                "net_pnl": -1.0,
+            },
+        ]
+
+        summary = summarise_by_entry_route(trades)
+
+        self.assertEqual(summary[0]["entry_route"], "INTRADAY_ESTABLISHED")
+        self.assertEqual(summary[0]["win_rate_pct"], 100)
+        self.assertEqual(summary[1]["entry_route"], "INTRADAY_TRANSITION")
+        self.assertEqual(summary[1]["net_pnl"], -1.0)
 
 
 if __name__ == "__main__":

@@ -3049,18 +3049,19 @@ def _trend_health_context(
 
     trend = latest_closed(trend_df)
     confirm = latest_closed(confirm_df)
+    trend_structure = detect_market_structure(trend_df, "trend")
     confirm_structure = detect_market_structure(confirm_df, "confirm")
     min_efficiency = get_config_float(
         "TREND_HEALTH_MIN_EFFICIENCY_RATIO",
         0.18,
     )
-    min_adx_slope = get_config_float("TREND_HEALTH_MIN_ADX_SLOPE", -1.5)
+    min_adx_slope = get_config_float("TREND_HEALTH_MIN_ADX_SLOPE", -1.0)
     max_warning_points = get_config_float(
         "TREND_HEALTH_MAX_WARNING_POINTS",
         4.5,
     )
     hard_block_points = max(
-        get_config_float("TREND_HEALTH_HARD_BLOCK_POINTS", 6),
+        get_config_float("TREND_HEALTH_HARD_BLOCK_POINTS", 6.5),
         max_warning_points,
     )
     efficiency = _safe_float(trend.get("efficiency_ratio"))
@@ -3084,6 +3085,15 @@ def _trend_health_context(
             })
 
     if side == "BUY":
+        full_ema_stack = bool(
+            _safe_float(trend.get("close")) > _safe_float(trend.get("ema20"))
+            and _safe_float(trend.get("ema20")) >= _safe_float(trend.get("ema50"))
+            and _safe_float(trend.get("ema50")) >= _safe_float(trend.get("ema200"))
+        )
+        structure_aligned = bool(
+            trend_structure.get("bullish_structure")
+            or trend_structure.get("bullish_breakout")
+        )
         trend_direction_ok = (
             _safe_float(trend.get("close")) > _safe_float(trend.get("ema50"))
             and (
@@ -3103,6 +3113,15 @@ def _trend_health_context(
         )
         di_conflict = di_spread < 0
     else:
+        full_ema_stack = bool(
+            _safe_float(trend.get("close")) < _safe_float(trend.get("ema20"))
+            and _safe_float(trend.get("ema20")) <= _safe_float(trend.get("ema50"))
+            and _safe_float(trend.get("ema50")) <= _safe_float(trend.get("ema200"))
+        )
+        structure_aligned = bool(
+            trend_structure.get("bearish_structure")
+            or trend_structure.get("bearish_breakdown")
+        )
         trend_direction_ok = (
             _safe_float(trend.get("close")) < _safe_float(trend.get("ema50"))
             and (
@@ -3151,6 +3170,29 @@ def _trend_health_context(
     healthy = bool(
         not hard_failure and warning_points < max_warning_points
     )
+    trending_adx = get_config_float("TRENDING_ADX", 23)
+    established = bool(
+        healthy
+        and full_ema_stack
+        and not di_conflict
+        and not opposite_structure
+        and (
+            efficiency >= min_efficiency
+            or adx >= trending_adx
+            or structure_aligned
+        )
+    )
+    transition = bool(
+        healthy
+        and trend_direction_ok
+        and not opposite_structure
+        and not established
+    )
+    market_state = (
+        "ESTABLISHED"
+        if established
+        else ("TRANSITION" if transition else "WEAK")
+    )
     bonus = get_config_float("TREND_HEALTH_SCORE_BONUS", 1.0)
     penalty = get_config_float("TREND_HEALTH_SCORE_PENALTY", 0.35)
 
@@ -3171,6 +3213,11 @@ def _trend_health_context(
         "adx_slope": round(float(adx_slope), 2),
         "di_spread": round(float(di_spread), 2),
         "trend_direction_ok": trend_direction_ok,
+        "full_ema_stack": full_ema_stack,
+        "structure_aligned": structure_aligned,
+        "established": established,
+        "transition": transition,
+        "market_state": market_state,
         "confirm_ema50_lost": confirm_ema_lost,
         "opposite_structure": opposite_structure,
         "vwap_conflict": vwap_conflict,
@@ -3186,7 +3233,7 @@ def _trend_health_context(
 
 def _intraday_setup_context(side, confirm_df):
     closed = confirm_df.iloc[:-1] if len(confirm_df) > 1 else confirm_df
-    setup_lookback = max(get_config_int("INTRADAY_SETUP_LOOKBACK", 4), 1)
+    setup_lookback = max(get_config_int("INTRADAY_SETUP_LOOKBACK", 6), 1)
     structure_lookback = max(
         get_config_int("INTRADAY_SETUP_STRUCTURE_LOOKBACK", 8),
         4,
@@ -3447,6 +3494,12 @@ def _intraday_trigger_context(side, entry_df):
 
     trigger_event = local_break or sweep_reclaim or ema_reclaim
     volume_support = volume_mult <= 0 or volume_mult >= 0.9
+    strong_volume = volume_mult >= get_config_float(
+        "INTRADAY_TRIGGER_MIN_VOLUME_MULT",
+        1.0,
+    )
+    structural_event = local_break or sweep_reclaim
+    chart_momentum_support = macd_improving or strong_volume
     not_chasing = max_chase_atr <= 0 or chase_atr <= max_chase_atr
     points = 0
     points = add_score(points, directional, 2)
@@ -3471,9 +3524,13 @@ def _intraday_trigger_context(side, entry_df):
         "local_break": local_break,
         "sweep_reclaim": sweep_reclaim,
         "ema_reclaim": ema_reclaim,
+        "structural_event": structural_event,
         "vwap_aligned": vwap_aligned,
         "macd_improving": macd_improving,
         "volume_support": volume_support,
+        "strong_volume": strong_volume,
+        "volume_mult": round(float(volume_mult), 2),
+        "chart_momentum_support": chart_momentum_support,
         "body_atr": round(float(body_atr), 2),
         "directional_close": round(float(directional_close), 2),
         "chase_atr": round(float(chase_atr), 2),
@@ -3515,6 +3572,18 @@ def _intraday_entry_context(
 
     setup = _intraday_setup_context(side, confirm_df)
     trigger = _intraday_trigger_context(side, entry_df)
+    market_state = str(
+        (trend_health or {}).get("market_state") or "ESTABLISHED"
+    ).upper()
+    route = (
+        "TRANSITION"
+        if market_state == "TRANSITION"
+        else ("ESTABLISHED" if market_state == "ESTABLISHED" else "WEAK")
+    )
+    participation_available = bool(
+        participation and participation.get("available")
+    )
+    futures_score = _safe_float(participation_score)
     reasons = []
 
     if not trend_ok:
@@ -3526,22 +3595,52 @@ def _intraday_entry_context(
     if not bool(entry_quality.get("late_entry_ok", True)):
         reasons.append("LATE_ENTRY_HARD_BLOCK")
 
-    minimum_checks = (
-        (
-            "CONFIDENCE",
-            trend_confidence,
+    if route == "WEAK":
+        reasons.append("INTRADAY_WEAK_REGIME")
+
+    transition_enabled = bool(
+        getattr(config, "INTRADAY_TRANSITION_ENABLED", True)
+    )
+
+    if route == "TRANSITION" and not transition_enabled:
+        reasons.append("INTRADAY_TRANSITION_DISABLED")
+
+    if route == "TRANSITION":
+        confidence_min = get_config_float(
+            "INTRADAY_TRANSITION_MIN_CONFIDENCE",
+            76,
+        )
+        trend_min = get_config_float(
+            "INTRADAY_TRANSITION_MIN_TREND_SCORE",
+            7.5,
+        )
+        confirm_min = get_config_float(
+            "INTRADAY_TRANSITION_MIN_CONFIRM_SCORE",
+            6.5,
+        )
+        min_futures = get_config_float(
+            "INTRADAY_TRANSITION_MIN_FUTURES_SCORE",
+            0.5,
+        )
+    else:
+        confidence_min = get_config_float(
+            "INTRADAY_ESTABLISHED_MIN_CONFIDENCE",
             get_config_float("INTRADAY_MIN_CONFIDENCE", 74),
-        ),
-        (
-            "TREND",
-            trend_score,
+        )
+        trend_min = get_config_float(
+            "INTRADAY_ESTABLISHED_MIN_TREND_SCORE",
             get_config_float("INTRADAY_MIN_TREND_SCORE", 7.5),
-        ),
-        (
-            "CONFIRM",
-            confirm_score,
+        )
+        confirm_min = get_config_float(
+            "INTRADAY_ESTABLISHED_MIN_CONFIRM_SCORE",
             get_config_float("INTRADAY_MIN_CONFIRM_SCORE", 6.5),
-        ),
+        )
+        min_futures = get_config_float("INTRADAY_MIN_FUTURES_SCORE", 0)
+
+    minimum_checks = (
+        ("CONFIDENCE", trend_confidence, confidence_min),
+        ("TREND", trend_score, trend_min),
+        ("CONFIRM", confirm_score, confirm_min),
     )
 
     for label, value, minimum in minimum_checks:
@@ -3555,15 +3654,45 @@ def _intraday_entry_context(
     if not trigger.get("valid"):
         reasons.append(trigger.get("reason", "INTRADAY_TRIGGER_NOT_READY"))
 
-    eligible = not reasons
-    participation_available = bool(
-        participation and participation.get("available")
+    if (
+        route == "TRANSITION"
+        and bool(
+            getattr(
+                config,
+                "INTRADAY_TRANSITION_REQUIRE_BREAKOUT_RETEST",
+                True,
+            )
+        )
+        and not setup.get("breakout_retest")
+    ):
+        reasons.append("TRANSITION_BREAKOUT_RETEST_REQUIRED")
+
+    if route == "TRANSITION" and not trigger.get("structural_event"):
+        reasons.append("TRANSITION_STRUCTURAL_TRIGGER_REQUIRED")
+
+    require_trigger_support = bool(
+        getattr(
+            config,
+            "INTRADAY_TRIGGER_REQUIRE_MOMENTUM_OR_FLOW",
+            True,
+        )
     )
+    flow_support_min = get_config_float(
+        "INTRADAY_TRIGGER_FLOW_SUPPORT_SCORE",
+        0.5,
+    )
+    flow_support = participation_available and futures_score >= flow_support_min
+    trigger_support = bool(
+        trigger.get("chart_momentum_support") or flow_support
+    )
+
+    if require_trigger_support and participation_available and not trigger_support:
+        reasons.append("INTRADAY_TRIGGER_MOMENTUM_OR_FLOW_REQUIRED")
+
+    eligible = not reasons
     require_futures = bool(
         getattr(config, "INTRADAY_REQUIRE_FUTURES", True)
     )
-    min_futures = get_config_float("INTRADAY_MIN_FUTURES_SCORE", 0)
-    futures_score = _safe_float(participation_score)
     futures_supports = futures_ok and futures_score >= min_futures
     active = eligible
 
@@ -3588,11 +3717,18 @@ def _intraday_entry_context(
         "reasons": reasons,
         "setup": setup,
         "trigger": trigger,
+        "route": route,
+        "market_state": market_state,
+        "required_confidence": confidence_min,
+        "required_trend_score": trend_min,
+        "required_confirm_score": confirm_min,
+        "trigger_support": trigger_support,
+        "flow_support": flow_support,
         "participation_available": participation_available,
         "futures_score": round(float(futures_score), 2),
         "min_futures_score": min_futures,
         "reason": (
-            "INTRADAY_ENTRY_ACTIVE"
+            f"INTRADAY_{route}_ENTRY_ACTIVE"
             if active
             else (
                 "INTRADAY_ENTRY_AWAITING_FUTURES"
@@ -4990,6 +5126,14 @@ def _side_signal_score(
 
 def _signal_threshold(side_data):
     if side_data.get("confirmation_type") != "REVERSAL":
+        intraday = side_data.get("intraday_entry") or {}
+
+        if intraday.get("active"):
+            return _safe_float(
+                intraday.get("required_confidence"),
+                config.LONG_TERM_SIGNAL_THRESHOLD,
+            )
+
         return config.LONG_TERM_SIGNAL_THRESHOLD
 
     momentum = side_data.get("reversal_context", {}).get("momentum", {})
@@ -5142,6 +5286,7 @@ def log_signal_analysis(analysis):
             trigger = intraday.get("trigger") or {}
             log_info(
                 f"{side_data.get('side')} INTRADAY ENTRY ACTIVE | "
+                f"ROUTE={intraday.get('route')} | "
                 f"SETUP={setup.get('type')}:{setup.get('points')} | "
                 f"TRIGGER={trigger.get('points')} | "
                 f"FUTURES={intraday.get('futures_score')}"

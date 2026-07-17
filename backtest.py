@@ -1350,6 +1350,22 @@ def generate_symbol_trades(
             int(entry_index),
             frames,
         )
+        intraday_context = side_analysis.get("intraday_entry") or {}
+        setup_context = intraday_context.get("setup") or {}
+        trigger_context = intraday_context.get("trigger") or {}
+        route = str(intraday_context.get("route") or "").upper()
+        trade["entry_route"] = (
+            f"INTRADAY_{route}"
+            if confirmation_type == "TREND" and route
+            else confirmation_type
+        )
+        trade["entry_setup_type"] = setup_context.get("type") or ""
+        trade["entry_setup_points"] = setup_context.get("points", "")
+        trade["entry_trigger_points"] = trigger_context.get("points", "")
+        trade["entry_futures_score"] = intraday_context.get(
+            "futures_score",
+            "",
+        )
         trade["skip_reason"] = reason
         trades.append(trade)
         active_until_ms = int(trade["exit_ms"])
@@ -1458,6 +1474,26 @@ def summarise_trades(trades, skipped_by_limits):
     total = len(trades)
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
     net_pnl = equity - balance
+    notes = [
+        "Backtest uses historical OHLCV candles and simulated fills.",
+        (
+            "News, LLM, realtime websocket confirmation, order-book flow, "
+            "and private account state are not replayed."
+        ),
+        (
+            "Intracandle order is conservative: DCA, SL, then TP are "
+            "evaluated inside the same candle."
+        ),
+    ]
+
+    if (
+        getattr(config, "INTRADAY_TRANSITION_ENABLED", True)
+        and getattr(config, "BACKTEST_ASSUME_NEUTRAL_FUTURES_CONTEXT", True)
+    ):
+        notes.append(
+            "Neutral backtest futures context scores zero, so live transition "
+            "entries requiring positive futures support are not represented."
+        )
 
     return {
         "initial_balance": round(balance, 4),
@@ -1479,11 +1515,7 @@ def summarise_trades(trades, skipped_by_limits):
         "avg_duration_hours": round(sum(durations) / len(durations), 2) if durations else 0,
         "dca_trades": dca_trades,
         "skipped_by_position_limits": skipped_by_limits,
-        "notes": [
-            "Backtest uses historical OHLCV candles and simulated fills.",
-            "News, LLM, realtime websocket confirmation, order-book flow, and private account state are not replayed.",
-            "Intracandle order is conservative: DCA, SL, then TP are evaluated inside the same candle.",
-        ],
+        "notes": notes,
         "equity_curve": equity_curve,
     }
 
@@ -1507,6 +1539,30 @@ def summarise_by_symbol(trades):
                 2,
             ) if subset else 0,
             "dca_trades": sum(1 for item in subset if int(item["dca_count"]) > 0),
+        })
+
+    return rows
+
+
+def summarise_by_entry_route(trades):
+    rows = []
+    routes = {item.get("entry_route", "UNKNOWN") for item in trades}
+
+    for route in sorted(routes):
+        subset = [
+            item
+            for item in trades
+            if item.get("entry_route", "UNKNOWN") == route
+        ]
+        wins = sum(1 for item in subset if item["result"] == "WIN")
+        pnl = sum(float(item["net_pnl"]) for item in subset)
+        rows.append({
+            "entry_route": route,
+            "trades": len(subset),
+            "wins": wins,
+            "losses": len(subset) - wins,
+            "win_rate_pct": round((wins / len(subset) * 100) if subset else 0, 2),
+            "net_pnl": round(pnl, 4),
         })
 
     return rows
@@ -1732,6 +1788,7 @@ def run_backtest(args):
 
     accepted_trades, skipped_by_limits = apply_position_limits(all_trades)
     summary = summarise_trades(accepted_trades, skipped_by_limits)
+    route_summary = summarise_by_entry_route(accepted_trades)
     summary.update({
         "symbols": symbols,
         "start": ms_to_iso(start_ms),
@@ -1739,6 +1796,7 @@ def run_backtest(args):
         "failed_symbols": failed_symbols,
         "generated_trades_before_position_limits": len(all_trades),
         "reversal_diagnostics": reversal_diagnostics,
+        "entry_route_summary": route_summary,
         "settings": {
             "signal_step_candles": int(getattr(config, "BACKTEST_SIGNAL_STEP_CANDLES", 4)),
             "exit_timeframe": getattr(config, "BACKTEST_EXIT_TIMEFRAME", config.ENTRY_TIMEFRAME),
@@ -1794,6 +1852,18 @@ def run_backtest(args):
             "reversal_entry_enabled": bool(
                 getattr(config, "REVERSAL_ENTRY_ENABLED", True)
             ),
+            "intraday_established_min_confidence": float(
+                getattr(config, "INTRADAY_ESTABLISHED_MIN_CONFIDENCE", 72)
+            ),
+            "intraday_transition_enabled": bool(
+                getattr(config, "INTRADAY_TRANSITION_ENABLED", True)
+            ),
+            "intraday_transition_min_confidence": float(
+                getattr(config, "INTRADAY_TRANSITION_MIN_CONFIDENCE", 76)
+            ),
+            "intraday_transition_min_futures_score": float(
+                getattr(config, "INTRADAY_TRANSITION_MIN_FUTURES_SCORE", 0.5)
+            ),
             "trend_exhaustion_guard_enabled": bool(
                 getattr(config, "TREND_EXHAUSTION_GUARD_ENABLED", True)
             ),
@@ -1812,6 +1882,7 @@ def run_backtest(args):
     written_files = [
         write_csv(results_dir / "trades.csv", accepted_trades),
         write_csv(results_dir / "symbol_summary.csv", symbol_summary),
+        write_csv(results_dir / "entry_route_summary.csv", route_summary),
         write_json(results_dir / "summary.json", summary),
     ]
 
@@ -1823,7 +1894,15 @@ def run_backtest(args):
     print(f"Net return: {summary['net_return_pct']}%")
     print(f"Max drawdown: {summary['max_drawdown_pct']}%")
     print(f"Results: {results_dir.resolve()}")
-    if any(item.name not in {"trades.csv", "symbol_summary.csv", "summary.json"} for item in written_files):
+    if any(
+        item.name not in {
+            "trades.csv",
+            "symbol_summary.csv",
+            "entry_route_summary.csv",
+            "summary.json",
+        }
+        for item in written_files
+    ):
         print("Locked output fallback files:")
         for item in written_files:
             print(f"  {item.name}")

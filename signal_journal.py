@@ -30,6 +30,18 @@ FIELDNAMES = [
     "sell_regime_score",
     "buy_regime",
     "sell_regime",
+    "buy_intraday_route",
+    "sell_intraday_route",
+    "buy_intraday_setup",
+    "sell_intraday_setup",
+    "buy_intraday_setup_points",
+    "sell_intraday_setup_points",
+    "buy_intraday_trigger_points",
+    "sell_intraday_trigger_points",
+    "buy_intraday_trigger_support",
+    "sell_intraday_trigger_support",
+    "buy_intraday_futures_score",
+    "sell_intraday_futures_score",
     "buy_entry_quality_ok",
     "sell_entry_quality_ok",
     "buy_entry_chase_atr",
@@ -178,6 +190,19 @@ def _nested_value(side, parent, key, default=""):
     return default if value is None else value
 
 
+def _intraday_value(side, key, child_key=None, default=""):
+    intraday = (side or {}).get("intraday_entry") or {}
+    item = intraday.get(key, default)
+
+    if child_key is not None:
+        item = item or {}
+        value = item.get(child_key, default)
+    else:
+        value = item
+
+    return default if value is None else value
+
+
 def append_signal_journal(
     symbol,
     analysis,
@@ -228,6 +253,46 @@ def append_signal_journal(
             "sell_regime_score": _side_value(sell, "regime_score"),
             "buy_regime": _nested_value(buy, "regime_context", "regime"),
             "sell_regime": _nested_value(sell, "regime_context", "regime"),
+            "buy_intraday_route": _intraday_value(buy, "route"),
+            "sell_intraday_route": _intraday_value(sell, "route"),
+            "buy_intraday_setup": _intraday_value(buy, "setup", "type"),
+            "sell_intraday_setup": _intraday_value(sell, "setup", "type"),
+            "buy_intraday_setup_points": _intraday_value(
+                buy,
+                "setup",
+                "points",
+            ),
+            "sell_intraday_setup_points": _intraday_value(
+                sell,
+                "setup",
+                "points",
+            ),
+            "buy_intraday_trigger_points": _intraday_value(
+                buy,
+                "trigger",
+                "points",
+            ),
+            "sell_intraday_trigger_points": _intraday_value(
+                sell,
+                "trigger",
+                "points",
+            ),
+            "buy_intraday_trigger_support": _intraday_value(
+                buy,
+                "trigger_support",
+            ),
+            "sell_intraday_trigger_support": _intraday_value(
+                sell,
+                "trigger_support",
+            ),
+            "buy_intraday_futures_score": _intraday_value(
+                buy,
+                "futures_score",
+            ),
+            "sell_intraday_futures_score": _intraday_value(
+                sell,
+                "futures_score",
+            ),
             "buy_entry_quality_ok": _nested_value(
                 buy,
                 "entry_quality",
