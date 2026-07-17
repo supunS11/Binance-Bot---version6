@@ -3740,6 +3740,105 @@ def _intraday_entry_context(
     return context
 
 
+def _trend_route_recovery_context(
+    normal_trend_following_ok,
+    trend_timing_rescue,
+    continuation_pullback,
+    legacy_trend_following_ok,
+    trend_confidence,
+    participation_score,
+    participation,
+    futures_ok,
+):
+    enabled = bool(
+        getattr(config, "TREND_ROUTE_RECOVERY_ENABLED", True)
+    )
+    rescue = trend_timing_rescue or {}
+    pullback = continuation_pullback or {}
+    normal_eligible = bool(normal_trend_following_ok)
+    rescue_eligible = bool(rescue.get("eligible"))
+    pullback_eligible = bool(pullback.get("eligible"))
+    if normal_eligible:
+        source = "NORMAL_TREND"
+    elif pullback_eligible:
+        source = "CONTINUATION_PULLBACK"
+    elif rescue_eligible:
+        source = "TREND_TIMING_RESCUE"
+    else:
+        source = "NONE"
+    min_confidence = get_config_float(
+        "TREND_ROUTE_RECOVERY_MIN_CONFIDENCE",
+        78,
+    )
+    confidence_ok = _safe_float(trend_confidence) >= min_confidence
+    chart_eligible = bool(
+        normal_eligible or rescue_eligible or pullback_eligible
+    )
+    eligible = bool(enabled and chart_eligible and confidence_ok)
+    participation_available = bool(
+        participation and participation.get("available")
+    )
+    futures_score = _safe_float(participation_score)
+    min_futures = get_config_float(
+        "TREND_ROUTE_RECOVERY_MIN_FUTURES_SCORE",
+        0.5,
+    )
+    require_futures = bool(
+        getattr(config, "TREND_ROUTE_RECOVERY_REQUIRE_FUTURES", True)
+    )
+    futures_supports = bool(
+        futures_ok and futures_score >= min_futures
+    )
+    active = bool(
+        eligible and
+        legacy_trend_following_ok and
+        (
+            not require_futures or
+            (participation_available and futures_supports)
+        )
+    )
+    reasons = []
+
+    if not enabled:
+        reasons.append("TREND_ROUTE_RECOVERY_DISABLED")
+    if not chart_eligible:
+        reasons.append("QUALIFIED_TREND_ROUTE_MISSING")
+    if not confidence_ok:
+        reasons.append(
+            f"CONFIDENCE={round(_safe_float(trend_confidence), 2)} "
+            f"< {min_confidence}"
+        )
+    if eligible and require_futures and not participation_available:
+        reasons.append("FUTURES_CONTEXT_REQUIRED")
+    elif eligible and participation_available and not futures_supports:
+        reasons.append(
+            f"FUTURES_SCORE={round(futures_score, 2)} < {min_futures}"
+        )
+    if eligible and participation_available and not legacy_trend_following_ok:
+        reasons.append("ORIGINAL_TREND_ROUTE_NOT_CONFIRMED")
+
+    return {
+        "enabled": enabled,
+        "eligible": eligible,
+        "active": active,
+        "source": source,
+        "required_confidence": min_confidence,
+        "participation_available": participation_available,
+        "futures_score": round(float(futures_score), 2),
+        "min_futures_score": min_futures,
+        "reasons": reasons,
+        "reason": (
+            "TREND_ROUTE_RECOVERY_ACTIVE"
+            if active
+            else (
+                "TREND_ROUTE_RECOVERY_AWAITING_FUTURES"
+                if eligible and not participation_available
+                else "TREND_ROUTE_RECOVERY_BLOCKED"
+            )
+        ),
+    }
+
+
 def _counter_trend_context(side, trend_df, confirm_df):
     trend = latest_closed(trend_df)
     confirm = latest_closed(confirm_df)
@@ -5010,8 +5109,21 @@ def _side_signal_score(
         participation,
         futures_ok,
     )
+    trend_route_recovery = _trend_route_recovery_context(
+        normal_trend_following_ok,
+        trend_timing_rescue,
+        continuation_pullback,
+        legacy_trend_following_ok,
+        trend_confidence,
+        participation_score,
+        participation,
+        futures_ok,
+    )
     trend_following_ok = (
-        bool(intraday_entry.get("active"))
+        bool(
+            intraday_entry.get("active") or
+            trend_route_recovery.get("active")
+        )
         if getattr(config, "INTRADAY_ENTRY_ENABLED", True)
         else legacy_trend_following_ok
     )
@@ -5108,6 +5220,7 @@ def _side_signal_score(
         "trend_timing_rescue": trend_timing_rescue,
         "continuation_pullback": continuation_pullback,
         "intraday_entry": intraday_entry,
+        "trend_route_recovery": trend_route_recovery,
         "reversal_ok": reversal_ok,
         "reversal_confirmed": reversal_confirmed,
         "reversal_reasons": reversal_reasons,
@@ -5127,11 +5240,18 @@ def _side_signal_score(
 def _signal_threshold(side_data):
     if side_data.get("confirmation_type") != "REVERSAL":
         intraday = side_data.get("intraday_entry") or {}
+        recovery = side_data.get("trend_route_recovery") or {}
 
         if intraday.get("active"):
             return _safe_float(
                 intraday.get("required_confidence"),
                 config.LONG_TERM_SIGNAL_THRESHOLD,
+            )
+
+        if recovery.get("active"):
+            return max(
+                _safe_float(config.LONG_TERM_SIGNAL_THRESHOLD),
+                _safe_float(recovery.get("required_confidence")),
             )
 
         return config.LONG_TERM_SIGNAL_THRESHOLD
@@ -5239,6 +5359,7 @@ def log_signal_analysis(analysis):
         rescue = side_data.get("trend_timing_rescue") or {}
         pullback = side_data.get("continuation_pullback") or {}
         intraday = side_data.get("intraday_entry") or {}
+        recovery = side_data.get("trend_route_recovery") or {}
         trend_health = side_data.get("trend_health") or {}
         reversal_futures = (
             (side_data.get("reversal_context") or {}).get(
@@ -5300,6 +5421,23 @@ def log_signal_analysis(analysis):
                 f"SETUP={(intraday.get('setup') or {}).get('type')} | "
                 f"TRIGGER={(intraday.get('trigger') or {}).get('points')} | "
                 f"REASON={intraday.get('reason')}"
+            )
+
+        if recovery.get("active"):
+            log_info(
+                f"{side_data.get('side')} TREND ROUTE RECOVERY ACTIVE | "
+                f"SOURCE={recovery.get('source')} | "
+                f"CONFIDENCE={side_data.get('trend_confidence')} | "
+                f"FUTURES={recovery.get('futures_score')}"
+            )
+        elif (
+            recovery.get("reason") ==
+            "TREND_ROUTE_RECOVERY_AWAITING_FUTURES"
+        ):
+            log_info(
+                f"{side_data.get('side')} TREND ROUTE RECOVERY WAITING | "
+                f"SOURCE={recovery.get('source')} | "
+                f"CONFIDENCE={side_data.get('trend_confidence')}"
             )
 
         if trend_health.get("enabled") and not trend_health.get("healthy"):
@@ -5648,6 +5786,15 @@ def should_fetch_futures_context(analysis):
     sell = analysis.get("sell", {})
 
     if any(
+        (side_data.get("trend_route_recovery") or {}).get("eligible")
+        and not (side_data.get("trend_route_recovery") or {}).get(
+            "participation_available"
+        )
+        for side_data in (buy, sell)
+    ):
+        return True
+
+    if any(
         (side_data.get("intraday_entry") or {}).get("eligible")
         and not (side_data.get("intraday_entry") or {}).get(
             "participation_available"
@@ -5772,6 +5919,12 @@ def futures_context_priority(analysis):
         if (side_data.get("intraday_entry") or {}).get("eligible"):
             priority += get_config_float(
                 "FUTURES_CONTEXT_PRIORITY_INTRADAY_BONUS",
+                8,
+            )
+
+        if (side_data.get("trend_route_recovery") or {}).get("eligible"):
+            priority += get_config_float(
+                "FUTURES_CONTEXT_PRIORITY_TREND_RECOVERY_BONUS",
                 8,
             )
 
