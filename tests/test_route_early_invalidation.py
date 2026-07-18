@@ -274,7 +274,11 @@ class RouteEarlyInvalidationBacktestTests(unittest.TestCase):
             "reason": "TREND_THESIS_INVALIDATED",
         }
 
-        with patch.object(config, "EARLY_FLOW_EXIT_ENABLED", True), patch.object(
+        with patch.object(config, "LEVERAGE", 10), patch.object(
+            config,
+            "EARLY_FLOW_EXIT_ENABLED",
+            True,
+        ), patch.object(
             config,
             "EARLY_FLOW_EXIT_TREND_ENABLED",
             True,

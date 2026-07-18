@@ -9,6 +9,7 @@ class DcaContinuationGuardTests(unittest.TestCase):
     def evaluate(self, structure_ok):
         with (
             patch.object(config, "DCA_STRICT_GUARD_ENABLED", True),
+            patch.object(config, "DCA_TRIGGER_MODE", "static_roi"),
             patch.object(
                 config,
                 "DCA_STRICT_GUARD_APPLY_TO_REVERSAL_ONLY",

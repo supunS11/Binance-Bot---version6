@@ -22,6 +22,9 @@ logs/
 data/open_trades.json
 data/signal_journal.csv
 data/signal_journal.bak_*.csv
+data/signal_outcomes*.csv
+data/signal_outcomes_pending*.json
+data/signal_calibration*.json
 data/news_cache.json
 data/llm_cache.json
 

@@ -1025,13 +1025,40 @@ def simulate_trade(
             if trigger_roi is None or next_margin <= 0:
                 break
 
-            anchor_price = fills[-1]["price"]
-            trigger_price = dca_trigger_price(side, anchor_price, trigger_roi)
+            cooldown_ms = max(
+                int(getattr(config, "DCA_MIN_SECONDS_BETWEEN_ORDERS", 0)),
+                0,
+            ) * 1000
+
+            if cooldown_ms and candle_time - int(fills[-1]["time"]) < cooldown_ms:
+                break
+
+            max_adverse_roi = max(
+                float(getattr(config, "DCA_MAX_ADVERSE_ROI", 0)),
+                0,
+            )
+
+            if max_adverse_roi and trigger_roi > max_adverse_roi:
+                dca_blocked_count += 1
+                last_dca_block_reason = "DCA_MAX_RISK_EXCEEDED"
+                break
+
+            trigger_anchor_price = fills[0]["price"]
+            spacing_anchor_price = fills[-1]["price"]
+            trigger_price = dca_trigger_price(
+                side,
+                trigger_anchor_price,
+                trigger_roi,
+            )
 
             if not candle_hits_dca(side, candle, trigger_price):
                 break
 
-            if getattr(config, "DCA_STRICT_GUARD_ENABLED", True):
+            if (
+                getattr(config, "DCA_STRICT_GUARD_ENABLED", True) or
+                getattr(config, "DCA_TRIGGER_MODE", "static_roi") ==
+                "adaptive_hybrid"
+            ):
                 trend_slice = closed_slice(
                     frames["trend"].indicators,
                     candle_time,
@@ -1066,6 +1093,8 @@ def simulate_trade(
                     dca_level=dca_count + 1,
                     adverse_roi=trigger_roi,
                     position_adverse_roi=round(float(position_adverse_roi), 2),
+                    trigger_roi=trigger_roi,
+                    spacing_anchor_price=spacing_anchor_price,
                 )
 
                 if not guard_ok:
@@ -1117,6 +1146,12 @@ def simulate_trade(
                         confirm_slice,
                         confirmation_type,
                     )
+
+            if (
+                getattr(config, "DCA_TRIGGER_MODE", "static_roi") ==
+                "adaptive_hybrid"
+            ):
+                break
 
         adverse_price = float(candle["low"]) if side == "BUY" else float(candle["high"])
         adverse_roi = abs(
@@ -1985,6 +2020,27 @@ def run_backtest(args):
                 )
             ),
             "use_dca": bool(getattr(config, "BACKTEST_USE_DCA", False)),
+            "dca_trigger_mode": getattr(
+                config,
+                "DCA_TRIGGER_MODE",
+                "static_roi",
+            ),
+            "dca_trigger_rois": list(getattr(config, "DCA_TRIGGER_ROIS", [])),
+            "dca_max_adverse_roi": float(
+                getattr(config, "DCA_MAX_ADVERSE_ROI", 0)
+            ),
+            "dca_min_seconds_between_orders": int(
+                getattr(config, "DCA_MIN_SECONDS_BETWEEN_ORDERS", 0)
+            ),
+            "dca_adaptive_atr_multipliers": list(
+                getattr(config, "DCA_ADAPTIVE_ATR_MULTIPLIERS", [])
+            ),
+            "dca_adaptive_require_structure": bool(
+                getattr(config, "DCA_ADAPTIVE_REQUIRE_STRUCTURE", True)
+            ),
+            "dca_adaptive_require_recovery": bool(
+                getattr(config, "DCA_ADAPTIVE_REQUIRE_RECOVERY", True)
+            ),
             "multi_tp_enabled": bool(
                 getattr(config, "BACKTEST_MULTI_TP_ENABLED", False) and
                 getattr(config, "MULTI_TP_ENABLED", False)
