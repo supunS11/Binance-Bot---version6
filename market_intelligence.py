@@ -29,10 +29,11 @@ def _message_data(message):
 
 
 class MarketFlowMonitor:
-    def __init__(self, symbols, shutdown_event=None):
+    def __init__(self, symbols, shutdown_event=None, shadow_monitor=None):
         self.enabled = bool(getattr(config, "MARKET_FLOW_ENABLED", True))
         self.symbols = tuple(dict.fromkeys(symbol.upper() for symbol in symbols))
         self.shutdown_event = shutdown_event
+        self.shadow_monitor = shadow_monitor
         self.running = False
         self.resetting = False
         self.last_message_at = 0.0
@@ -362,6 +363,14 @@ class MarketFlowMonitor:
             self.last_message_at = time.time()
 
         if event_type in {"aggTrade", "trade"}:
+            if self.shadow_monitor is not None:
+                try:
+                    self.shadow_monitor.handle_message(data)
+                except Exception as exc:
+                    log_warning(
+                        f"Shadow order-flow trade fanout warning: {exc}"
+                    )
+
             self._handle_trade(data)
         elif event_type == "depthUpdate":
             self._handle_depth(data)
@@ -579,6 +588,7 @@ class MarketFlowMonitor:
         )
         depth_fresh = depth_age is not None and depth_age <= stale_seconds
         trade_fresh = trade_age is not None and trade_age <= stale_seconds
+        cvd_component = cvd_score if trade_fresh else 0.0
         depth_component = depth_imbalance if depth_fresh else 0.0
         micro_scale = max(
             _safe_float(getattr(config, "MARKET_FLOW_MICROPRICE_SCALE_BPS", 2), 2),
@@ -586,7 +596,7 @@ class MarketFlowMonitor:
         )
         micro_component = _clip(microprice_bps / micro_scale) if depth_fresh else 0.0
         directional = _clip(
-            (cvd_score * 0.55) +
+            (cvd_component * 0.55) +
             (depth_component * 0.15) +
             (micro_component * 0.10) +
             (ofi * 0.20 if depth_fresh else 0.0)
@@ -597,9 +607,9 @@ class MarketFlowMonitor:
         )
         buy_score = round(directional * max_score, 3)
         components = {
-            "cvd_1m": ratios[60],
-            "cvd_5m": ratios[300],
-            "cvd_15m": ratios[900],
+            "cvd_1m": ratios[60] if trade_fresh else None,
+            "cvd_5m": ratios[300] if trade_fresh else None,
+            "cvd_15m": ratios[900] if trade_fresh else None,
             "depth": depth_component if depth_fresh else None,
             "microprice": micro_component if depth_fresh else None,
             "ofi": ofi if depth_fresh and ofi_samples else None,
@@ -625,10 +635,22 @@ class MarketFlowMonitor:
             "symbol": symbol,
             "buy_score": buy_score,
             "sell_score": round(-buy_score, 3),
-            "cvd_1m": None if ratios[60] is None else round(ratios[60], 4),
-            "cvd_5m": None if ratios[300] is None else round(ratios[300], 4),
-            "cvd_15m": None if ratios[900] is None else round(ratios[900], 4),
-            "notional_1m": round(notionals[60], 2),
+            "cvd_1m": (
+                None
+                if not trade_fresh or ratios[60] is None
+                else round(ratios[60], 4)
+            ),
+            "cvd_5m": (
+                None
+                if not trade_fresh or ratios[300] is None
+                else round(ratios[300], 4)
+            ),
+            "cvd_15m": (
+                None
+                if not trade_fresh or ratios[900] is None
+                else round(ratios[900], 4)
+            ),
+            "notional_1m": round(notionals[60], 2) if trade_fresh else 0.0,
             "depth_imbalance": round(depth_imbalance, 4) if depth_fresh else None,
             "microprice_bps": round(microprice_bps, 4) if depth_fresh else None,
             "ofi": round(ofi, 4) if depth_fresh and ofi_samples else None,

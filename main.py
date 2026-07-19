@@ -9,6 +9,7 @@ import config
 from binance.enums import SIDE_BUY, SIDE_SELL
 
 from exchange import (
+    sync_client_time,
     get_klines,
     get_balance,
     get_margin_balance,
@@ -32,7 +33,13 @@ from exchange import (
     cancel_open_protection_orders,
     cancel_algo_order,
     get_price_precision,
-    get_private_rest_backoff_remaining
+    get_private_rest_backoff_remaining,
+    get_execution_reconciliation,
+    get_reconciled_executed_quantity,
+    is_reconciled_execution_settled,
+    get_algo_order_execution,
+    find_matching_open_algo_order,
+    normalize_trigger_price,
 )
 
 from indicators import apply_indicators
@@ -734,6 +741,66 @@ def place_tp_sl_with_recovery(
         last_result
     )
     return last_result if return_details else False
+
+
+def fail_safe_close_unprotected_position(
+    symbol,
+    position_side=None,
+    reference_price=None,
+    context="PROTECTION_FAILURE",
+):
+    """Flatten a position whose protection or durable state could not be secured."""
+    if not getattr(config, "PROTECTION_FAILURE_CLOSE_ENABLED", True):
+        log_error(
+            f"{symbol} protection fail-safe close disabled | CONTEXT={context}"
+        )
+        return False
+
+    details = get_open_position_details(symbol, force=True)
+
+    if details is None:
+        log_error(
+            f"{symbol} protection fail-safe aborted | "
+            f"position snapshot unavailable | CONTEXT={context}"
+        )
+        return False
+
+    position_detail = details.get(symbol)
+
+    if not position_detail:
+        log_warning(
+            f"{symbol} protection fail-safe found position already closed | "
+            f"CONTEXT={context}"
+        )
+        return True
+
+    live_amount = float(position_detail.get("amount", 0) or 0)
+    live_position_side = (
+        position_detail.get("position_side") or position_side
+    )
+    cancel_open_protection_orders(symbol)
+    closed = close_position_market(
+        symbol,
+        live_amount,
+        position_side=live_position_side,
+        reference_price=(
+            reference_price or position_detail.get("mark_price")
+        ),
+        context=f"FAILSAFE_{context}",
+    )
+
+    if not closed:
+        log_error(
+            f"{symbol} PROTECTION FAIL-SAFE CLOSE NOT CONFIRMED | "
+            f"CONTEXT={context}"
+        )
+        return False
+
+    cancel_open_protection_orders(symbol)
+    log_warning(
+        f"{symbol} protection fail-safe close confirmed | CONTEXT={context}"
+    )
+    return True
 
 
 def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, btc_trend):
@@ -1442,12 +1509,80 @@ def manage_dca_position(
         f"{symbol} DCA placing market order | "
         f"SIDE={order_side} | QTY={quantity} | MARGIN={dca_margin}"
     )
-    order = place_market_order(symbol, order_side, quantity)
+    fresh_details = get_open_position_details(symbol, force=True)
+
+    if fresh_details is None:
+        clear_dca_reservation(state, symbol, dca_level)
+        log_warning(
+            f"{symbol} DCA aborted | fresh position snapshot unavailable"
+        )
+        return
+
+    fresh_position = fresh_details.get(symbol)
+
+    if not fresh_position or fresh_position.get("side") != side:
+        clear_dca_reservation(state, symbol, dca_level)
+        log_warning(
+            f"{symbol} DCA aborted | live position vanished or changed side"
+        )
+        return
+
+    position_detail = fresh_position
+    pre_position_amount = float(fresh_position.get("amount", 0) or 0)
+    old_quantity = abs(pre_position_amount)
+    avg_entry = float(
+        fresh_position.get("entry_price") or avg_entry or 0
+    )
+    order = place_market_order(
+        symbol,
+        order_side,
+        quantity,
+        pre_position_amount=pre_position_amount,
+        pre_average_price=avg_entry,
+        reference_price=current_price,
+        context=f"DCA_LEVEL_{dca_level}",
+    )
 
     if not order:
         clear_dca_reservation(state, symbol, dca_level)
-        log_warning(f"{symbol} DCA aborted | market order failed")
+        log_warning(f"{symbol} DCA aborted | execution failed with no fill")
         return
+
+    reconciliation = get_execution_reconciliation(order)
+
+    if not is_reconciled_execution_settled(order):
+        pending_dca = dict(
+            (get_position_state(state, symbol) or {}).get("pending_dca") or {}
+        )
+        pending_dca.update({
+            "execution_unsettled": True,
+            "execution_context": f"DCA_LEVEL_{dca_level}",
+            "execution_reconciliation": reconciliation,
+        })
+        update_position_runtime_fields(
+            state,
+            symbol,
+            {"pending_dca": pending_dca},
+        )
+        log_error(
+            f"{symbol} DCA execution is unsettled | LEVEL={dca_level} | "
+            "reservation retained; no duplicate fallback will be submitted"
+        )
+        return
+
+    filled_quantity = get_reconciled_executed_quantity(order)
+
+    if filled_quantity <= 0:
+        clear_dca_reservation(state, symbol, dca_level)
+        log_warning(f"{symbol} DCA aborted | confirmed zero fill")
+        return
+
+    level_info["requested_quantity"] = quantity
+    level_info["executed_quantity"] = filled_quantity
+    level_info["execution_mode"] = reconciliation.get("execution_mode")
+    level_info["execution_fallback_used"] = bool(
+        reconciliation.get("fallback_used")
+    )
 
     fill_price = get_entry_price(symbol, order)
 
@@ -1460,15 +1595,17 @@ def manage_dca_position(
         avg_entry,
         old_quantity,
         fill_price,
-        quantity
+        filled_quantity
     )
+
+    used_dca_margin = dca_margin * min(filled_quantity / quantity, 1)
 
     if not record_dca_fill(
         state,
         symbol,
         avg_entry,
         total_quantity,
-        dca_margin,
+        used_dca_margin,
         fill_price,
         level_info
     ):
@@ -1562,7 +1699,22 @@ def manage_dca_position(
             new_tp_info = protection_result
 
             if not protection_ok:
-                log_warning(f"{symbol} DCA TP ORDER NOT CREATED")
+                log_error(
+                    f"{symbol} DCA replacement protection was not secured"
+                )
+                update_position_tp_status(
+                    state,
+                    symbol,
+                    protection_result,
+                    context=f"DCA_LEVEL_{dca_count + 1}",
+                )
+                fail_safe_close_unprotected_position(
+                    symbol,
+                    position_side=position_detail.get("position_side"),
+                    reference_price=current_price,
+                    context=f"DCA_LEVEL_{dca_count + 1}_PROTECTION",
+                )
+                return
         else:
             log_warning(
                 f"{symbol} DCA TP reprice skipped | "
@@ -1953,10 +2105,16 @@ def close_all_open_positions_for_target_stop():
             symbol = detail.get("symbol")
             amount = detail.get("amount", 0)
             position_side = detail.get("position_side")
-            cancel_open_protection_orders(symbol)
 
-            if close_position_market(symbol, amount, position_side=position_side):
-                log_warning(f"{symbol} target margin stop close submitted")
+            if close_position_market(
+                symbol,
+                amount,
+                position_side=position_side,
+                reference_price=detail.get("mark_price"),
+                context="TARGET_MARGIN_STOP",
+            ):
+                cancel_open_protection_orders(symbol)
+                log_warning(f"{symbol} target margin stop close confirmed")
             else:
                 log_error(f"{symbol} target margin stop close failed")
 
@@ -2542,6 +2700,207 @@ class DcaWebsocketMonitor:
             detail.get("quantity", abs(float(detail.get("amount", 0) or 0))),
         )
 
+    def _persist_multi_tp_updates(self, state, symbol, updates, error_label):
+        if update_position_runtime_fields(state, symbol, updates):
+            return True
+
+        log_error(
+            f"{symbol} TP runner state persistence failed | {error_label}"
+        )
+        return False
+
+    @staticmethod
+    def _algo_intent_matches(
+        execution,
+        order_type,
+        close_side,
+        position_side,
+        close_position,
+        quantity=None,
+    ):
+        if not execution.get("found"):
+            return False
+
+        order = execution.get("algo_order") or {}
+        actual_type = str(
+            order.get("orderType") or order.get("type") or ""
+        ).upper()
+        actual_side = str(order.get("side") or "").upper()
+        actual_position_side = str(
+            order.get("positionSide") or "BOTH"
+        ).upper()
+        actual_close_position = str(
+            order.get("closePosition", False)
+        ).lower() == "true"
+
+        if actual_type != str(order_type).upper():
+            return False
+
+        if actual_side != str(close_side).upper():
+            return False
+
+        if actual_position_side != str(position_side or "BOTH").upper():
+            return False
+
+        if actual_close_position != bool(close_position):
+            return False
+
+        if quantity is not None:
+            expected_quantity = abs(float(quantity or 0))
+            actual_quantity = abs(float(order.get("quantity", 0) or 0))
+            tolerance = max(expected_quantity * 1e-6, 1e-12)
+
+            if abs(actual_quantity - expected_quantity) > tolerance:
+                return False
+
+        return True
+
+    def _resolve_exact_tp1_fill(
+        self,
+        symbol,
+        state,
+        position_state,
+        position_detail,
+    ):
+        tp1_order_id = position_state.get("tp1_order_id") or ""
+        side = str(position_state.get("side") or "").upper()
+        close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
+        position_side = position_detail.get("position_side") or "BOTH"
+
+        if not tp1_order_id:
+            self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_protection_error": "TP1_ORDER_ID_MISSING"},
+                "TP1_ORDER_ID_MISSING",
+            )
+            return False, None
+
+        execution = get_algo_order_execution(symbol, tp1_order_id)
+
+        if not execution.get("query_ok"):
+            self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_protection_error": "TP1_ORDER_QUERY_UNAVAILABLE"},
+                "TP1_ORDER_QUERY_UNAVAILABLE",
+            )
+            return False, None
+
+        if not execution.get("found"):
+            matching = find_matching_open_algo_order(
+                symbol,
+                "TAKE_PROFIT_MARKET",
+                close_side,
+                position_side=position_side,
+                trigger_price=position_state.get("tp1_price"),
+                close_position=False,
+                quantity=position_state.get("tp1_quantity"),
+            )
+            repaired_id = matching.get("order_id") or ""
+
+            if repaired_id:
+                if not self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {
+                        "tp1_order_id": repaired_id,
+                        "runner_protection_error": "",
+                    },
+                    "TP1_ORDER_ID_REPAIR",
+                ):
+                    return False, None
+
+                execution = get_algo_order_execution(symbol, repaired_id)
+            else:
+                self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_protection_error": "TP1_ORDER_NOT_FOUND"},
+                    "TP1_ORDER_NOT_FOUND",
+                )
+                return False, None
+
+        if not self._algo_intent_matches(
+            execution,
+            "TAKE_PROFIT_MARKET",
+            close_side,
+            position_side,
+            False,
+            quantity=position_state.get("tp1_quantity"),
+        ):
+            self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_protection_error": "TP1_ORDER_INTENT_MISMATCH"},
+                "TP1_ORDER_INTENT_MISMATCH",
+            )
+            return False, None
+
+        algo_status = execution.get("algo_status") or "UNKNOWN"
+        self._persist_multi_tp_updates(
+            state,
+            symbol,
+            {"tp1_order_status": algo_status},
+            "TP1_ORDER_STATUS",
+        )
+
+        if not execution.get("filled"):
+            return False, execution
+
+        live_quantity = abs(float(position_detail.get("quantity", 0) or 0))
+
+        if not tp1_fill_confirmed(
+            position_state.get("tp1_base_quantity"),
+            position_state.get("tp1_quantity"),
+            live_quantity,
+        ):
+            return False, execution
+
+        return True, execution
+
+    def _validate_runner_order_id(
+        self,
+        symbol,
+        order_id,
+        order_type,
+        close_side,
+        position_side,
+        trigger_price=None,
+    ):
+        if not order_id:
+            return "MISSING"
+
+        execution = get_algo_order_execution(symbol, order_id)
+
+        if not execution.get("query_ok"):
+            return "UNAVAILABLE"
+
+        if not self._algo_intent_matches(
+            execution,
+            order_type,
+            close_side,
+            position_side,
+            True,
+        ):
+            return "INVALID"
+
+        if trigger_price is not None:
+            order = execution.get("algo_order") or {}
+            actual_trigger = float(
+                order.get("triggerPrice") or order.get("stopPrice") or 0
+            )
+            expected_trigger = float(trigger_price or 0)
+            tolerance = max(abs(expected_trigger) * 1e-9, 1e-12)
+
+            if (
+                actual_trigger <= 0 or
+                abs(actual_trigger - expected_trigger) > tolerance
+            ):
+                return "INVALID"
+
+        return "OPEN" if execution.get("open") else "TERMINAL"
+
     def _handle_multi_tp_runner(self, symbol, mark_price, state):
         position_state = get_position_state(state, symbol)
 
@@ -2551,71 +2910,175 @@ class DcaWebsocketMonitor:
         stage = position_state.get("multi_tp_stage")
 
         if stage == RUNNER_ACTIVE:
-            tp1_order_id = position_state.get("tp1_order_id") or ""
-            old_sl_order_id = position_state.get("initial_sl_order_id") or ""
-            runner_sl_order_id = position_state.get("runner_sl_order_id") or ""
+            if not self._multi_tp_retry_ready(symbol):
+                return False
 
-            if (
-                (tp1_order_id or (old_sl_order_id and runner_sl_order_id)) and
-                self._multi_tp_retry_ready(symbol)
-            ):
-                lock = get_dca_lock(symbol)
+            lock = get_dca_lock(symbol)
 
-                if lock.acquire(blocking=False):
-                    try:
-                        cleanup_updates = {}
+            if not lock.acquire(blocking=False):
+                return False
 
-                        if (
-                            tp1_order_id and
-                            cancel_algo_order(symbol, tp1_order_id)
-                        ):
-                            cleanup_updates["tp1_order_id"] = ""
+            try:
+                fresh_state = load_trade_state()
+                fresh_position_state = get_position_state(fresh_state, symbol)
+                details = get_open_position_details(symbol, force=True)
+                position_detail = (details or {}).get(symbol)
 
-                        if (
-                            old_sl_order_id and
-                            runner_sl_order_id and
-                            cancel_algo_order(symbol, old_sl_order_id)
+                if not fresh_position_state or not position_detail:
+                    return False
+
+                side = str(fresh_position_state.get("side") or "").upper()
+                close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
+                position_side = position_detail.get("position_side") or "BOTH"
+                runner_tp_order_id = (
+                    fresh_position_state.get("runner_tp_order_id") or ""
+                )
+                runner_sl_order_id = (
+                    fresh_position_state.get("runner_sl_order_id") or ""
+                )
+                tp_state = self._validate_runner_order_id(
+                    symbol,
+                    runner_tp_order_id,
+                    "TAKE_PROFIT_MARKET",
+                    close_side,
+                    position_side,
+                    trigger_price=fresh_position_state.get("runner_tp_price"),
+                )
+                sl_required = bool(
+                    getattr(config, "TP1_RUNNER_STOP_ENABLED", True)
+                )
+                sl_state = (
+                    self._validate_runner_order_id(
+                        symbol,
+                        runner_sl_order_id,
+                        "STOP_MARKET",
+                        close_side,
+                        position_side,
+                        trigger_price=fresh_position_state.get("runner_sl_price"),
+                    )
+                    if sl_required
+                    else "OPEN"
+                )
+
+                if "UNAVAILABLE" in (tp_state, sl_state):
+                    self._persist_multi_tp_updates(
+                        fresh_state,
+                        symbol,
+                        {"runner_protection_error": "RUNNER_ORDER_QUERY_UNAVAILABLE"},
+                        "RUNNER_ORDER_QUERY_UNAVAILABLE",
+                    )
+                    return False
+
+                repair_updates = {}
+
+                if tp_state != "OPEN":
+                    repair_updates["runner_tp_order_id"] = ""
+
+                if sl_required and sl_state != "OPEN":
+                    repair_updates["runner_sl_order_id"] = ""
+
+                if repair_updates:
+                    repair_updates.update({
+                        "multi_tp_stage": RUNNER_PENDING,
+                        "runner_protection_error": "RUNNER_ORDER_REPAIR_REQUIRED",
+                    })
+                    self._persist_multi_tp_updates(
+                        fresh_state,
+                        symbol,
+                        repair_updates,
+                        "RUNNER_ORDER_REPAIR_REQUIRED",
+                    )
+                    return False
+
+                cleanup_updates = {}
+                tp1_order_id = fresh_position_state.get("tp1_order_id") or ""
+
+                if tp1_order_id:
+                    tp1_execution = get_algo_order_execution(
+                        symbol,
+                        tp1_order_id,
+                    )
+
+                    if tp1_execution.get("query_ok") and (
+                        not tp1_execution.get("found") or
+                        tp1_execution.get("filled")
+                    ):
+                        cleanup_updates["tp1_order_id"] = ""
+
+                old_sl_order_id = (
+                    fresh_position_state.get("initial_sl_order_id") or ""
+                )
+
+                if old_sl_order_id and runner_sl_order_id:
+                    if old_sl_order_id == runner_sl_order_id:
+                        cleanup_updates["initial_sl_order_id"] = ""
+                    else:
+                        old_sl_state = self._validate_runner_order_id(
+                            symbol,
+                            old_sl_order_id,
+                            "STOP_MARKET",
+                            close_side,
+                            position_side,
+                        )
+
+                        if old_sl_state == "OPEN" and cancel_algo_order(
+                            symbol,
+                            old_sl_order_id,
                         ):
                             cleanup_updates["initial_sl_order_id"] = ""
+                        elif old_sl_state in ("INVALID", "TERMINAL"):
+                            cleanup_updates["initial_sl_order_id"] = ""
 
-                        if cleanup_updates:
-                            update_position_runtime_fields(
-                                state,
-                                symbol,
-                                cleanup_updates,
-                            )
-                    finally:
-                        lock.release()
+                if cleanup_updates:
+                    self._persist_multi_tp_updates(
+                        fresh_state,
+                        symbol,
+                        cleanup_updates,
+                        "RUNNER_ACTIVE_CLEANUP",
+                    )
+            finally:
+                lock.release()
 
             return False
 
         if stage not in (TP1_PENDING, RUNNER_PENDING):
             return False
 
-        fill_seen = self._synced_multi_tp_fill_confirmed(
+        quantity_reduction_seen = self._synced_multi_tp_fill_confirmed(
             symbol,
             position_state,
         )
+        trigger_seen = bool(position_state.get("tp1_trigger_seen_at"))
+        trigger_now = tp1_trigger_reached(
+            position_state.get("side"),
+            mark_price,
+            position_state.get("tp1_price"),
+        )
 
-        if (
-            stage == TP1_PENDING and
-            not fill_seen and
-            not tp1_trigger_reached(
-                position_state.get("side"),
-                mark_price,
-                position_state.get("tp1_price"),
-            )
-        ):
-            return False
+        if stage == TP1_PENDING:
+            if trigger_now and not trigger_seen:
+                trigger_seen = self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {
+                        "tp1_trigger_seen_at": datetime.now().isoformat(
+                            timespec="seconds"
+                        ),
+                    },
+                    "TP1_TRIGGER_LATCH",
+                )
+
+            if not trigger_seen and not quantity_reduction_seen:
+                return False
 
         if not self._multi_tp_retry_ready(symbol):
-            return True
+            return False
 
         lock = get_dca_lock(symbol)
 
         if not lock.acquire(blocking=False):
             log_info(f"{symbol} TP1 runner transition deferred | position busy")
-            return True
+            return False
 
         try:
             fresh_state = load_trade_state()
@@ -2624,7 +3087,7 @@ class DcaWebsocketMonitor:
             if not fresh_position_state or not fresh_position_state.get(
                 "multi_tp_active"
             ):
-                return True
+                return False
 
             fresh_stage = fresh_position_state.get("multi_tp_stage")
 
@@ -2639,20 +3102,32 @@ class DcaWebsocketMonitor:
                     f"{symbol} TP1 runner transition skipped | "
                     "live position not found"
                 )
-                return True
+                return False
 
             live_quantity = abs(float(position_detail.get("quantity", 0) or 0))
 
             if fresh_stage == TP1_PENDING:
-                if not tp1_fill_confirmed(
-                    fresh_position_state.get("tp1_base_quantity"),
-                    fresh_position_state.get("tp1_quantity"),
-                    live_quantity,
-                ):
-                    return True
+                fill_confirmed, tp1_execution = self._resolve_exact_tp1_fill(
+                    symbol,
+                    fresh_state,
+                    fresh_position_state,
+                    position_detail,
+                )
 
-                runner_basis = float(mark_price)
-                update_position_runtime_fields(
+                if not fill_confirmed:
+                    return False
+
+                algo_order = (tp1_execution or {}).get("algo_order") or {}
+                runner_basis = float(
+                    algo_order.get("actualPrice") or
+                    fresh_position_state.get("tp1_price") or
+                    mark_price
+                )
+                actual_price = float(
+                    algo_order.get("actualPrice") or runner_basis
+                )
+
+                if not self._persist_multi_tp_updates(
                     fresh_state,
                     symbol,
                     {
@@ -2660,21 +3135,39 @@ class DcaWebsocketMonitor:
                         "tp1_filled_at": datetime.now().isoformat(
                             timespec="seconds"
                         ),
-                        "tp1_fill_price": fresh_position_state.get("tp1_price"),
+                        "tp1_fill_price": actual_price,
                         "runner_basis_price": runner_basis,
                         "runner_quantity": live_quantity,
                         "runner_protection_error": "",
                     },
-                )
+                    "TP1_FILL_TRANSITION",
+                ):
+                    return False
+
                 fresh_position_state = get_position_state(fresh_state, symbol)
                 tp1_order_id = fresh_position_state.get("tp1_order_id") or ""
 
-                if tp1_order_id and cancel_algo_order(symbol, tp1_order_id):
-                    update_position_runtime_fields(
+                if tp1_order_id and not cancel_algo_order(
+                    symbol,
+                    tp1_order_id,
+                ):
+                    self._persist_multi_tp_updates(
+                        fresh_state,
+                        symbol,
+                        {"runner_protection_error": "TP1_CANCEL_FAILED"},
+                        "TP1_CANCEL_FAILED",
+                    )
+                    return False
+
+                if tp1_order_id:
+                    if not self._persist_multi_tp_updates(
                         fresh_state,
                         symbol,
                         {"tp1_order_id": ""},
-                    )
+                        "TP1_ID_CLEAR",
+                    ):
+                        return False
+
                     fresh_position_state = get_position_state(
                         fresh_state,
                         symbol,
@@ -2696,12 +3189,12 @@ class DcaWebsocketMonitor:
 
         except Exception as e:
             log_error(f"{symbol} TP1 runner transition error: {e}")
-            return True
+            return False
 
         finally:
             lock.release()
 
-    def _configure_multi_tp_runner(
+    def _configure_multi_tp_runner_legacy(
         self,
         symbol,
         mark_price,
@@ -3005,6 +3498,443 @@ class DcaWebsocketMonitor:
         )
         return True
 
+    def _configure_multi_tp_runner(
+        self,
+        symbol,
+        mark_price,
+        state,
+        position_state,
+        position_detail,
+    ):
+        """Idempotently install and persist runner SL first, then TP2."""
+        side = str(position_state.get("side") or "").upper()
+
+        if side not in ("BUY", "SELL"):
+            self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_protection_error": "RUNNER_SIDE_INVALID"},
+                "RUNNER_SIDE_INVALID",
+            )
+            return False
+
+        order_side = SIDE_BUY if side == "BUY" else SIDE_SELL
+        close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
+        position_side = position_detail.get("position_side") or "BOTH"
+        original_entry = float(
+            position_state.get("avg_entry") or
+            position_state.get("initial_entry") or
+            0
+        )
+        runner_basis = float(
+            position_state.get("runner_basis_price") or mark_price or 0
+        )
+        signal_type = (
+            position_state.get("confirmation_type") or
+            position_state.get("signal_type")
+        )
+        sl_required = bool(
+            getattr(config, "TP1_RUNNER_STOP_ENABLED", True)
+        )
+
+        if original_entry <= 0 or runner_basis <= 0 or mark_price <= 0:
+            self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_protection_error": "RUNNER_BASIS_INVALID"},
+                "RUNNER_BASIS_INVALID",
+            )
+            return False
+
+        runner_tp_price = position_state.get("runner_tp_price")
+        runner_tp_mode = position_state.get("runner_tp_mode") or ""
+        runner_tp_context = position_state.get("runner_tp_context") or {}
+        runner_sl_price = position_state.get("runner_sl_price")
+        runner_sl_mode = position_state.get("runner_sl_mode") or ""
+        trend_df = confirm_df = None
+
+        if not runner_tp_price or (sl_required and not runner_sl_price):
+            trend_df, confirm_df, _ = get_signal_frames(symbol, None)
+
+        if not runner_tp_price:
+            runner_tp_price, runner_tp_mode, runner_tp_context = (
+                calculate_runner_take_profit(
+                    symbol,
+                    side,
+                    runner_basis,
+                    trend_df,
+                    confirm_df,
+                    signal_type=signal_type,
+                )
+            )
+
+        runner_tp_price = normalize_trigger_price(
+            symbol,
+            order_side,
+            "TAKE_PROFIT_MARKET",
+            runner_tp_price,
+        )
+
+        runner_tp_order_id = position_state.get("runner_tp_order_id") or ""
+
+        if runner_tp_order_id:
+            tp_id_state = self._validate_runner_order_id(
+                symbol,
+                runner_tp_order_id,
+                "TAKE_PROFIT_MARKET",
+                close_side,
+                position_side,
+                trigger_price=runner_tp_price,
+            )
+
+            if tp_id_state == "UNAVAILABLE":
+                self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_protection_error": "RUNNER_TP_QUERY_UNAVAILABLE"},
+                    "RUNNER_TP_QUERY_UNAVAILABLE",
+                )
+                return False
+
+            if tp_id_state != "OPEN":
+                if not self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_tp_order_id": ""},
+                    "RUNNER_TP_STALE_ID_CLEAR",
+                ):
+                    return False
+
+                runner_tp_order_id = ""
+
+        tp_is_ahead = (
+            runner_tp_price > mark_price
+            if side == "BUY"
+            else runner_tp_price < mark_price
+        )
+
+        if not runner_tp_order_id and not tp_is_ahead:
+            fallback_roi = max(
+                float(getattr(config, "TP2_FALLBACK_ROI", 35)),
+                0,
+            )
+
+            if str(signal_type or "").upper() == "REVERSAL":
+                reversal_max = max(
+                    float(getattr(config, "REVERSAL_TP_MAX_ROI", 45)),
+                    0,
+                )
+
+                if reversal_max > 0:
+                    fallback_roi = min(fallback_roi, reversal_max)
+
+            runner_basis = float(mark_price)
+            runner_tp_price = normalize_trigger_price(
+                symbol,
+                order_side,
+                "TAKE_PROFIT_MARKET",
+                roi_to_price(
+                    side,
+                    runner_basis,
+                    fallback_roi,
+                    leverage=config.LEVERAGE,
+                ),
+            )
+            runner_tp_mode = f"TP2_REBASED_FALLBACK_ROI_{fallback_roi}%"
+            runner_tp_context = {"reason": "TP2_REBASED_AFTER_TRIGGER"}
+
+        if runner_tp_price <= 0:
+            self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_protection_error": "RUNNER_TP_PRICE_INVALID"},
+                "RUNNER_TP_PRICE_INVALID",
+            )
+            return False
+
+        if sl_required and not runner_sl_price:
+            if confirm_df is None:
+                _, confirm_df, _ = get_signal_frames(symbol, None)
+
+            runner_sl_price, sl_context = calculate_runner_stop(
+                side,
+                original_entry,
+                mark_price,
+                confirm_df,
+                leverage=config.LEVERAGE,
+            )
+
+            if runner_sl_price is None:
+                reason = sl_context.get("reason", "RUNNER_STOP_UNAVAILABLE")
+                self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_protection_error": reason},
+                    reason,
+                )
+                return False
+
+            runner_sl_mode = (
+                f"RUNNER_{sl_context.get('source', 'PROFIT_LOCK')}"
+            )
+
+        if sl_required:
+            runner_sl_price = normalize_trigger_price(
+                symbol,
+                order_side,
+                "STOP_MARKET",
+                runner_sl_price,
+            )
+
+            sl_is_valid = (
+                runner_sl_price < mark_price
+                if side == "BUY"
+                else runner_sl_price > mark_price
+            )
+
+            if runner_sl_price <= 0 or not sl_is_valid:
+                _, confirm_df, _ = get_signal_frames(symbol, None)
+                runner_sl_price, sl_context = calculate_runner_stop(
+                    side,
+                    original_entry,
+                    mark_price,
+                    confirm_df,
+                    leverage=config.LEVERAGE,
+                )
+
+                if runner_sl_price is None:
+                    reason = sl_context.get(
+                        "reason",
+                        "RUNNER_STOP_NO_LONGER_VALID",
+                    )
+                    self._persist_multi_tp_updates(
+                        state,
+                        symbol,
+                        {"runner_protection_error": reason},
+                        reason,
+                    )
+                    return False
+
+                runner_sl_price = normalize_trigger_price(
+                    symbol,
+                    order_side,
+                    "STOP_MARKET",
+                    runner_sl_price,
+                )
+                runner_sl_mode = (
+                    f"RUNNER_{sl_context.get('source', 'PROFIT_LOCK')}"
+                )
+
+        target_updates = {
+            "runner_basis_price": runner_basis,
+            "runner_quantity": abs(
+                float(position_detail.get("quantity", 0) or 0)
+            ),
+            "runner_tp_price": runner_tp_price,
+            "runner_tp_mode": runner_tp_mode,
+            "runner_tp_context": runner_tp_context,
+            "runner_sl_price": runner_sl_price if sl_required else None,
+            "runner_sl_mode": runner_sl_mode if sl_required else "",
+            "runner_protection_error": "",
+        }
+
+        if not self._persist_multi_tp_updates(
+            state,
+            symbol,
+            target_updates,
+            "RUNNER_TARGETS",
+        ):
+            return False
+
+        position_state = get_position_state(state, symbol) or position_state
+        runner_sl_order_id = position_state.get("runner_sl_order_id") or ""
+
+        if sl_required and runner_sl_order_id:
+            sl_id_state = self._validate_runner_order_id(
+                symbol,
+                runner_sl_order_id,
+                "STOP_MARKET",
+                close_side,
+                position_side,
+                trigger_price=runner_sl_price,
+            )
+
+            if sl_id_state == "UNAVAILABLE":
+                self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_protection_error": "RUNNER_SL_QUERY_UNAVAILABLE"},
+                    "RUNNER_SL_QUERY_UNAVAILABLE",
+                )
+                return False
+
+            if sl_id_state != "OPEN":
+                if not self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_sl_order_id": ""},
+                    "RUNNER_SL_STALE_ID_CLEAR",
+                ):
+                    return False
+
+                runner_sl_order_id = ""
+
+        if sl_required and not runner_sl_order_id:
+            matching_sl = find_matching_open_algo_order(
+                symbol,
+                "STOP_MARKET",
+                close_side,
+                position_side=position_side,
+                trigger_price=runner_sl_price,
+                close_position=True,
+            )
+            runner_sl_order_id = matching_sl.get("order_id") or ""
+            placed_runner_sl = False
+
+            if not runner_sl_order_id:
+                sl_order = place_close_position_protection(
+                    symbol,
+                    order_side,
+                    "STOP_MARKET",
+                    runner_sl_price,
+                    position_side=position_side,
+                )
+                runner_sl_order_id = extract_order_id(sl_order)
+                placed_runner_sl = bool(runner_sl_order_id)
+
+            if not runner_sl_order_id:
+                self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_protection_error": "RUNNER_SL_ORDER_FAILED"},
+                    "RUNNER_SL_ORDER_FAILED",
+                )
+                return False
+
+            if not self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_sl_order_id": runner_sl_order_id},
+                "RUNNER_SL_ID",
+            ):
+                if placed_runner_sl:
+                    cancel_algo_order(symbol, runner_sl_order_id)
+                return False
+
+        position_state = get_position_state(state, symbol) or position_state
+        runner_tp_order_id = position_state.get("runner_tp_order_id") or ""
+
+        if not runner_tp_order_id:
+            matching_tp = find_matching_open_algo_order(
+                symbol,
+                "TAKE_PROFIT_MARKET",
+                close_side,
+                position_side=position_side,
+                trigger_price=runner_tp_price,
+                close_position=True,
+            )
+            runner_tp_order_id = matching_tp.get("order_id") or ""
+            placed_runner_tp = False
+
+            if not runner_tp_order_id:
+                tp_order = place_close_position_protection(
+                    symbol,
+                    order_side,
+                    "TAKE_PROFIT_MARKET",
+                    runner_tp_price,
+                    position_side=position_side,
+                )
+                runner_tp_order_id = extract_order_id(tp_order)
+                placed_runner_tp = bool(runner_tp_order_id)
+
+            if not runner_tp_order_id:
+                self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_protection_error": "RUNNER_TP_ORDER_FAILED"},
+                    "RUNNER_TP_ORDER_FAILED",
+                )
+                return False
+
+            if not self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_tp_order_id": runner_tp_order_id},
+                "RUNNER_TP_ID",
+            ):
+                if placed_runner_tp:
+                    cancel_algo_order(symbol, runner_tp_order_id)
+                return False
+
+        position_state = get_position_state(state, symbol) or position_state
+        old_sl_order_id = position_state.get("initial_sl_order_id") or ""
+        old_sl_remaining = old_sl_order_id
+
+        if old_sl_order_id and runner_sl_order_id:
+            if old_sl_order_id == runner_sl_order_id:
+                old_sl_remaining = ""
+            else:
+                old_sl_state = self._validate_runner_order_id(
+                    symbol,
+                    old_sl_order_id,
+                    "STOP_MARKET",
+                    close_side,
+                    position_side,
+                )
+
+                if old_sl_state == "OPEN":
+                    if cancel_algo_order(symbol, old_sl_order_id):
+                        old_sl_remaining = ""
+                elif old_sl_state in ("INVALID", "TERMINAL"):
+                    old_sl_remaining = ""
+
+        active_updates = {
+            "multi_tp_stage": RUNNER_ACTIVE,
+            "initial_sl_order_id": old_sl_remaining,
+            "tp_status": "CREATED",
+            "tp_price": runner_tp_price,
+            "tp_mode": runner_tp_mode,
+            "tp_context": "TP2_RUNNER",
+            "sl_status": (
+                "CREATED"
+                if sl_required
+                else position_state.get("sl_status", "DISABLED")
+            ),
+            "sl_enabled": bool(
+                runner_sl_order_id or position_state.get("sl_enabled")
+            ),
+            "sl_price": (
+                runner_sl_price
+                if runner_sl_order_id
+                else position_state.get("sl_price")
+            ),
+            "sl_source": "TP1_RUNNER",
+            "runner_protection_error": "",
+        }
+
+        if not self._persist_multi_tp_updates(
+            state,
+            symbol,
+            active_updates,
+            "RUNNER_ACTIVATION",
+        ):
+            return False
+
+        log_info(
+            f"{symbol} TP1 runner protected | TP2={runner_tp_price} | "
+            f"TP2_MODE={runner_tp_mode} | "
+            f"SL={runner_sl_price if runner_sl_order_id else 'UNCHANGED'}"
+        )
+        send_telegram_message(
+            f"{config.TELEGRAM_MESSAGE_PREFIX}\n"
+            f"{symbol} TP1 reached and partial profit booked\n"
+            f"Remaining quantity: {position_detail.get('quantity')}\n"
+            f"TP2: {runner_tp_price}\n"
+            f"Runner stop: "
+            f"{runner_sl_price if runner_sl_order_id else 'unchanged'}"
+        )
+        return True
+
     def _route_early_invalidation_context(self, position_state, mark_price):
         if not position_state or not position_state.get("managed_by_bot"):
             return None
@@ -3228,6 +4158,8 @@ class DcaWebsocketMonitor:
                 symbol,
                 amount,
                 position_side=position_side,
+                reference_price=mark_price,
+                context=f"{fresh_context['route']}_EARLY_INVALIDATION",
             )
 
             if closed:
@@ -3466,6 +4398,8 @@ class DcaWebsocketMonitor:
                 symbol,
                 amount,
                 position_side=position_side,
+                reference_price=mark_price,
+                context=f"{route}_PROFIT_RETRACE",
             )
 
             if closed:
@@ -4247,10 +5181,57 @@ def execute_entry_candidate(
             return position_details, open_positions, False
 
         side = SIDE_BUY if signal == "BUY" else SIDE_SELL
-        order = place_market_order(symbol, side, quantity)
+        pre_order_details = get_open_position_details(symbol, force=True)
+
+        if pre_order_details is None:
+            log_warning(
+                f"{symbol} entry skipped | fresh pre-order snapshot unavailable"
+            )
+            return position_details, open_positions, False
+
+        if symbol in pre_order_details:
+            log_warning(
+                f"{symbol} entry skipped | position appeared before submission"
+            )
+            return position_details, open_positions, False
+
+        order = place_market_order(
+            symbol,
+            side,
+            quantity,
+            pre_position_amount=0,
+            pre_average_price=0,
+            reference_price=current_price,
+            context="ENTRY",
+        )
 
         if not order:
             return position_details, open_positions, False
+
+        reconciliation = get_execution_reconciliation(order)
+
+        if not is_reconciled_execution_settled(order):
+            log_error(
+                f"{symbol} ENTRY EXECUTION UNSETTLED | "
+                "no duplicate fallback will be submitted"
+            )
+            fail_safe_close_unprotected_position(
+                symbol,
+                reference_price=current_price,
+                context="UNSETTLED_ENTRY",
+            )
+            return position_details, open_positions, False
+
+        filled_quantity = get_reconciled_executed_quantity(order)
+
+        if filled_quantity <= 0:
+            log_warning(f"{symbol} entry ended with a confirmed zero fill")
+            return position_details, open_positions, False
+
+        used_initial_margin = initial_margin * min(
+            filled_quantity / quantity,
+            1,
+        )
 
         entry_price = get_entry_price(symbol, order)
 
@@ -4289,7 +5270,7 @@ def execute_entry_candidate(
             symbol,
             side,
             entry_price,
-            quantity,
+            filled_quantity,
             confirm_df,
             structure_tp=structure_tp,
             signal_type=signal_type,
@@ -4302,7 +5283,13 @@ def execute_entry_candidate(
         protection_ok = bool(protection_result.get("ok"))
 
         if not protection_ok:
-            log_warning(f"{symbol} TP ORDER NOT CREATED")
+            log_error(f"{symbol} entry protection was not secured")
+            fail_safe_close_unprotected_position(
+                symbol,
+                reference_price=current_price,
+                context="ENTRY_PROTECTION",
+            )
+            return position_details, open_positions, False
 
         trade_times[symbol] = {
             "entry_time": datetime.now(),
@@ -4312,9 +5299,9 @@ def execute_entry_candidate(
             symbol,
             signal,
             entry_price,
-            quantity,
+            filled_quantity,
             config.MARGIN_PER_TRADE,
-            initial_margin,
+            used_initial_margin,
             reference_price,
             level_info
         )
@@ -4323,6 +5310,7 @@ def execute_entry_candidate(
         position_state["signal_id"] = signal_id
         position_state["signal_rank_score"] = candidate.get("rank_score")
         position_state["market_context"] = candidate.get("market_context") or {}
+        position_state["execution"] = reconciliation
         intraday_context = side_analysis.get("intraday_entry") or {}
         setup_context = intraday_context.get("setup") or {}
         trigger_context = intraday_context.get("trigger") or {}
@@ -4353,7 +5341,17 @@ def execute_entry_candidate(
         position_state["tp_updated_at"] = datetime.now().isoformat(
             timespec="seconds"
         )
-        upsert_position_state(trade_state, symbol, position_state)
+        if not upsert_position_state(trade_state, symbol, position_state):
+            log_error(
+                f"{symbol} durable entry state was not secured; "
+                "closing position as a fail-safe"
+            )
+            fail_safe_close_unprotected_position(
+                symbol,
+                reference_price=current_price,
+                context="ENTRY_STATE_PERSISTENCE",
+            )
+            return position_details, open_positions, False
         append_signal_journal(
             symbol,
             final_analysis,
@@ -4387,15 +5385,17 @@ def execute_entry_candidate(
             symbol,
             signal,
             entry_price,
-            quantity,
-            initial_margin,
+            filled_quantity,
+            used_initial_margin,
             protection_result,
             final_analysis,
             news_context,
             llm_context
         )
 
-        open_positions[symbol] = quantity if signal == "BUY" else -quantity
+        open_positions[symbol] = (
+            filled_quantity if signal == "BUY" else -filled_quantity
+        )
         order_counts = get_open_position_counts(open_positions)
         latest_position_details = get_open_position_details()
 
@@ -4551,6 +5551,7 @@ def finalize_scanned_symbol(
 def run_bot():
 
     log_info("BOT STARTED")
+    sync_client_time()
     scan_symbols = get_scan_symbols()
     log_info(
         f"Scanning {len(scan_symbols)} symbols | "

@@ -19,6 +19,8 @@ _MULTI_TP_FIELDS = {
     "tp1_base_quantity",
     "tp1_order_id",
     "initial_sl_order_id",
+    "tp1_trigger_seen_at",
+    "tp1_order_status",
     "tp1_filled_at",
     "tp1_fill_price",
     "runner_basis_price",
@@ -144,9 +146,11 @@ def save_trade_state(state):
     try:
         with _state_file_lock():
             _save_trade_state_unlocked(state)
+        return True
 
     except Exception as e:
         log_error(f"trade state save error: {e}")
+        return False
 
 
 def get_position_state(state, symbol):
@@ -154,15 +158,34 @@ def get_position_state(state, symbol):
 
 
 def upsert_position_state(state, symbol, data):
-    try:
-        with _state_file_lock():
-            latest_state = _load_trade_state_unlocked()
-            latest_state.setdefault("positions", {})[symbol] = data
-            _save_trade_state_unlocked(latest_state)
-            state["positions"] = latest_state.get("positions", {})
+    attempts = max(
+        int(getattr(config, "STATE_UPSERT_RETRY_ATTEMPTS", 3)),
+        1,
+    )
+    retry_delay = max(
+        float(getattr(config, "STATE_UPSERT_RETRY_DELAY_SECONDS", 0.25)),
+        0,
+    )
 
-    except Exception as e:
-        log_error(f"{symbol} trade state upsert error: {e}")
+    for attempt in range(1, attempts + 1):
+        try:
+            with _state_file_lock():
+                latest_state = _load_trade_state_unlocked()
+                latest_state.setdefault("positions", {})[symbol] = data
+                _save_trade_state_unlocked(latest_state)
+                state["positions"] = latest_state.get("positions", {})
+            return True
+
+        except Exception as e:
+            log_error(
+                f"{symbol} trade state upsert error | "
+                f"ATTEMPT={attempt}/{attempts}: {e}"
+            )
+
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+
+    return False
 
 
 def remove_position_state(state, symbol):
@@ -176,9 +199,11 @@ def remove_position_state(state, symbol):
                 _save_trade_state_unlocked(latest_state)
 
             state["positions"] = latest_state.get("positions", {})
+            return True
 
     except Exception as e:
         log_error(f"{symbol} trade state remove error: {e}")
+        return False
 
 
 def update_position_tp_status(state, symbol, tp_info, context=""):
@@ -379,6 +404,11 @@ def record_dca_fill(
 def _pending_dca_is_active(pending):
     if not pending:
         return False
+
+    # An ambiguous exchange acknowledgement must never age out into a duplicate
+    # DCA order. It stays reserved until reconciliation or operator repair.
+    if pending.get("execution_unsettled"):
+        return True
 
     timeout = max(float(getattr(config, "DCA_PENDING_TIMEOUT_SECONDS", 300)), 1)
 

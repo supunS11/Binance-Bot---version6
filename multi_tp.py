@@ -47,6 +47,8 @@ def build_multi_tp_state(protection_result):
         "tp1_base_quantity": result.get("tp1_base_quantity"),
         "tp1_order_id": extract_order_id(result.get("tp_order")),
         "initial_sl_order_id": extract_order_id(result.get("sl_order")),
+        "tp1_trigger_seen_at": None,
+        "tp1_order_status": "NEW",
         "tp1_filled_at": None,
         "tp1_fill_price": None,
         "runner_basis_price": None,

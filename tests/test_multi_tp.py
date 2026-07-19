@@ -128,6 +128,21 @@ class MultiTpStateTests(unittest.TestCase):
 
 
 class MultiTpExchangeTests(unittest.TestCase):
+    def setUp(self):
+        price_rules = patch.object(
+            exchange,
+            "get_symbol_price_rules",
+            return_value={
+                "available": True,
+                "tick_size": "0.01",
+                "min_price": "0.01",
+                "max_price": "1000000",
+                "precision": 2,
+            },
+        )
+        price_rules.start()
+        self.addCleanup(price_rules.stop)
+
     def test_partial_tp_is_quantity_based_and_reduce_only_in_one_way_mode(self):
         with patch.object(
             exchange,
@@ -137,7 +152,11 @@ class MultiTpExchangeTests(unittest.TestCase):
             exchange,
             "place_algo_order",
             return_value={"algoId": 123},
-        ) as place:
+        ) as place, patch.object(
+            exchange,
+            "normalize_trigger_price",
+            return_value=105,
+        ):
             order, quantity = exchange.place_partial_take_profit(
                 "BTCUSDT",
                 exchange.SIDE_BUY,
@@ -163,7 +182,11 @@ class MultiTpExchangeTests(unittest.TestCase):
             exchange,
             "place_algo_order",
             return_value={"algoId": 123},
-        ) as place:
+        ) as place, patch.object(
+            exchange,
+            "normalize_trigger_price",
+            return_value=105,
+        ):
             exchange.place_partial_take_profit(
                 "BTCUSDT",
                 exchange.SIDE_BUY,
@@ -436,6 +459,24 @@ class MultiTpMonitorTests(unittest.TestCase):
         ), patch(
             "main.cancel_algo_order",
             return_value=True,
+        ), patch(
+            "main.get_algo_order_execution",
+            return_value={
+                "query_ok": True,
+                "found": True,
+                "filled": True,
+                "triggered": True,
+                "actual_status": "FILLED",
+                "algo_status": "FINISHED",
+                "algo_order": {
+                    "orderType": "TAKE_PROFIT_MARKET",
+                    "side": "SELL",
+                    "positionSide": "BOTH",
+                    "closePosition": False,
+                    "quantity": "0.5",
+                    "actualPrice": "105",
+                },
+            },
         ), patch.object(
             monitor,
             "_configure_multi_tp_runner",
@@ -474,11 +515,11 @@ class MultiTpMonitorTests(unittest.TestCase):
         }
         state = {"positions": {"BTCUSDT": position}}
 
-        with patch("main.get_price_precision", return_value=2), patch(
-            "main.get_open_stop_loss_info",
-            return_value={},
+        with patch(
+            "main.normalize_trigger_price",
+            side_effect=lambda symbol, side, order_type, price: float(price),
         ), patch(
-            "main.get_open_take_profit_info",
+            "main.find_matching_open_algo_order",
             return_value={},
         ), patch(
             "main.place_close_position_protection",
@@ -491,6 +532,10 @@ class MultiTpMonitorTests(unittest.TestCase):
             side_effect=apply_updates,
         ), patch(
             "main.send_telegram_message",
+        ), patch.object(
+            monitor,
+            "_validate_runner_order_id",
+            return_value="OPEN",
         ):
             handled = monitor._configure_multi_tp_runner(
                 "BTCUSDT",

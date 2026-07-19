@@ -2,19 +2,31 @@ from binance.client import Client
 from binance.enums import *
 
 from collections import deque
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import (
+    Decimal,
+    InvalidOperation,
+    ROUND_DOWN,
+    ROUND_HALF_UP,
+    ROUND_UP,
+)
 import pandas as pd
 import re
 import threading
 import time
+import uuid
 import numpy as np
 
 import config
 from indicators import apply_indicators
 from logger import log_info, log_warning, log_error
+from execution_telemetry import (
+    aggregate_order_execution,
+    append_execution_telemetry,
+    calculate_slippage_bps,
+)
 
 
-client = Client(config.API_KEY, config.SECRET_KEY)
+client = Client(config.API_KEY, config.SECRET_KEY, ping=False)
 _exchange_info_cache = None
 _last_kline_request_at = 0.0
 _public_rest_backoff_until = 0.0
@@ -38,11 +50,22 @@ _private_position_cache_lock = threading.Lock()
 _BAN_UNTIL_RE = re.compile(r"banned until\s+(\d+)", re.IGNORECASE)
 _RATE_LIMIT_RE = re.compile(r"(code=-1003|too many requests)", re.IGNORECASE)
 
-# =========================
-# SYNC TIME
-# =========================
-server_time = client.get_server_time()
-client.timestamp_offset = server_time['serverTime'] - int(time.time() * 1000)
+def sync_client_time():
+    try:
+        server_time = client.get_server_time()
+        client.timestamp_offset = (
+            server_time["serverTime"] - int(time.time() * 1000)
+        )
+        return True
+
+    except Exception as exc:
+        client.timestamp_offset = 0
+        log_warning(
+            "Binance startup time sync unavailable; "
+            "using zero timestamp offset | "
+            f"ERROR={exc}"
+        )
+        return False
 
 
 def _throttle_kline_request():
@@ -960,6 +983,64 @@ def get_mark_price(symbol):
         return None
 
 
+def get_book_ticker(symbol):
+    try:
+        response = _public_rest_call(
+            f"futures_orderbook_ticker:{symbol}",
+            client.futures_orderbook_ticker,
+            symbol=symbol,
+            weight=getattr(config, "SMART_EXECUTION_BOOK_TICKER_WEIGHT", 2),
+        )
+        bid = _to_float((response or {}).get("bidPrice"), 0) or 0
+        ask = _to_float((response or {}).get("askPrice"), 0) or 0
+        bid_quantity = _to_float((response or {}).get("bidQty"), 0) or 0
+        ask_quantity = _to_float((response or {}).get("askQty"), 0) or 0
+
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+
+        return {
+            "symbol": symbol,
+            "bid": bid,
+            "ask": ask,
+            "bid_quantity": max(bid_quantity, 0),
+            "ask_quantity": max(ask_quantity, 0),
+            "mid": (bid + ask) / 2,
+            "spread_bps": ((ask - bid) / ((bid + ask) / 2)) * 10000,
+        }
+
+    except Exception as exc:
+        log_warning(f"{symbol} book ticker unavailable: {exc}")
+        return None
+
+
+def get_futures_depth_snapshot(symbol, limit=None):
+    limit = max(
+        int(
+            limit or getattr(
+                config,
+                "ORDER_FLOW_SHADOW_DEPTH_SNAPSHOT_LIMIT",
+                1000,
+            )
+        ),
+        5,
+    )
+    weight = 20 if limit >= 1000 else 10 if limit >= 500 else 5
+
+    try:
+        return _public_rest_call(
+            f"futures_order_book:{symbol}",
+            client.futures_order_book,
+            symbol=symbol,
+            limit=limit,
+            weight=weight,
+        )
+
+    except Exception as exc:
+        log_warning(f"{symbol} depth snapshot unavailable: {exc}")
+        return None
+
+
 # =========================
 # KLINES
 # =========================
@@ -1201,6 +1282,147 @@ def _cancel_algo_order(symbol, algo_id):
     )
 
 
+def _get_algo_order(symbol, algo_id=None, client_algo_id=None):
+    params = {"symbol": symbol}
+
+    if algo_id:
+        params["algoId"] = algo_id
+    elif client_algo_id:
+        params["clientAlgoId"] = client_algo_id
+    else:
+        raise ValueError("algo_id or client_algo_id is required")
+
+    method = getattr(client, "futures_get_algo_order", None)
+
+    if method:
+        return _private_rest_call(
+            f"futures_get_algo_order:{symbol}",
+            method,
+            **params,
+        )
+
+    return _private_rest_call(
+        f"futures_get_algo_order:{symbol}",
+        client._request_futures_api,
+        "get",
+        "algoOrder",
+        True,
+        data=params,
+    )
+
+
+def _normalise_algo_order_response(response):
+    if not isinstance(response, dict):
+        return {}
+
+    data = response.get("data")
+
+    if isinstance(data, dict):
+        return data
+
+    return response
+
+
+def get_algo_order_info(symbol, algo_id=None, client_algo_id=None):
+    """Return an exact conditional-order lookup with explicit query state."""
+    identity = algo_id or client_algo_id or ""
+
+    try:
+        order = _normalise_algo_order_response(
+            _get_algo_order(
+                symbol,
+                algo_id=algo_id,
+                client_algo_id=client_algo_id,
+            )
+        )
+        order["_query_ok"] = True
+        order["_found"] = bool(
+            order.get("algoId") or order.get("clientAlgoId")
+        )
+        return order
+
+    except Exception as exc:
+        message = str(exc).lower()
+        not_found = (
+            "unknown order" in message or
+            "order does not exist" in message or
+            "not found" in message
+        )
+
+        if not not_found:
+            log_warning(
+                f"{symbol} exact algo lookup failed | ID={identity} | ERROR={exc}"
+            )
+
+        return {
+            "algoId": algo_id or "",
+            "clientAlgoId": client_algo_id or "",
+            "_query_ok": bool(not_found),
+            "_found": False,
+            "_error": str(exc),
+        }
+
+
+def get_algo_order_execution(symbol, algo_id):
+    """Resolve an algo order and, when triggered, its exact child order."""
+    algo_order = get_algo_order_info(symbol, algo_id=algo_id)
+    result = {
+        "query_ok": bool(algo_order.get("_query_ok")),
+        "found": bool(algo_order.get("_found")),
+        "algo_order": algo_order,
+        "algo_status": str(algo_order.get("algoStatus") or "").upper(),
+        "actual_order": {},
+        "actual_status": "",
+        "executed_quantity": max(
+            _execution_quantity(algo_order.get("actualQty")),
+            _execution_quantity(algo_order.get("executedQty")),
+        ),
+        "triggered": bool(algo_order.get("actualOrderId")),
+        "filled": False,
+        "open": False,
+    }
+
+    if not result["found"]:
+        return result
+
+    actual_order_id = algo_order.get("actualOrderId")
+
+    if actual_order_id:
+        try:
+            actual_order = _private_rest_call(
+                f"futures_get_order:{symbol}",
+                client.futures_get_order,
+                symbol=symbol,
+                orderId=actual_order_id,
+            )
+            actual_order = actual_order if isinstance(actual_order, dict) else {}
+            result["actual_order"] = actual_order
+            result["actual_status"] = str(
+                actual_order.get("status") or ""
+            ).upper()
+            result["executed_quantity"] = max(
+                result["executed_quantity"],
+                _execution_quantity(actual_order.get("executedQty")),
+            )
+        except Exception as exc:
+            result["actual_order_error"] = str(exc)
+
+    algo_status = result["algo_status"]
+    result["open"] = algo_status in {
+        "NEW",
+        "PENDING",
+        "WORKING",
+        "ACTIVE",
+    }
+    # `actualQty` may equal the requested quantity even on an untriggered,
+    # canceled algo order. Only the exact triggered child order can prove fill.
+    result["filled"] = bool(
+        result["triggered"] and
+        result["actual_status"] == "FILLED"
+    )
+    return result
+
+
 def cancel_algo_order(symbol, algo_id):
     if not algo_id:
         return True
@@ -1242,6 +1464,99 @@ def _order_trigger_price(order):
             return value
 
     return ""
+
+
+def find_matching_open_algo_order(
+    symbol,
+    order_type,
+    close_side,
+    position_side=None,
+    trigger_price=None,
+    close_position=None,
+    quantity=None,
+):
+    """Find only a protection order whose intent matches every supplied field."""
+    try:
+        orders = _normalise_algo_orders(_get_open_algo_orders(symbol))
+    except Exception as exc:
+        log_warning(f"{symbol} matching algo lookup error: {exc}")
+        return {}
+
+    expected_type = str(order_type or "").upper()
+    expected_side = str(close_side or "").upper()
+    expected_position_side = str(position_side or "BOTH").upper()
+    expected_close_position = (
+        None
+        if close_position is None
+        else bool(close_position)
+    )
+    target_price = _to_float(trigger_price, None)
+    target_quantity = _to_float(quantity, None)
+    price_rules = get_symbol_price_rules(symbol)
+    price_tolerance = max(
+        float(_to_float(price_rules.get("tick_size"), 0) or 0),
+        abs(float(target_price or 0)) * 1e-9,
+        1e-12,
+    )
+
+    for order in orders:
+        current_type = str(
+            order.get("orderType") or order.get("type") or ""
+        ).upper()
+        current_side = str(order.get("side") or "").upper()
+        current_position_side = str(
+            order.get("positionSide") or "BOTH"
+        ).upper()
+
+        if current_type != expected_type or current_side != expected_side:
+            continue
+
+        if current_position_side != expected_position_side:
+            continue
+
+        if expected_close_position is not None:
+            current_close_position = str(
+                order.get("closePosition", False)
+            ).lower() == "true"
+
+            if current_close_position != expected_close_position:
+                continue
+
+        if target_price is not None:
+            current_price = _to_float(_order_trigger_price(order), None)
+
+            if (
+                current_price is None or
+                abs(float(current_price) - float(target_price)) > price_tolerance
+            ):
+                continue
+
+        if target_quantity is not None:
+            current_quantity = _to_float(order.get("quantity"), None)
+            quantity_tolerance = max(abs(float(target_quantity)) * 1e-6, 1e-12)
+
+            if (
+                current_quantity is None or
+                abs(float(current_quantity) - float(target_quantity)) >
+                quantity_tolerance
+            ):
+                continue
+
+        return {
+            "price": _order_trigger_price(order),
+            "type": current_type,
+            "side": current_side,
+            "position_side": current_position_side,
+            "close_position": str(
+                order.get("closePosition", False)
+            ).lower() == "true",
+            "quantity": order.get("quantity"),
+            "order_id": order.get("algoId", ""),
+            "client_order_id": order.get("clientAlgoId", ""),
+            "order": order,
+        }
+
+    return {}
 
 
 def get_open_take_profit_info(symbol):
@@ -1422,6 +1737,90 @@ def get_price_precision(symbol):
     return 4
 
 
+def get_symbol_price_rules(symbol):
+    try:
+        for item in get_exchange_info().get("symbols", []):
+            if item.get("symbol") != symbol:
+                continue
+
+            filters = {
+                entry.get("filterType"): entry
+                for entry in item.get("filters", [])
+            }
+            price_filter = filters.get("PRICE_FILTER") or {}
+            return {
+                "available": True,
+                "tick_size": price_filter.get("tickSize", "0"),
+                "min_price": price_filter.get("minPrice", "0"),
+                "max_price": price_filter.get("maxPrice", "0"),
+                "precision": int(item.get("pricePrecision", 4)),
+            }
+
+    except Exception as exc:
+        log_warning(f"{symbol} price rule lookup warning: {exc}")
+
+    return {
+        "available": False,
+        "tick_size": "0",
+        "min_price": "0",
+        "max_price": "0",
+        "precision": 8,
+    }
+
+
+def normalize_order_price(symbol, price, rounding="nearest"):
+    try:
+        rules = get_symbol_price_rules(symbol)
+
+        if not rules.get("available", True):
+            return 0.0
+
+        value = Decimal(str(float(price)))
+        tick = Decimal(str(rules.get("tick_size") or "0"))
+        minimum = Decimal(str(rules.get("min_price") or "0"))
+        maximum = Decimal(str(rules.get("max_price") or "0"))
+
+        if value <= 0:
+            return 0.0
+
+        if tick <= 0:
+            precision = max(int(rules.get("precision", 4)), 0)
+            return round(float(value), precision)
+
+        rounding_mode = {
+            "down": ROUND_DOWN,
+            "up": ROUND_UP,
+            "nearest": ROUND_HALF_UP,
+        }.get(str(rounding or "nearest").lower(), ROUND_HALF_UP)
+        steps = (value / tick).to_integral_value(rounding=rounding_mode)
+        normalized = steps * tick
+
+        if minimum > 0:
+            normalized = max(normalized, minimum)
+
+        if maximum > 0:
+            normalized = min(normalized, maximum)
+
+        return float(normalized)
+
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        log_warning(f"{symbol} price normalization warning: {exc}")
+        return 0.0
+
+
+def normalize_trigger_price(symbol, side, order_type, price):
+    side = str(side or "").upper()
+    order_type = str(order_type or "").upper()
+    take_profit = "TAKE_PROFIT" in order_type
+
+    if side == SIDE_BUY:
+        rounding = "down" if take_profit else "up"
+    else:
+        rounding = "up" if take_profit else "down"
+
+    return normalize_order_price(symbol, price, rounding=rounding)
+
+
 def get_symbol_quantity_rules(symbol):
     try:
         for item in get_exchange_info().get("symbols", []):
@@ -1438,6 +1837,7 @@ def get_symbol_quantity_rules(symbol):
                 {}
             )
             return {
+                "available": True,
                 "step_size": lot_size.get("stepSize", "1"),
                 "min_qty": lot_size.get("minQty", "0"),
                 "max_qty": lot_size.get("maxQty", "0"),
@@ -1446,18 +1846,22 @@ def get_symbol_quantity_rules(symbol):
     except Exception as e:
         log_warning(f"{symbol} quantity rule lookup warning: {e}")
 
-    precision = get_symbol_precision(symbol)
     return {
-        "step_size": str(10 ** -precision),
+        "available": False,
+        "step_size": "0",
         "min_qty": "0",
         "max_qty": "0",
-        "precision": precision,
+        "precision": 8,
     }
 
 
 def normalize_order_quantity(symbol, quantity, round_down=True):
     try:
         rules = get_symbol_quantity_rules(symbol)
+
+        if not rules.get("available", True):
+            return 0.0
+
         value = Decimal(str(abs(float(quantity))))
         step = Decimal(str(rules.get("step_size") or "1"))
         min_qty = Decimal(str(rules.get("min_qty") or "0"))
@@ -1528,27 +1932,1010 @@ def get_entry_price(symbol, order=None):
 # =========================
 # MARKET ORDER
 # =========================
-def place_market_order(symbol, side, quantity):
+def _execution_position_detail(symbol, position_side=None, expected_side=None):
+    rows = get_open_position_detail_rows(symbol, force=True)
+
+    if rows is None:
+        return False, None
+
+    position_side = str(position_side or "").upper()
+    expected_side = str(expected_side or "").upper()
+
+    if position_side in ("LONG", "SHORT"):
+        for detail in rows:
+            if detail.get("position_side") == position_side:
+                return True, detail
+
+        return True, None
+
+    if expected_side in ("BUY", "SELL"):
+        for detail in rows:
+            if detail.get("side") == expected_side:
+                return True, detail
+
+        return True, None
+
+    if len(rows) == 1:
+        return True, rows[0]
+
+    return True, None
+
+
+def _execution_quantity(value):
+    return max(float(_to_float(value, 0) or 0), 0)
+
+
+def _normalised_residual_quantity(symbol, requested_quantity, executed_quantity):
+    residual = max(
+        _execution_quantity(requested_quantity) -
+        _execution_quantity(executed_quantity),
+        0,
+    )
+    tolerance = max(_execution_quantity(requested_quantity) * 1e-9, 1e-12)
+
+    if residual <= tolerance:
+        return 0.0, 0.0
+
+    return residual, normalize_order_quantity(symbol, residual)
+
+
+def _wait_for_position_reconciliation(
+    symbol,
+    position_side=None,
+    expected_side=None,
+    accept_condition=None,
+):
+    attempts = max(
+        int(getattr(config, "EXECUTION_VERIFY_ATTEMPTS", 4)),
+        1,
+    )
+    delay_seconds = max(
+        float(getattr(config, "EXECUTION_VERIFY_DELAY_SECONDS", 0.25)),
+        0,
+    )
+    last_detail = None
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1 and delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+        available, detail = _execution_position_detail(
+            symbol,
+            position_side=position_side,
+            expected_side=expected_side,
+        )
+
+        if available:
+            last_detail = detail
+
+            if accept_condition is None or accept_condition(detail):
+                return True, detail, attempt
+
+    return False, last_detail, attempts
+
+
+def _inferred_entry_fill_price(
+    pre_position_amount,
+    pre_average_price,
+    post_position_detail,
+    executed_quantity,
+):
+    executed_quantity = _execution_quantity(executed_quantity)
+
+    if executed_quantity <= 0 or not post_position_detail:
+        return 0
+
+    post_average = _execution_quantity(post_position_detail.get("entry_price"))
+    post_quantity = abs(
+        float(_to_float(post_position_detail.get("amount"), 0) or 0)
+    )
+    pre_quantity = abs(float(_to_float(pre_position_amount, 0) or 0))
+    pre_average = _execution_quantity(pre_average_price)
+
+    if pre_quantity <= 0:
+        return post_average
+
+    if post_average <= 0 or post_quantity <= pre_quantity or pre_average <= 0:
+        return 0
+
+    inferred_quote = (
+        (post_average * post_quantity) -
+        (pre_average * pre_quantity)
+    )
+    return max(inferred_quote / executed_quantity, 0)
+
+
+def _enrich_reconciled_order(order, reconciliation):
+    result = dict(order or {})
+    result["executedQty"] = str(
+        round(_execution_quantity(reconciliation.get("executed_quantity")), 12)
+    )
+    average_fill_price = _execution_quantity(
+        reconciliation.get("average_fill_price")
+    )
+
+    if average_fill_price > 0:
+        result["avgPrice"] = str(round(average_fill_price, 12))
+
+    result["_execution_reconciliation"] = reconciliation
+    return result
+
+
+def get_execution_reconciliation(order):
+    if not isinstance(order, dict):
+        return {}
+
+    reconciliation = order.get("_execution_reconciliation")
+    return reconciliation if isinstance(reconciliation, dict) else {}
+
+
+def get_reconciled_executed_quantity(order, fallback=0):
+    if isinstance(order, dict):
+        reconciliation = get_execution_reconciliation(order)
+        value = reconciliation.get("executed_quantity")
+
+        if value is not None:
+            return _execution_quantity(value)
+
+        if "executedQty" in order:
+            return _execution_quantity(order.get("executedQty"))
+
+    return _execution_quantity(fallback)
+
+
+def is_reconciled_execution_settled(order):
+    if not isinstance(order, dict):
+        return False
+
+    reconciliation = order.get("_execution_reconciliation")
+
+    if not isinstance(reconciliation, dict):
+        return True
+
+    return bool(reconciliation.get("order_terminal", True))
+
+
+_TERMINAL_EXECUTION_ORDER_STATUSES = {
+    "FILLED",
+    "CANCELED",
+    "CANCELLED",
+    "EXPIRED",
+    "EXPIRED_IN_MATCH",
+    "REJECTED",
+}
+
+
+def _new_execution_client_order_id(label="m"):
+    timestamp = int(time.time() * 1000)
+    label = re.sub(r"[^a-zA-Z0-9]", "", str(label or "m"))[:4]
+    return f"v6{label}-{timestamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _execution_order_is_terminal(order):
+    status = str((order or {}).get("status") or "").upper()
+    return status in _TERMINAL_EXECUTION_ORDER_STATUSES
+
+
+def _resolve_entry_order(symbol, client_order_id, initial_order=None):
+    latest_order = initial_order if isinstance(initial_order, dict) else None
+    errors = []
+    attempts = max(
+        int(getattr(config, "EXECUTION_VERIFY_ATTEMPTS", 4)),
+        1,
+    )
+    delay_seconds = max(
+        float(getattr(config, "EXECUTION_VERIFY_DELAY_SECONDS", 0.25)),
+        0,
+    )
+
+    for attempt in range(1, attempts + 1):
+        if _execution_order_is_terminal(latest_order):
+            return latest_order, True, attempt - 1, errors
+
+        if attempt > 1 and delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+        try:
+            queried_order = _private_rest_call(
+                f"futures_get_order:{symbol}",
+                client.futures_get_order,
+                symbol=symbol,
+                origClientOrderId=client_order_id,
+            )
+
+            if isinstance(queried_order, dict):
+                latest_order = queried_order
+
+        except Exception as exc:
+            errors.append(str(exc))
+
+    return (
+        latest_order,
+        _execution_order_is_terminal(latest_order),
+        attempts,
+        errors,
+    )
+
+
+def _cancel_unsettled_entry_order(symbol, client_order_id):
+    try:
+        response = _private_rest_call(
+            f"futures_cancel_order:{symbol}",
+            client.futures_cancel_order,
+            symbol=symbol,
+            origClientOrderId=client_order_id,
+        )
+        _clear_position_cache(symbol)
+        return response if isinstance(response, dict) else None, ""
+
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _submit_entry_market_order(
+    symbol,
+    side,
+    quantity,
+    client_order_id=None,
+):
+    client_order_id = client_order_id or _new_execution_client_order_id("m")
 
     try:
-
-        order = _private_rest_call(
+        return _private_rest_call(
             f"futures_create_order:{symbol}",
             client.futures_create_order,
             symbol=symbol,
             side=side,
             type=FUTURE_ORDER_TYPE_MARKET,
             quantity=quantity,
-            newOrderRespType="RESULT"
+            newOrderRespType="RESULT",
+            newClientOrderId=client_order_id,
         )
 
+    finally:
         _clear_position_cache(symbol)
-        log_info(f"{symbol} MARKET ORDER: {side}")
-        return order
 
-    except Exception as e:
-        log_error(f"{symbol} order error: {e}")
+
+def _place_reconciled_market_order(
+    symbol,
+    side,
+    quantity,
+    pre_position_amount=None,
+    pre_average_price=None,
+    reference_price=None,
+    context="ENTRY",
+    execution_mode="MARKET",
+    fallback_used=False,
+):
+    requested_quantity = _execution_quantity(quantity)
+
+    if requested_quantity <= 0:
         return None
+
+    if not getattr(config, "EXECUTION_RECONCILIATION_ENABLED", True):
+        try:
+            order = _submit_entry_market_order(symbol, side, requested_quantity)
+            log_info(f"{symbol} MARKET ORDER: {side}")
+            return order
+        except Exception as exc:
+            log_error(f"{symbol} order error: {exc}")
+            return None
+
+    started_at = time.monotonic()
+    expected_side = "BUY" if str(side).upper() == "BUY" else "SELL"
+    direction = 1 if expected_side == "BUY" else -1
+    pre_detail = None
+
+    if pre_position_amount is None:
+        _, pre_detail = _execution_position_detail(
+            symbol,
+            expected_side=expected_side,
+        )
+        pre_position_amount = (
+            float(pre_detail.get("amount", 0) or 0)
+            if pre_detail
+            else 0
+        )
+
+        if pre_average_price is None and pre_detail:
+            pre_average_price = pre_detail.get("entry_price")
+
+    pre_position_amount = float(_to_float(pre_position_amount, 0) or 0)
+    residual_retry_attempts = max(
+        int(getattr(config, "EXECUTION_RESIDUAL_RETRY_ATTEMPTS", 1)),
+        0,
+    )
+    orders = []
+    client_order_ids = []
+    errors = []
+    submission_attempts = 0
+    submitted_quantity = 0.0
+    verification_attempts = 0
+    position_verified = False
+    all_submissions_terminal = True
+    post_detail = None
+    executed_quantity = 0.0
+    remaining_to_submit = requested_quantity
+
+    for _ in range(residual_retry_attempts + 1):
+        submit_quantity = normalize_order_quantity(symbol, remaining_to_submit)
+
+        if submit_quantity <= 0:
+            break
+
+        submission_attempts += 1
+        submitted_quantity += submit_quantity
+        client_order_id = _new_execution_client_order_id("m")
+        client_order_ids.append(client_order_id)
+        submitted_order = None
+
+        try:
+            submitted_order = _submit_entry_market_order(
+                symbol,
+                side,
+                submit_quantity,
+                client_order_id=client_order_id,
+            )
+            log_info(
+                f"{symbol} MARKET ORDER: {side} | "
+                f"ATTEMPT={submission_attempts} | QTY={submit_quantity}"
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+            log_error(
+                f"{symbol} order error | ATTEMPT={submission_attempts}: {exc}"
+            )
+
+        resolved_order, order_terminal, status_attempts, status_errors = (
+            _resolve_entry_order(
+                symbol,
+                client_order_id,
+                initial_order=submitted_order,
+            )
+        )
+        verification_attempts += status_attempts
+        errors.extend(status_errors)
+
+        if not order_terminal:
+            cancel_order, cancel_error = _cancel_unsettled_entry_order(
+                symbol,
+                client_order_id,
+            )
+
+            if cancel_error:
+                errors.append(cancel_error)
+
+            resolved_order, order_terminal, status_attempts, status_errors = (
+                _resolve_entry_order(
+                    symbol,
+                    client_order_id,
+                    initial_order=cancel_order or resolved_order,
+                )
+            )
+            verification_attempts += status_attempts
+            errors.extend(status_errors)
+
+        if resolved_order:
+            orders.append(resolved_order)
+
+        if not order_terminal:
+            all_submissions_terminal = False
+
+        known_execution = aggregate_order_execution(orders)[
+            "executed_quantity"
+        ]
+
+        def entry_position_updated(detail):
+            post_amount = (
+                float(detail.get("amount", 0) or 0)
+                if detail
+                else 0
+            )
+            delta = max(
+                (post_amount - pre_position_amount) * direction,
+                0,
+            )
+            required_delta = min(
+                max(known_execution, 1e-12),
+                requested_quantity,
+            )
+            return delta + 1e-12 >= required_delta
+
+        reconciled, detail, verify_count = _wait_for_position_reconciliation(
+            symbol,
+            expected_side=expected_side,
+            accept_condition=entry_position_updated,
+        )
+        verification_attempts += verify_count
+
+        if detail is not None:
+            post_detail = detail
+
+        if reconciled:
+            position_verified = True
+            post_amount = (
+                float(detail.get("amount", 0) or 0)
+                if detail
+                else 0
+            )
+            position_delta = max(
+                (post_amount - pre_position_amount) * direction,
+                0,
+            )
+            executed_quantity = min(position_delta, requested_quantity)
+
+        aggregate = aggregate_order_execution(orders)
+        executed_quantity = min(
+            max(executed_quantity, aggregate["executed_quantity"]),
+            requested_quantity,
+        )
+        residual_quantity, retry_quantity = _normalised_residual_quantity(
+            symbol,
+            requested_quantity,
+            executed_quantity,
+        )
+
+        if retry_quantity <= 0:
+            break
+
+        if not order_terminal:
+            log_warning(
+                f"{symbol} residual entry retry skipped | "
+                f"ORDER_STATUS_NOT_TERMINAL | "
+                f"CLIENT_ORDER_ID={client_order_id}"
+            )
+            break
+
+        remaining_to_submit = retry_quantity
+
+    aggregate = aggregate_order_execution(orders)
+    residual_quantity, retry_quantity = _normalised_residual_quantity(
+        symbol,
+        requested_quantity,
+        executed_quantity,
+    )
+    fully_filled = (
+        all_submissions_terminal and
+        executed_quantity > 0 and
+        retry_quantity <= 0
+    )
+    average_fill_price = aggregate["average_fill_price"]
+
+    if average_fill_price <= 0:
+        average_fill_price = _inferred_entry_fill_price(
+            pre_position_amount,
+            pre_average_price,
+            post_detail,
+            executed_quantity,
+        )
+
+    post_position_amount = (
+        float(post_detail.get("amount", 0) or 0)
+        if post_detail
+        else pre_position_amount + (executed_quantity * direction)
+    )
+    status = (
+        "FILLED"
+        if fully_filled
+        else "PENDING"
+        if not all_submissions_terminal
+        else "PARTIAL"
+        if executed_quantity > 0
+        else "FAILED"
+    )
+    reconciliation = {
+        "context": str(context or "ENTRY").upper(),
+        "execution_mode": execution_mode,
+        "fallback_used": bool(fallback_used),
+        "requested_quantity": requested_quantity,
+        "submitted_quantity": round(submitted_quantity, 12),
+        "executed_quantity": executed_quantity,
+        "residual_quantity": residual_quantity,
+        "fallback_quantity": requested_quantity if fallback_used else 0,
+        "fully_filled": fully_filled,
+        "order_terminal": all_submissions_terminal,
+        "position_verified": position_verified,
+        "position_closed": False,
+        "average_fill_price": average_fill_price,
+        "reference_price": _execution_quantity(reference_price),
+        "status": status,
+        "submission_attempts": submission_attempts,
+        "verification_attempts": verification_attempts,
+        "pre_position_amount": pre_position_amount,
+        "post_position_amount": post_position_amount,
+        "order_ids": aggregate["order_ids"],
+        "client_order_ids": ",".join(client_order_ids),
+        "error": " | ".join(errors),
+    }
+    latency_ms = round((time.monotonic() - started_at) * 1000, 2)
+    fill_ratio_pct = round(
+        (executed_quantity / requested_quantity) * 100,
+        4,
+    )
+    append_execution_telemetry({
+        **reconciliation,
+        "symbol": symbol,
+        "order_side": str(side).upper(),
+        "position_side": "",
+        "fill_ratio_pct": fill_ratio_pct,
+        "slippage_bps": calculate_slippage_bps(
+            side,
+            reference_price,
+            average_fill_price,
+        ),
+        "latency_ms": latency_ms,
+        "commission": aggregate["commission"],
+        "commission_asset": aggregate["commission_asset"],
+    })
+
+    if executed_quantity <= 0 and all_submissions_terminal:
+        return None
+
+    if not all_submissions_terminal:
+        log_error(
+            f"{symbol} MARKET ORDER UNSETTLED | SIDE={side} | "
+            f"OBSERVED={executed_quantity}/{requested_quantity} | "
+            f"RESIDUAL={residual_quantity} | "
+            f"CLIENT_ORDER_IDS={','.join(client_order_ids)}"
+        )
+    elif not fully_filled:
+        log_warning(
+            f"{symbol} MARKET ORDER PARTIAL | SIDE={side} | "
+            f"FILLED={executed_quantity}/{requested_quantity} | "
+            f"RESIDUAL={residual_quantity}"
+        )
+
+    return _enrich_reconciled_order(
+        orders[-1] if orders else None,
+        reconciliation,
+    )
+
+
+def _submit_entry_ioc_limit_order(
+    symbol,
+    side,
+    quantity,
+    limit_price,
+    client_order_id,
+):
+    try:
+        return _private_rest_call(
+            f"futures_create_order_smart:{symbol}",
+            client.futures_create_order,
+            symbol=symbol,
+            side=side,
+            type=FUTURE_ORDER_TYPE_LIMIT,
+            timeInForce=str(
+                getattr(config, "SMART_EXECUTION_TIME_IN_FORCE", "IOC")
+            ).upper(),
+            quantity=quantity,
+            price=limit_price,
+            newOrderRespType="RESULT",
+            newClientOrderId=client_order_id,
+        )
+
+    finally:
+        _clear_position_cache(symbol)
+
+
+def _smart_execution_context_enabled(context):
+    normalized = str(context or "ENTRY").upper()
+
+    if normalized.startswith("DCA"):
+        normalized = "DCA"
+
+    return normalized in getattr(
+        config,
+        "SMART_EXECUTION_CONTEXTS",
+        {"ENTRY", "DCA"},
+    )
+
+
+def _place_smart_entry_order(
+    symbol,
+    side,
+    quantity,
+    pre_position_amount=None,
+    pre_average_price=None,
+    reference_price=None,
+    context="ENTRY",
+):
+    requested_quantity = _execution_quantity(quantity)
+
+    if requested_quantity <= 0:
+        return None
+
+    quote = get_book_ticker(symbol)
+
+    if not quote:
+        log_warning(
+            f"{symbol} smart execution quote unavailable; using market fallback"
+        )
+        return _place_reconciled_market_order(
+            symbol,
+            side,
+            requested_quantity,
+            pre_position_amount=pre_position_amount,
+            pre_average_price=pre_average_price,
+            reference_price=reference_price,
+            context=context,
+            execution_mode="MARKET_QUOTE_FALLBACK",
+            fallback_used=True,
+        )
+
+    started_at = time.monotonic()
+    expected_side = "BUY" if str(side).upper() == "BUY" else "SELL"
+    direction = 1 if expected_side == "BUY" else -1
+    pre_detail = None
+
+    if pre_position_amount is None:
+        _, pre_detail = _execution_position_detail(
+            symbol,
+            expected_side=expected_side,
+        )
+        pre_position_amount = (
+            float(pre_detail.get("amount", 0) or 0)
+            if pre_detail
+            else 0
+        )
+
+        if pre_average_price is None and pre_detail:
+            pre_average_price = pre_detail.get("entry_price")
+
+    pre_position_amount = float(_to_float(pre_position_amount, 0) or 0)
+    reference_price = _execution_quantity(
+        reference_price or quote.get("mid")
+    )
+    cross_bps = max(
+        float(getattr(config, "SMART_EXECUTION_MAX_CROSS_BPS", 2.0)),
+        0,
+    )
+    raw_limit_price = (
+        quote["ask"] * (1 + cross_bps / 10000)
+        if expected_side == "BUY"
+        else quote["bid"] * (1 - cross_bps / 10000)
+    )
+    limit_price = normalize_order_price(
+        symbol,
+        raw_limit_price,
+        rounding="up" if expected_side == "BUY" else "down",
+    )
+    submit_quantity = normalize_order_quantity(symbol, requested_quantity)
+
+    if limit_price <= 0 or submit_quantity <= 0:
+        return _place_reconciled_market_order(
+            symbol,
+            side,
+            requested_quantity,
+            pre_position_amount=pre_position_amount,
+            pre_average_price=pre_average_price,
+            reference_price=reference_price,
+            context=context,
+            execution_mode="MARKET_PRICE_RULE_FALLBACK",
+            fallback_used=True,
+        )
+
+    client_order_id = _new_execution_client_order_id("ioc")
+    errors = []
+    submitted_order = None
+
+    try:
+        submitted_order = _submit_entry_ioc_limit_order(
+            symbol,
+            side,
+            submit_quantity,
+            limit_price,
+            client_order_id,
+        )
+        log_info(
+            f"{symbol} SMART IOC ORDER | SIDE={side} | "
+            f"QTY={submit_quantity} | LIMIT={limit_price}"
+        )
+    except Exception as exc:
+        errors.append(str(exc))
+        log_warning(f"{symbol} smart IOC response error: {exc}")
+
+    resolved_order, terminal, verification_attempts, status_errors = (
+        _resolve_entry_order(
+            symbol,
+            client_order_id,
+            initial_order=submitted_order,
+        )
+    )
+    errors.extend(status_errors)
+
+    if not terminal:
+        cancel_order, cancel_error = _cancel_unsettled_entry_order(
+            symbol,
+            client_order_id,
+        )
+
+        if cancel_error:
+            errors.append(cancel_error)
+
+        resolved_order, terminal, attempts, status_errors = (
+            _resolve_entry_order(
+                symbol,
+                client_order_id,
+                initial_order=cancel_order or resolved_order,
+            )
+        )
+        verification_attempts += attempts
+        errors.extend(status_errors)
+
+    limit_orders = [resolved_order] if resolved_order else []
+    limit_aggregate = aggregate_order_execution(limit_orders)
+    limit_executed = min(
+        limit_aggregate["executed_quantity"],
+        requested_quantity,
+    )
+    position_verified = False
+    post_detail = None
+
+    def smart_position_updated(detail):
+        post_amount = (
+            float(detail.get("amount", 0) or 0)
+            if detail
+            else 0
+        )
+        delta = max(
+            (post_amount - pre_position_amount) * direction,
+            0,
+        )
+        return delta + 1e-12 >= min(limit_executed, requested_quantity)
+
+    reconciled, detail, verify_count = _wait_for_position_reconciliation(
+        symbol,
+        expected_side=expected_side,
+        accept_condition=smart_position_updated,
+    )
+    verification_attempts += verify_count
+
+    if detail is not None:
+        post_detail = detail
+
+    if reconciled:
+        position_verified = True
+        post_amount = (
+            float(detail.get("amount", 0) or 0)
+            if detail
+            else 0
+        )
+        limit_executed = min(
+            max(
+                limit_executed,
+                (post_amount - pre_position_amount) * direction,
+            ),
+            requested_quantity,
+        )
+
+    residual_quantity, fallback_quantity = _normalised_residual_quantity(
+        symbol,
+        requested_quantity,
+        limit_executed,
+    )
+    fallback_order = None
+    fallback_reconciliation = {}
+    fallback_used = False
+
+    if (
+        fallback_quantity > 0 and
+        terminal and
+        getattr(config, "SMART_EXECUTION_MARKET_FALLBACK_ENABLED", True)
+    ):
+        fallback_used = True
+        fallback_pre_amount = (
+            float(post_detail.get("amount", 0) or 0)
+            if post_detail
+            else pre_position_amount + (limit_executed * direction)
+        )
+        fallback_pre_average = (
+            post_detail.get("entry_price")
+            if post_detail
+            else pre_average_price
+        )
+        fallback_order = _place_reconciled_market_order(
+            symbol,
+            side,
+            fallback_quantity,
+            pre_position_amount=fallback_pre_amount,
+            pre_average_price=fallback_pre_average,
+            reference_price=reference_price,
+            context=context,
+            execution_mode="MARKET_SMART_FALLBACK",
+            fallback_used=True,
+        )
+        fallback_reconciliation = get_execution_reconciliation(fallback_order)
+
+    fallback_executed = _execution_quantity(
+        fallback_reconciliation.get("executed_quantity")
+    )
+    total_executed = min(
+        limit_executed + fallback_executed,
+        requested_quantity,
+    )
+    residual_quantity, normalized_residual = _normalised_residual_quantity(
+        symbol,
+        requested_quantity,
+        total_executed,
+    )
+    fallback_terminal = (
+        bool(fallback_reconciliation.get("order_terminal", True))
+        if fallback_used
+        else True
+    )
+    all_terminal = bool(terminal and fallback_terminal)
+    fully_filled = (
+        all_terminal and
+        total_executed > 0 and
+        normalized_residual <= 0
+    )
+    combined_orders = list(limit_orders)
+
+    if fallback_executed > 0:
+        combined_orders.append({
+            "executedQty": str(fallback_executed),
+            "avgPrice": str(
+                fallback_reconciliation.get("average_fill_price") or 0
+            ),
+            "orderId": fallback_reconciliation.get("order_ids") or "",
+            "clientOrderId": (
+                fallback_reconciliation.get("client_order_ids") or ""
+            ),
+            "status": fallback_reconciliation.get("status") or "",
+        })
+
+    aggregate = aggregate_order_execution(combined_orders)
+    average_fill_price = aggregate["average_fill_price"]
+
+    if average_fill_price <= 0:
+        average_fill_price = _inferred_entry_fill_price(
+            pre_position_amount,
+            pre_average_price,
+            post_detail,
+            total_executed,
+        )
+
+    status = (
+        "FILLED"
+        if fully_filled
+        else "PENDING"
+        if not all_terminal
+        else "PARTIAL"
+        if total_executed > 0
+        else "FAILED"
+    )
+    post_position_amount = (
+        float(fallback_reconciliation.get("post_position_amount"))
+        if fallback_reconciliation.get("post_position_amount") is not None
+        else float(post_detail.get("amount", 0) or 0)
+        if post_detail
+        else pre_position_amount + (total_executed * direction)
+    )
+    order_ids = ",".join(
+        value
+        for value in (
+            limit_aggregate.get("order_ids", ""),
+            str(fallback_reconciliation.get("order_ids") or ""),
+        )
+        if value
+    )
+    client_order_ids = ",".join(
+        value
+        for value in (
+            client_order_id,
+            str(fallback_reconciliation.get("client_order_ids") or ""),
+        )
+        if value
+    )
+    reconciliation = {
+        "context": str(context or "ENTRY").upper(),
+        "execution_mode": "SMART_IOC_MARKET_FALLBACK",
+        "fallback_used": fallback_used,
+        "requested_quantity": requested_quantity,
+        "submitted_quantity": round(
+            submit_quantity + (fallback_quantity if fallback_used else 0),
+            12,
+        ),
+        "executed_quantity": total_executed,
+        "residual_quantity": residual_quantity,
+        "fallback_quantity": fallback_quantity if fallback_used else 0,
+        "fully_filled": fully_filled,
+        "order_terminal": all_terminal,
+        "position_verified": bool(
+            position_verified or
+            fallback_reconciliation.get("position_verified")
+        ),
+        "position_closed": False,
+        "average_fill_price": average_fill_price,
+        "reference_price": reference_price,
+        "status": status,
+        "submission_attempts": 1 + int(
+            fallback_reconciliation.get("submission_attempts") or 0
+        ),
+        "verification_attempts": verification_attempts + int(
+            fallback_reconciliation.get("verification_attempts") or 0
+        ),
+        "pre_position_amount": pre_position_amount,
+        "post_position_amount": post_position_amount,
+        "order_ids": order_ids,
+        "client_order_ids": client_order_ids,
+        "error": " | ".join(
+            errors +
+            ([fallback_reconciliation.get("error")] if fallback_reconciliation.get("error") else [])
+        ),
+    }
+    append_execution_telemetry({
+        **reconciliation,
+        "symbol": symbol,
+        "order_side": expected_side,
+        "position_side": "",
+        "fill_ratio_pct": round(
+            (total_executed / requested_quantity) * 100,
+            4,
+        ),
+        "best_bid": quote.get("bid"),
+        "best_ask": quote.get("ask"),
+        "spread_bps": round(float(quote.get("spread_bps") or 0), 4),
+        "limit_price": limit_price,
+        "slippage_bps": calculate_slippage_bps(
+            side,
+            reference_price,
+            average_fill_price,
+        ),
+        "latency_ms": round((time.monotonic() - started_at) * 1000, 2),
+        "commission": aggregate["commission"],
+        "commission_asset": aggregate["commission_asset"],
+    })
+
+    if total_executed <= 0 and all_terminal:
+        return None
+
+    if not all_terminal:
+        log_error(
+            f"{symbol} SMART ORDER UNSETTLED | SIDE={side} | "
+            f"OBSERVED={total_executed}/{requested_quantity} | "
+            f"NO UNSAFE MARKET FALLBACK"
+        )
+
+    return _enrich_reconciled_order(
+        fallback_order or resolved_order,
+        reconciliation,
+    )
+
+
+def place_market_order(
+    symbol,
+    side,
+    quantity,
+    pre_position_amount=None,
+    pre_average_price=None,
+    reference_price=None,
+    context="ENTRY",
+):
+    if (
+        getattr(config, "SMART_EXECUTION_ENABLED", False) and
+        _smart_execution_context_enabled(context)
+    ):
+        return _place_smart_entry_order(
+            symbol,
+            side,
+            quantity,
+            pre_position_amount=pre_position_amount,
+            pre_average_price=pre_average_price,
+            reference_price=reference_price,
+            context=context,
+        )
+
+    return _place_reconciled_market_order(
+        symbol,
+        side,
+        quantity,
+        pre_position_amount=pre_position_amount,
+        pre_average_price=pre_average_price,
+        reference_price=reference_price,
+        context=context,
+    )
 
 
 def _is_position_side_error(error):
@@ -1584,67 +2971,306 @@ def _submit_close_order(symbol, side, quantity, position_side=None, reduce_only=
     return order
 
 
-def close_position_market(symbol, amount, position_side=None):
+def _submit_position_close_once(symbol, amount, position_side=None):
+    amount = float(amount)
+    quantity = normalize_order_quantity(symbol, abs(amount))
+    position_side = (position_side or "").upper()
+
+    if quantity <= 0:
+        raise ValueError(f"{symbol} close quantity is below exchange minimum")
+
+    if position_side in ("LONG", "SHORT"):
+        side = SIDE_SELL if position_side == "LONG" else SIDE_BUY
+        order = _submit_close_order(
+            symbol,
+            side,
+            quantity,
+            position_side=position_side,
+            reduce_only=False,
+        )
+        log_warning(
+            f"{symbol} HEDGE CLOSE ORDER: {side} | POSITION_SIDE={position_side}"
+        )
+        return order, side, position_side
+
+    side = SIDE_SELL if amount > 0 else SIDE_BUY
 
     try:
-        amount = float(amount)
-        quantity = abs(amount)
+        order = _submit_close_order(
+            symbol,
+            side,
+            quantity,
+            reduce_only=True,
+        )
+        log_warning(f"{symbol} REDUCE-ONLY CLOSE ORDER: {side}")
+        return order, side, "BOTH"
 
-        if quantity <= 0:
+    except Exception as exc:
+        if not _is_position_side_error(exc):
+            raise
+
+        inferred_position_side = "LONG" if amount > 0 else "SHORT"
+        log_warning(
+            f"{symbol} reduce-only close failed; retrying hedge close | "
+            f"POSITION_SIDE={inferred_position_side} | ERROR={exc}"
+        )
+        order = _submit_close_order(
+            symbol,
+            side,
+            quantity,
+            position_side=inferred_position_side,
+            reduce_only=False,
+        )
+        log_warning(
+            f"{symbol} HEDGE CLOSE ORDER: {side} | "
+            f"POSITION_SIDE={inferred_position_side}"
+        )
+        return order, side, inferred_position_side
+
+
+def close_position_market(
+    symbol,
+    amount,
+    position_side=None,
+    reference_price=None,
+    context="EXIT",
+):
+    """Close a live position and return success only after it is confirmed flat."""
+    try:
+        amount = float(amount)
+        requested_quantity = abs(amount)
+
+        if requested_quantity <= 0:
             return None
 
-        position_side = (position_side or "").upper()
-
-        if position_side in ("LONG", "SHORT"):
-            side = SIDE_SELL if position_side == "LONG" else SIDE_BUY
-            order = _submit_close_order(
+        if not getattr(config, "EXECUTION_RECONCILIATION_ENABLED", True):
+            order, _, _ = _submit_position_close_once(
                 symbol,
-                side,
-                quantity,
+                amount,
                 position_side=position_side,
-                reduce_only=False
-            )
-            log_warning(
-                f"{symbol} HEDGE CLOSE ORDER: {side} | POSITION_SIDE={position_side}"
             )
             return order
 
-        side = SIDE_SELL if amount > 0 else SIDE_BUY
+        started_at = time.monotonic()
+        expected_side = "BUY" if amount > 0 else "SELL"
+        available, pre_detail = _execution_position_detail(
+            symbol,
+            position_side=position_side,
+            expected_side=expected_side,
+        )
 
-        try:
-            order = _submit_close_order(
+        if available and pre_detail is None:
+            reconciliation = {
+                "context": str(context or "EXIT").upper(),
+                "execution_mode": "MARKET_CLOSE",
+                "fallback_used": False,
+                "requested_quantity": requested_quantity,
+                "submitted_quantity": 0,
+                "executed_quantity": 0,
+                "residual_quantity": 0,
+                "fallback_quantity": 0,
+                "fully_filled": True,
+                "order_terminal": True,
+                "position_verified": True,
+                "position_closed": True,
+                "average_fill_price": 0,
+                "reference_price": _execution_quantity(reference_price),
+                "status": "ALREADY_CLOSED",
+                "submission_attempts": 0,
+                "verification_attempts": 1,
+                "pre_position_amount": 0,
+                "post_position_amount": 0,
+                "order_ids": "",
+                "client_order_ids": "",
+                "error": "",
+            }
+            append_execution_telemetry({
+                **reconciliation,
+                "symbol": symbol,
+                "order_side": SIDE_SELL if amount > 0 else SIDE_BUY,
+                "position_side": str(position_side or "BOTH").upper(),
+                "fill_ratio_pct": 100,
+                "latency_ms": round((time.monotonic() - started_at) * 1000, 2),
+            })
+            return _enrich_reconciled_order(None, reconciliation)
+
+        live_amount = (
+            float(pre_detail.get("amount", amount) or amount)
+            if pre_detail
+            else amount
+        )
+        pre_position_amount = live_amount
+        requested_quantity = abs(live_amount)
+
+        if reference_price is None and pre_detail:
+            reference_price = pre_detail.get("mark_price")
+
+        residual_retry_attempts = max(
+            int(getattr(config, "EXECUTION_RESIDUAL_RETRY_ATTEMPTS", 1)),
+            0,
+        )
+        orders = []
+        errors = []
+        submission_attempts = 0
+        submitted_quantity = 0.0
+        verification_attempts = 0
+        position_verified = False
+        position_closed = False
+        post_detail = pre_detail
+        order_side = SIDE_SELL if live_amount > 0 else SIDE_BUY
+        resolved_position_side = str(position_side or "BOTH").upper()
+        remaining_amount = live_amount
+
+        for _ in range(residual_retry_attempts + 1):
+            if abs(remaining_amount) <= 0:
+                break
+
+            submission_attempts += 1
+            submit_quantity = normalize_order_quantity(
                 symbol,
-                side,
-                quantity,
-                reduce_only=True
+                abs(remaining_amount),
             )
-            log_warning(f"{symbol} REDUCE-ONLY CLOSE ORDER: {side}")
-            return order
 
-        except Exception as e:
-            if not _is_position_side_error(e):
-                raise
+            if submit_quantity <= 0:
+                errors.append("residual close quantity below exchange minimum")
+                break
 
-            inferred_position_side = "LONG" if amount > 0 else "SHORT"
-            log_warning(
-                f"{symbol} reduce-only close failed; retrying hedge close | "
-                f"POSITION_SIDE={inferred_position_side} | ERROR={e}"
-            )
-            order = _submit_close_order(
+            submitted_quantity += submit_quantity
+
+            try:
+                signed_submit_amount = (
+                    submit_quantity if remaining_amount > 0 else -submit_quantity
+                )
+                order, order_side, resolved_position_side = (
+                    _submit_position_close_once(
+                        symbol,
+                        signed_submit_amount,
+                        position_side=position_side,
+                    )
+                )
+
+                if order:
+                    orders.append(order)
+            except Exception as exc:
+                errors.append(str(exc))
+                log_error(
+                    f"{symbol} close position error | "
+                    f"ATTEMPT={submission_attempts}: {exc}"
+                )
+
+            amount_before_submit = abs(remaining_amount)
+
+            def close_position_updated(detail):
+                if detail is None:
+                    return True
+
+                live_quantity = abs(float(detail.get("amount", 0) or 0))
+                return live_quantity < amount_before_submit - 1e-12
+
+            available, detail, verify_count = _wait_for_position_reconciliation(
                 symbol,
-                side,
-                quantity,
-                position_side=inferred_position_side,
-                reduce_only=False
+                position_side=(
+                    resolved_position_side
+                    if resolved_position_side in ("LONG", "SHORT")
+                    else None
+                ),
+                expected_side=expected_side,
+                accept_condition=close_position_updated,
             )
-            log_warning(
-                f"{symbol} HEDGE CLOSE ORDER: {side} | "
-                f"POSITION_SIDE={inferred_position_side}"
-            )
-            return order
+            verification_attempts += verify_count
 
-    except Exception as e:
-        log_error(f"{symbol} close position error: {e}")
+            if not available:
+                break
+
+            position_verified = True
+            post_detail = detail
+
+            if detail is None:
+                position_closed = True
+                remaining_amount = 0
+                break
+
+            remaining_amount = float(detail.get("amount", 0) or 0)
+
+            if abs(remaining_amount) >= amount_before_submit - 1e-12:
+                break
+
+        aggregate = aggregate_order_execution(orders)
+        residual_quantity = abs(remaining_amount) if not position_closed else 0
+        executed_quantity = max(requested_quantity - residual_quantity, 0)
+        executed_quantity = min(
+            max(executed_quantity, aggregate["executed_quantity"]),
+            requested_quantity,
+        )
+        average_fill_price = aggregate["average_fill_price"]
+        status = (
+            "CLOSED"
+            if position_closed
+            else "RESIDUAL_OPEN"
+            if position_verified
+            else "UNVERIFIED"
+        )
+        reconciliation = {
+            "context": str(context or "EXIT").upper(),
+            "execution_mode": "MARKET_CLOSE",
+            "fallback_used": False,
+            "requested_quantity": requested_quantity,
+            "submitted_quantity": round(submitted_quantity, 12),
+            "executed_quantity": executed_quantity,
+            "residual_quantity": residual_quantity,
+            "fallback_quantity": 0,
+            "fully_filled": position_closed,
+            "order_terminal": position_closed,
+            "position_verified": position_verified,
+            "position_closed": position_closed,
+            "average_fill_price": average_fill_price,
+            "reference_price": _execution_quantity(reference_price),
+            "status": status,
+            "submission_attempts": submission_attempts,
+            "verification_attempts": verification_attempts,
+            "pre_position_amount": pre_position_amount,
+            "post_position_amount": (
+                float(post_detail.get("amount", 0) or 0)
+                if post_detail
+                else 0
+            ),
+            "order_ids": aggregate["order_ids"],
+            "client_order_ids": aggregate["client_order_ids"],
+            "error": " | ".join(errors),
+        }
+        append_execution_telemetry({
+            **reconciliation,
+            "symbol": symbol,
+            "order_side": order_side,
+            "position_side": resolved_position_side,
+            "fill_ratio_pct": round(
+                (executed_quantity / requested_quantity) * 100,
+                4,
+            ),
+            "slippage_bps": calculate_slippage_bps(
+                order_side,
+                reference_price,
+                average_fill_price,
+            ),
+            "latency_ms": round((time.monotonic() - started_at) * 1000, 2),
+            "commission": aggregate["commission"],
+            "commission_asset": aggregate["commission_asset"],
+        })
+
+        if not position_closed:
+            log_error(
+                f"{symbol} close not confirmed | STATUS={status} | "
+                f"RESIDUAL={residual_quantity}"
+            )
+            return None
+
+        return _enrich_reconciled_order(
+            orders[-1] if orders else None,
+            reconciliation,
+        )
+
+    except Exception as exc:
+        log_error(f"{symbol} close position error: {exc}")
         return None
 
 
@@ -1835,6 +3461,16 @@ def place_partial_take_profit(
         return None, 0.0
 
     close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
+    trigger_price = normalize_trigger_price(
+        symbol,
+        side,
+        "TAKE_PROFIT_MARKET",
+        trigger_price,
+    )
+
+    if trigger_price <= 0:
+        raise ValueError(f"{symbol} TP1 trigger price is invalid")
+
     params = {
         "algoType": "CONDITIONAL",
         "symbol": symbol,
@@ -1874,6 +3510,16 @@ def place_close_position_protection(
     position_side=None,
 ):
     close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
+    trigger_price = normalize_trigger_price(
+        symbol,
+        side,
+        order_type,
+        trigger_price,
+    )
+
+    if trigger_price <= 0:
+        raise ValueError(f"{symbol} {order_type} trigger price is invalid")
+
     params = {
         "algoType": "CONDITIONAL",
         "symbol": symbol,
@@ -2140,6 +3786,21 @@ def place_tp_sl(
                 precision
             )
 
+        tp_price = normalize_trigger_price(
+            symbol,
+            side,
+            "TAKE_PROFIT_MARKET",
+            tp_price,
+        )
+
+        if sl_enabled and sl_price is not None:
+            sl_price = normalize_trigger_price(
+                symbol,
+                side,
+                "STOP_MARKET",
+                sl_price,
+            )
+
         details.update({
             "tp_price": tp_price,
             "tp_mode": tp_mode,
@@ -2275,9 +3936,13 @@ def place_tp_sl(
                 position_side=position_side,
             )
             details["sl_order"] = sl_order
-            details["sl_created"] = bool(
-                _accepted_order_id(sl_order)
-            )
+            details["sl_created"] = bool(_accepted_order_id(sl_order))
+
+            if not details["sl_created"]:
+                raise RuntimeError(
+                    f"{symbol} SL order was not accepted | RESPONSE={sl_order}"
+                )
+
             log_info(
                 f"{symbol} SL order response | "
                 f"ALGO_ID={sl_order.get('algoId')} | "
