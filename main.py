@@ -1,5 +1,4 @@
-import logging
-import os
+import signal
 import threading
 import time
 from datetime import datetime, timedelta
@@ -10,6 +9,7 @@ from binance.enums import SIDE_BUY, SIDE_SELL
 
 from exchange import (
     sync_client_time,
+    is_one_way_position_mode,
     get_klines,
     get_balance,
     get_margin_balance,
@@ -26,6 +26,7 @@ from exchange import (
     get_open_stop_loss_info,
     place_stop_loss_only,
     place_close_position_protection,
+    place_partial_take_profit_quantity,
     set_margin_type,
     setup_leverage,
     get_entry_price,
@@ -40,6 +41,9 @@ from exchange import (
     get_algo_order_execution,
     find_matching_open_algo_order,
     normalize_trigger_price,
+    get_symbol_price_rules,
+    get_futures_depth_snapshot,
+    reconcile_execution_client_orders,
 )
 
 from indicators import apply_indicators
@@ -68,6 +72,11 @@ from market_intelligence import (
     calculate_market_breadth,
     calculate_regime_transition,
 )
+from order_flow_shadow import OrderFlowShadowMonitor
+from execution_telemetry import (
+    flush_execution_telemetry,
+    validate_execution_telemetry_path,
+)
 from llm_service import (
     apply_llm_filter,
     begin_llm_scan_budget,
@@ -81,10 +90,12 @@ from telegram_service import (
     send_telegram_message
 )
 from trade_state import (
+    TradeStateLoadError,
     apply_multi_tp_protection_state,
     clear_dca_reservation,
     create_position_state,
     get_position_state,
+    get_pending_execution,
     has_active_dca_reservation,
     load_trade_state,
     prune_closed_positions,
@@ -92,7 +103,10 @@ from trade_state import (
     reserve_dca_level,
     update_position_runtime_fields,
     update_position_tp_status,
-    upsert_position_state
+    upsert_position_state,
+    upsert_pending_execution,
+    remove_pending_execution,
+    trade_state_file_exists,
 )
 from logger import log_info, log_warning, log_error
 from multi_tp import (
@@ -112,6 +126,46 @@ _dca_locks = {}
 _dca_locks_guard = threading.Lock()
 shutdown_event = threading.Event()
 target_margin_stop_lock = threading.Lock()
+
+
+def request_shutdown(signum=None, _frame=None):
+    """Request an orderly stop from SIGINT, SIGTERM, or internal controls."""
+    signal_name = "INTERNAL"
+
+    if signum is not None:
+        try:
+            signal_name = signal.Signals(signum).name
+        except (TypeError, ValueError):
+            signal_name = str(signum)
+
+    if not shutdown_event.is_set():
+        log_warning(f"BOT SHUTDOWN REQUESTED | SOURCE={signal_name}")
+
+    shutdown_event.set()
+
+
+def install_shutdown_signal_handlers():
+    try:
+        signal.signal(signal.SIGINT, request_shutdown)
+        signal.signal(signal.SIGTERM, request_shutdown)
+        return True
+    except (ValueError, OSError) as exc:
+        log_warning(f"Shutdown signal handler unavailable: {exc}")
+        return False
+
+
+def load_runtime_trade_state(open_positions):
+    if (
+        getattr(config, "REQUIRE_STATE_FOR_OPEN_POSITIONS", True) and
+        open_positions and
+        not trade_state_file_exists()
+    ):
+        raise TradeStateLoadError(
+            "runtime state is missing while Binance has open positions; "
+            "restore DCA_STATE_PATH before starting entries"
+        )
+
+    return load_trade_state()
 
 
 def wait_for_next_scan(reason="SCAN_COMPLETE"):
@@ -803,6 +857,275 @@ def fail_safe_close_unprotected_position(
     return True
 
 
+def persist_pending_execution(
+    state,
+    symbol,
+    order,
+    side,
+    requested_quantity,
+    pre_position_amount,
+    reference_price,
+    context,
+    position_side=None,
+    signal_type=None,
+    dca_level=None,
+):
+    reconciliation = get_execution_reconciliation(order)
+    pending = {
+        "symbol": symbol,
+        "side": str(side or "").upper(),
+        "context": str(context or "ENTRY").upper(),
+        "requested_quantity": float(requested_quantity or 0),
+        "pre_position_amount": float(pre_position_amount or 0),
+        "reference_price": float(reference_price or 0),
+        "position_side": str(position_side or "BOTH").upper(),
+        "signal_type": str(signal_type or "").upper(),
+        "dca_level": dca_level,
+        "client_order_ids": reconciliation.get("client_order_ids") or "",
+        "order_ids": reconciliation.get("order_ids") or "",
+        "execution_mode": reconciliation.get("execution_mode") or "",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "last_reconciled_at": None,
+        "emergency_protection_secured": False,
+        "reconciliation": reconciliation,
+    }
+
+    if upsert_pending_execution(state, symbol, pending):
+        log_error(
+            f"{symbol} persisted unsettled execution | "
+            f"CONTEXT={pending['context']} | "
+            f"CLIENT_IDS={pending['client_order_ids']}"
+        )
+        return True
+
+    log_error(
+        f"{symbol} CRITICAL: unsettled execution could not be persisted | "
+        f"CONTEXT={pending['context']}"
+    )
+    return False
+
+
+def _pending_execution_live_detail(symbol, pending):
+    rows = get_open_position_detail_rows(symbol, force=True)
+
+    if rows is None:
+        return False, None
+
+    position_side = str(pending.get("position_side") or "BOTH").upper()
+
+    if position_side in ("LONG", "SHORT"):
+        for detail in rows:
+            if str(detail.get("position_side") or "").upper() == position_side:
+                return True, detail
+
+        return True, None
+
+    if len(rows) > 1:
+        log_error(
+            f"{symbol} pending execution reconciliation blocked | "
+            "multiple hedge legs require explicit position identity"
+        )
+        return False, None
+
+    return True, rows[0] if rows else None
+
+
+def _pending_execution_delta(pending, position_detail):
+    side = str(pending.get("side") or "").upper()
+    direction = 1 if side == "BUY" else -1
+    pre_amount = float(pending.get("pre_position_amount", 0) or 0)
+    live_amount = (
+        float(position_detail.get("amount", 0) or 0)
+        if position_detail
+        else 0
+    )
+    return max((live_amount - pre_amount) * direction, 0)
+
+
+def _secure_pending_execution_protection(state, symbol, pending, detail):
+    if pending.get("emergency_protection_secured"):
+        return True
+
+    live_quantity = abs(float(detail.get("amount", 0) or 0))
+    entry_price = float(
+        detail.get("entry_price") or pending.get("reference_price") or 0
+    )
+    side = SIDE_BUY if detail.get("side") == "BUY" else SIDE_SELL
+
+    if live_quantity <= 0 or entry_price <= 0:
+        return False
+
+    # A pre-existing close-all stop already protects an unsettled DCA increase.
+    if str(pending.get("context") or "").startswith("DCA"):
+        existing_sl = get_open_stop_loss_info(symbol)
+
+        if existing_sl.get("order_id"):
+            pending["emergency_protection_secured"] = True
+            pending["emergency_protection_mode"] = "EXISTING_CLOSE_ALL_SL"
+            return upsert_pending_execution(state, symbol, pending)
+
+    _, confirm_df, _ = get_signal_frames(symbol, None)
+    protection_result = place_tp_sl_with_recovery(
+        symbol,
+        side,
+        entry_price,
+        live_quantity,
+        confirm_df,
+        signal_type=pending.get("signal_type"),
+        context_label=f"{pending.get('context')}_UNSETTLED",
+        enable_multi_tp=False,
+        position_side=detail.get("position_side"),
+        return_details=True,
+    )
+
+    if not protection_result.get("ok"):
+        log_error(
+            f"{symbol} unsettled execution emergency protection failed | "
+            f"CONTEXT={pending.get('context')}"
+        )
+        return False
+
+    pending["emergency_protection_secured"] = True
+    pending["emergency_protection_mode"] = "FULL_POSITION_TP_SL"
+    pending["emergency_tp_price"] = protection_result.get("tp_price")
+    pending["emergency_sl_price"] = protection_result.get("sl_price")
+    return upsert_pending_execution(state, symbol, pending)
+
+
+def reconcile_pending_executions(state):
+    pending_items = dict(state.get("pending_executions") or {})
+
+    for symbol, pending in pending_items.items():
+        client_ids = pending.get("client_order_ids") or ""
+        result = reconcile_execution_client_orders(
+            symbol,
+            client_ids,
+            cancel_unsettled=True,
+        )
+        pending["last_reconciled_at"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+        pending["last_reconciliation"] = result
+        snapshot_available, detail = _pending_execution_live_detail(
+            symbol,
+            pending,
+        )
+
+        if not snapshot_available:
+            if not upsert_pending_execution(state, symbol, pending):
+                log_error(
+                    f"{symbol} CRITICAL: pending reconciliation state "
+                    "could not be persisted"
+                )
+                shutdown_event.set()
+            continue
+
+        observed_delta = _pending_execution_delta(pending, detail)
+        pending["observed_position_delta"] = observed_delta
+
+        if not result.get("order_terminal"):
+            if observed_delta > 0 and detail:
+                protected = _secure_pending_execution_protection(
+                    state,
+                    symbol,
+                    pending,
+                    detail,
+                )
+
+                if not protected:
+                    pending["emergency_protection_error"] = (
+                        "EMERGENCY_PROTECTION_STATE_NOT_PERSISTED"
+                        if pending.get("emergency_protection_secured")
+                        else "EMERGENCY_PROTECTION_NOT_SECURED"
+                    )
+
+                    if not upsert_pending_execution(state, symbol, pending):
+                        log_error(
+                            f"{symbol} CRITICAL: unprotected unsettled "
+                            "execution could not be persisted"
+                        )
+                        shutdown_event.set()
+            else:
+                if not upsert_pending_execution(state, symbol, pending):
+                    log_error(
+                        f"{symbol} CRITICAL: unsettled execution state "
+                        "could not be persisted"
+                    )
+                    shutdown_event.set()
+
+            log_error(
+                f"{symbol} execution remains unsettled | "
+                f"CONTEXT={pending.get('context')} | no new order allowed"
+            )
+            continue
+
+        if observed_delta <= 0 or not detail:
+            reservation_cleared = True
+
+            if pending.get("dca_level"):
+                reservation_result = clear_dca_reservation(
+                    state,
+                    symbol,
+                    pending.get("dca_level"),
+                )
+                reservation_cleared = reservation_result is not False
+
+            remove_result = (
+                remove_pending_execution(state, symbol)
+                if reservation_cleared
+                else False
+            )
+            pending_removed = bool(
+                reservation_cleared and remove_result is not False
+            )
+
+            if not pending_removed:
+                pending["cleanup_error"] = (
+                    "PENDING_EXECUTION_CLEANUP_NOT_PERSISTED"
+                )
+                upsert_pending_execution(state, symbol, pending)
+                log_error(
+                    f"{symbol} terminal pending execution cleanup failed; "
+                    "symbol remains blocked"
+                )
+                continue
+
+            log_warning(
+                f"{symbol} pending execution reconciled terminal with no live fill"
+            )
+            continue
+
+        closed = fail_safe_close_unprotected_position(
+            symbol,
+            position_side=detail.get("position_side"),
+            reference_price=(
+                detail.get("mark_price") or pending.get("reference_price")
+            ),
+            context=f"{pending.get('context')}_LATE_RECONCILIATION",
+        )
+
+        if closed:
+            remove_result = remove_pending_execution(state, symbol)
+
+            if remove_result is not False:
+                log_warning(
+                    f"{symbol} late/ambiguous fill was safely closed after "
+                    "originating order became terminal"
+                )
+            else:
+                pending["cleanup_error"] = (
+                    "CLOSED_POSITION_PENDING_STATE_REMOVE_FAILED"
+                )
+                upsert_pending_execution(state, symbol, pending)
+                log_error(
+                    f"{symbol} late fill closed but pending state cleanup "
+                    "failed; symbol remains blocked"
+                )
+        else:
+            pending["terminal_fill_close_failed"] = True
+            upsert_pending_execution(state, symbol, pending)
+
+
 def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, btc_trend):
     if shutdown_event.is_set():
         log_warning(f"{symbol} DCA skipped | bot shutdown requested")
@@ -813,6 +1136,12 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
         return
 
     position_state = get_position_state(state, symbol)
+
+    if get_pending_execution(state, symbol):
+        log_warning(
+            f"{symbol} DCA skipped | unsettled execution requires reconciliation"
+        )
+        return
 
     if not position_state:
         position_state = adopt_existing_position_state(
@@ -1279,6 +1608,12 @@ def manage_dca_position(
 
     position_state = get_position_state(state, symbol)
 
+    if get_pending_execution(state, symbol):
+        log_warning(
+            f"{symbol} DCA skipped | unsettled execution requires reconciliation"
+        )
+        return
+
     if not position_state:
         position_state = adopt_existing_position_state(
             state,
@@ -1292,9 +1627,15 @@ def manage_dca_position(
 
     if (
         getattr(config, "TP1_RUNNER_DISABLE_DCA", True) and
-        position_state.get("multi_tp_stage") in (
-            RUNNER_PENDING,
-            RUNNER_ACTIVE,
+        (
+            position_state.get("multi_tp_stage") in (
+                RUNNER_PENDING,
+                RUNNER_ACTIVE,
+            ) or
+            (
+                position_state.get("multi_tp_stage") == TP1_PENDING and
+                position_state.get("tp1_trigger_seen_at")
+            )
         )
     ):
         log_info(
@@ -1564,6 +1905,26 @@ def manage_dca_position(
             symbol,
             {"pending_dca": pending_dca},
         )
+        persisted = persist_pending_execution(
+            state,
+            symbol,
+            order,
+            order_side,
+            quantity,
+            pre_position_amount,
+            current_price,
+            context=f"DCA_LEVEL_{dca_level}",
+            position_side=fresh_position.get("position_side"),
+            signal_type=(
+                position_state.get("confirmation_type") or
+                position_state.get("signal_type")
+            ),
+            dca_level=dca_level,
+        )
+
+        if not persisted:
+            shutdown_event.set()
+
         log_error(
             f"{symbol} DCA execution is unsettled | LEVEL={dca_level} | "
             "reservation retained; no duplicate fallback will be submitted"
@@ -1611,8 +1972,16 @@ def manage_dca_position(
     ):
         log_error(
             f"{symbol} DCA fill state update failed | "
-            f"LEVEL={dca_level} | reservation kept temporarily"
+            f"LEVEL={dca_level} | closing position as a fail-safe"
         )
+        fail_safe_close_unprotected_position(
+            symbol,
+            position_side=position_detail.get("position_side"),
+            reference_price=current_price,
+            context=f"DCA_LEVEL_{dca_level}_STATE_PERSISTENCE",
+        )
+        shutdown_event.set()
+        return
 
     if trend_df is None or confirm_df is None or entry_df is None:
         trend_df, confirm_df, entry_df = get_signal_frames(symbol, btc_trend_df)
@@ -1722,12 +2091,24 @@ def manage_dca_position(
             )
 
     if new_tp_info:
-        update_position_tp_status(
+        if not update_position_tp_status(
             state,
             symbol,
             new_tp_info,
             context=f"DCA_LEVEL_{dca_count + 1}"
-        )
+        ):
+            log_error(
+                f"{symbol} DCA protection state persistence failed | "
+                f"LEVEL={dca_count + 1}"
+            )
+            fail_safe_close_unprotected_position(
+                symbol,
+                position_side=position_detail.get("position_side"),
+                reference_price=current_price,
+                context=f"DCA_LEVEL_{dca_count + 1}_TP_STATE_PERSISTENCE",
+            )
+            shutdown_event.set()
+            return
 
     append_signal_journal(
         symbol,
@@ -1904,6 +2285,7 @@ def ensure_reversal_stop_loss(
         entry_price,
         confirm_df,
         signal_type="REVERSAL",
+        position_side=position_detail.get("position_side"),
     )
     sl_created = bool(result.get("ok"))
     update_position_runtime_fields(
@@ -1936,9 +2318,15 @@ def dca_tick_ready(symbol, mark_price, state=None):
 
     if (
         getattr(config, "TP1_RUNNER_DISABLE_DCA", True) and
-        position_state.get("multi_tp_stage") in (
-            RUNNER_PENDING,
-            RUNNER_ACTIVE,
+        (
+            position_state.get("multi_tp_stage") in (
+                RUNNER_PENDING,
+                RUNNER_ACTIVE,
+            ) or
+            (
+                position_state.get("multi_tp_stage") == TP1_PENDING and
+                position_state.get("tp1_trigger_seen_at")
+            )
         )
     ):
         return False
@@ -2157,9 +2545,11 @@ def force_target_margin_process_exit(close_success):
     if delay_seconds > 0:
         time.sleep(delay_seconds)
 
-    log_warning("Target margin stop exiting process now")
-    logging.shutdown()
-    os._exit(0)
+    request_shutdown()
+    log_warning(
+        "Target margin stop requested graceful process shutdown; "
+        "monitor cleanup and telemetry flush will run"
+    )
 
 
 def trigger_target_margin_stop(margin_balance):
@@ -2214,6 +2604,20 @@ class TargetMarginBalanceMonitor:
 
     def stop(self):
         self.stop_event.set()
+        thread = self.thread
+
+        if (
+            thread is not None and
+            thread.is_alive() and
+            thread is not threading.current_thread()
+        ):
+            # A target-margin trigger closes and verifies positions on this
+            # worker. Cleanup must not flush telemetry or return the process
+            # while that risk-reduction workflow is still in flight.
+            thread.join()
+
+        if thread is None or not thread.is_alive():
+            self.thread = None
 
     def _run(self):
         interval = max(
@@ -2551,6 +2955,24 @@ class DcaWebsocketMonitor:
             self._stop_socket_locked()
             self._subscribe_locked(streams, "sync")
 
+    def reconcile_multi_tp_positions(self, position_details, state):
+        """Run the same TP1/runner recovery during scans and after restarts."""
+        for symbol, detail in (position_details or {}).items():
+            position_state = get_position_state(state, symbol)
+
+            if not position_state or not position_state.get("multi_tp_active"):
+                continue
+
+            mark_price = float(detail.get("mark_price", 0) or 0)
+
+            if mark_price <= 0:
+                continue
+
+            try:
+                self._handle_multi_tp_runner(symbol, mark_price, state)
+            except Exception as exc:
+                log_error(f"{symbol} scan TP runner reconciliation error: {exc}")
+
     def should_skip_scan_dca(self, symbol):
         if not self.enabled or not self.running:
             return False
@@ -2671,10 +3093,14 @@ class DcaWebsocketMonitor:
             price_source="websocket"
         )
 
-    def _multi_tp_retry_ready(self, symbol):
+    def _multi_tp_retry_ready(self, symbol, retry_seconds=None):
         now = time.monotonic()
         retry_seconds = max(
-            float(getattr(config, "TP1_RUNNER_RETRY_SECONDS", 5)),
+            float(
+                retry_seconds
+                if retry_seconds is not None
+                else getattr(config, "TP1_RUNNER_RETRY_SECONDS", 5)
+            ),
             1,
         )
 
@@ -2717,6 +3143,9 @@ class DcaWebsocketMonitor:
         position_side,
         close_position,
         quantity=None,
+        trigger_price=None,
+        reduce_only=None,
+        working_type="MARK_PRICE",
     ):
         if not execution.get("found"):
             return False
@@ -2732,6 +3161,10 @@ class DcaWebsocketMonitor:
         actual_close_position = str(
             order.get("closePosition", False)
         ).lower() == "true"
+        actual_reduce_only = str(
+            order.get("reduceOnly", False)
+        ).lower() == "true"
+        actual_working_type = str(order.get("workingType") or "").upper()
 
         if actual_type != str(order_type).upper():
             return False
@@ -2744,6 +3177,25 @@ class DcaWebsocketMonitor:
 
         if actual_close_position != bool(close_position):
             return False
+
+        if reduce_only is not None and actual_reduce_only != bool(reduce_only):
+            return False
+
+        if working_type and actual_working_type != str(working_type).upper():
+            return False
+
+        if trigger_price is not None:
+            actual_trigger = float(
+                order.get("triggerPrice") or order.get("stopPrice") or 0
+            )
+            expected_trigger = float(trigger_price or 0)
+            tolerance = max(abs(expected_trigger) * 1e-12, 1e-12)
+
+            if (
+                actual_trigger <= 0 or
+                abs(actual_trigger - expected_trigger) > tolerance
+            ):
+                return False
 
         if quantity is not None:
             expected_quantity = abs(float(quantity or 0))
@@ -2766,98 +3218,374 @@ class DcaWebsocketMonitor:
         side = str(position_state.get("side") or "").upper()
         close_side = SIDE_SELL if side == "BUY" else SIDE_BUY
         position_side = position_detail.get("position_side") or "BOTH"
+        target_quantity = abs(
+            float(position_state.get("tp1_quantity", 0) or 0)
+        )
+        current_order_quantity = abs(
+            float(
+                position_state.get("tp1_order_quantity") or
+                target_quantity
+            )
+        )
+        base_quantity = abs(
+            float(position_state.get("tp1_base_quantity", 0) or 0)
+        )
+        live_quantity = abs(float(position_detail.get("quantity", 0) or 0))
+        tolerance = max(target_quantity * 1e-6, 1e-12)
 
-        if not tp1_order_id:
+        if (
+            side not in ("BUY", "SELL") or
+            target_quantity <= 0 or
+            current_order_quantity <= 0 or
+            base_quantity <= 0
+        ):
             self._persist_multi_tp_updates(
                 state,
                 symbol,
-                {"runner_protection_error": "TP1_ORDER_ID_MISSING"},
-                "TP1_ORDER_ID_MISSING",
+                {"runner_protection_error": "TP1_STATE_INVALID"},
+                "TP1_STATE_INVALID",
             )
             return False, None
 
-        execution = get_algo_order_execution(symbol, tp1_order_id)
+        execution = None
 
-        if not execution.get("query_ok"):
-            self._persist_multi_tp_updates(
-                state,
-                symbol,
-                {"runner_protection_error": "TP1_ORDER_QUERY_UNAVAILABLE"},
-                "TP1_ORDER_QUERY_UNAVAILABLE",
-            )
-            return False, None
+        if tp1_order_id:
+            execution = get_algo_order_execution(symbol, tp1_order_id)
 
-        if not execution.get("found"):
-            matching = find_matching_open_algo_order(
-                symbol,
+            if not execution.get("query_ok"):
+                self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_protection_error": "TP1_ORDER_QUERY_UNAVAILABLE"},
+                    "TP1_ORDER_QUERY_UNAVAILABLE",
+                )
+                return False, None
+
+            if execution.get("found") and not self._algo_intent_matches(
+                execution,
                 "TAKE_PROFIT_MARKET",
                 close_side,
-                position_side=position_side,
+                position_side,
+                False,
+                quantity=current_order_quantity,
                 trigger_price=position_state.get("tp1_price"),
-                close_position=False,
-                quantity=position_state.get("tp1_quantity"),
-            )
-            repaired_id = matching.get("order_id") or ""
+                reduce_only=(position_side == "BOTH"),
+            ):
+                self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_protection_error": "TP1_ORDER_INTENT_MISMATCH"},
+                    "TP1_ORDER_INTENT_MISMATCH",
+                )
+                return False, None
 
-            if repaired_id:
+        if execution and execution.get("found"):
+            algo_status = execution.get("algo_status") or "UNKNOWN"
+
+            if not self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"tp1_order_status": algo_status},
+                "TP1_ORDER_STATUS",
+            ):
+                return False, None
+
+            if execution.get("open"):
+                return False, execution
+
+            execution_terminal = bool(
+                execution.get("terminal") or execution.get("filled")
+            )
+
+            if not execution_terminal:
+                self._persist_multi_tp_updates(
+                    state,
+                    symbol,
+                    {"runner_protection_error": "TP1_ORDER_STATUS_AMBIGUOUS"},
+                    "TP1_ORDER_STATUS_AMBIGUOUS",
+                )
+                return False, execution
+
+            accounted_ids = list(
+                position_state.get("tp1_accounted_order_ids") or []
+            )
+            cumulative_quantity = max(
+                float(position_state.get("tp1_executed_quantity", 0) or 0),
+                0,
+            )
+            cumulative_quote = max(
+                float(position_state.get("tp1_executed_quote", 0) or 0),
+                0,
+            )
+
+            if tp1_order_id not in accounted_ids:
+                current_executed = max(
+                    float(execution.get("executed_quantity", 0) or 0),
+                    0,
+                )
+
+                # Backward-compatible test/adoption records may only expose
+                # the exact-child FILLED flag. Production resolver always
+                # supplies exact child executedQty.
+                if execution.get("filled") and current_executed <= 0:
+                    current_executed = current_order_quantity
+
+                current_executed = min(
+                    current_executed,
+                    current_order_quantity,
+                )
+                actual_order = execution.get("actual_order") or {}
+                algo_order = execution.get("algo_order") or {}
+                current_fill_price = float(
+                    actual_order.get("avgPrice") or
+                    algo_order.get("actualPrice") or
+                    0
+                )
+                cumulative_quantity = min(
+                    cumulative_quantity + current_executed,
+                    target_quantity,
+                )
+
+                if current_fill_price > 0 and current_executed > 0:
+                    cumulative_quote += current_fill_price * current_executed
+
+                accounted_ids.append(tp1_order_id)
+
                 if not self._persist_multi_tp_updates(
                     state,
                     symbol,
                     {
-                        "tp1_order_id": repaired_id,
-                        "runner_protection_error": "",
+                        "tp1_accounted_order_ids": accounted_ids,
+                        "tp1_executed_quantity": cumulative_quantity,
+                        "tp1_executed_quote": cumulative_quote,
                     },
-                    "TP1_ORDER_ID_REPAIR",
+                    "TP1_EXECUTION_ACCOUNTING",
                 ):
-                    return False, None
+                    return False, execution
 
-                execution = get_algo_order_execution(symbol, repaired_id)
+                position_state = get_position_state(state, symbol) or position_state
             else:
+                cumulative_quantity = max(
+                    float(
+                        position_state.get("tp1_executed_quantity", 0) or 0
+                    ),
+                    0,
+                )
+                cumulative_quote = max(
+                    float(position_state.get("tp1_executed_quote", 0) or 0),
+                    0,
+                )
+
+            if (
+                cumulative_quantity + tolerance >= target_quantity and
+                tp1_fill_confirmed(
+                    base_quantity,
+                    target_quantity,
+                    live_quantity,
+                )
+            ):
+                resolved_execution = dict(execution)
+                resolved_execution["tp1_average_fill_price"] = (
+                    cumulative_quote / cumulative_quantity
+                    if cumulative_quantity > 0 and cumulative_quote > 0
+                    else 0
+                )
+                return True, resolved_execution
+
+            observed_reduction = max(base_quantity - live_quantity, 0)
+
+            if observed_reduction + tolerance < cumulative_quantity:
                 self._persist_multi_tp_updates(
                     state,
                     symbol,
-                    {"runner_protection_error": "TP1_ORDER_NOT_FOUND"},
-                    "TP1_ORDER_NOT_FOUND",
+                    {
+                        "runner_protection_error": (
+                            "TP1_EXECUTION_POSITION_MISMATCH"
+                        )
+                    },
+                    "TP1_EXECUTION_POSITION_MISMATCH",
                 )
-                return False, None
+                return False, execution
+        else:
+            cumulative_quantity = max(
+                float(position_state.get("tp1_executed_quantity", 0) or 0),
+                0,
+            )
 
-        if not self._algo_intent_matches(
-            execution,
-            "TAKE_PROFIT_MARKET",
-            close_side,
-            position_side,
-            False,
-            quantity=position_state.get("tp1_quantity"),
-        ):
+        observed_reduction = max(base_quantity - live_quantity, 0)
+        residual_quantity = min(
+            max(target_quantity - cumulative_quantity, 0),
+            max(target_quantity - observed_reduction, 0),
+        )
+
+        if residual_quantity <= tolerance:
             self._persist_multi_tp_updates(
                 state,
                 symbol,
-                {"runner_protection_error": "TP1_ORDER_INTENT_MISMATCH"},
-                "TP1_ORDER_INTENT_MISMATCH",
+                {
+                    "runner_protection_error": (
+                        "TP1_EXACT_ATTRIBUTION_INCOMPLETE"
+                    )
+                },
+                "TP1_EXACT_ATTRIBUTION_INCOMPLETE",
             )
-            return False, None
-
-        algo_status = execution.get("algo_status") or "UNKNOWN"
-        self._persist_multi_tp_updates(
-            state,
-            symbol,
-            {"tp1_order_status": algo_status},
-            "TP1_ORDER_STATUS",
-        )
-
-        if not execution.get("filled"):
             return False, execution
 
-        live_quantity = abs(float(position_detail.get("quantity", 0) or 0))
+        matching = find_matching_open_algo_order(
+            symbol,
+            "TAKE_PROFIT_MARKET",
+            close_side,
+            position_side=position_side,
+            trigger_price=position_state.get("tp1_price"),
+            close_position=False,
+            quantity=residual_quantity,
+            reduce_only=(position_side == "BOTH"),
+        )
 
-        if not tp1_fill_confirmed(
-            position_state.get("tp1_base_quantity"),
-            position_state.get("tp1_quantity"),
-            live_quantity,
+        if matching.get("query_ok") is False:
+            self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_protection_error": "TP1_OPEN_ORDER_QUERY_UNAVAILABLE"},
+                "TP1_OPEN_ORDER_QUERY_UNAVAILABLE",
+            )
+            return False, execution
+
+        repaired_id = matching.get("order_id") or ""
+
+        if repaired_id:
+            if not self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {
+                    "tp1_order_id": repaired_id,
+                    "tp1_order_quantity": residual_quantity,
+                    "tp1_order_status": "NEW",
+                    "runner_protection_error": "",
+                },
+                "TP1_ORDER_ID_REPAIR",
+            ):
+                return False, execution
+
+            return False, execution
+
+        mark_price = float(position_detail.get("mark_price", 0) or 0)
+        trigger_price = float(position_state.get("tp1_price", 0) or 0)
+        trigger_ahead = (
+            trigger_price > mark_price
+            if side == "BUY"
+            else trigger_price < mark_price
+        )
+
+        if not trigger_ahead:
+            price_rules = get_symbol_price_rules(symbol)
+            tick_size = max(
+                float(price_rules.get("tick_size", 0) or 0),
+                mark_price * 1e-6,
+                1e-12,
+            )
+            raw_trigger = (
+                mark_price + tick_size
+                if side == "BUY"
+                else mark_price - tick_size
+            )
+            trigger_price = normalize_trigger_price(
+                symbol,
+                SIDE_BUY if side == "BUY" else SIDE_SELL,
+                "TAKE_PROFIT_MARKET",
+                raw_trigger,
+            )
+            trigger_ahead = (
+                trigger_price > mark_price
+                if side == "BUY"
+                else trigger_price < mark_price
+            )
+
+        if mark_price <= 0 or trigger_price <= 0 or not trigger_ahead:
+            self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_protection_error": "TP1_REPAIR_TRIGGER_INVALID"},
+                "TP1_REPAIR_TRIGGER_INVALID",
+            )
+            return False, execution
+
+        repair_count = int(position_state.get("tp1_repair_count", 0) or 0) + 1
+        repair_updates = {
+            "tp1_order_id": "",
+            "tp1_order_quantity": residual_quantity,
+            "tp1_order_status": "REPAIR_PENDING",
+            "tp1_repair_count": repair_count,
+            "runner_protection_error": "TP1_REPAIR_SUBMISSION_PENDING",
+        }
+
+        if abs(trigger_price - float(position_state.get("tp1_price", 0) or 0)) > 1e-12:
+            repair_updates.update({
+                "tp1_rearmed_from_price": position_state.get("tp1_price"),
+                "tp1_price": trigger_price,
+            })
+
+        # Persist the exact replacement intent before submission. A restart
+        # can then strictly adopt an acknowledged order without duplicating it.
+        if not self._persist_multi_tp_updates(
+            state,
+            symbol,
+            repair_updates,
+            "TP1_REPAIR_INTENT",
         ):
             return False, execution
 
-        return True, execution
+        try:
+            repaired_order, placed_quantity = place_partial_take_profit_quantity(
+                symbol,
+                SIDE_BUY if side == "BUY" else SIDE_SELL,
+                residual_quantity,
+                trigger_price,
+                position_side=position_side,
+            )
+            repaired_id = extract_order_id(repaired_order)
+        except Exception as exc:
+            self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {
+                    "runner_protection_error": (
+                        f"TP1_REPAIR_SUBMISSION_ERROR: {exc}"
+                    )
+                },
+                "TP1_REPAIR_SUBMISSION_ERROR",
+            )
+            return False, execution
+
+        if (
+            not repaired_id or
+            abs(float(placed_quantity or 0) - residual_quantity) > tolerance
+        ):
+            if repaired_id:
+                cancel_algo_order(symbol, repaired_id)
+
+            self._persist_multi_tp_updates(
+                state,
+                symbol,
+                {"runner_protection_error": "TP1_REPAIR_ORDER_FAILED"},
+                "TP1_REPAIR_ORDER_FAILED",
+            )
+            return False, execution
+
+        if not self._persist_multi_tp_updates(
+            state,
+            symbol,
+            {
+                "tp1_order_id": repaired_id,
+                "tp1_order_quantity": placed_quantity,
+                "tp1_order_status": "NEW",
+                "runner_protection_error": "",
+            },
+            "TP1_REPAIR_ORDER_ID",
+        ):
+            cancel_algo_order(symbol, repaired_id)
+
+        return False, execution
 
     def _validate_runner_order_id(
         self,
@@ -2873,7 +3601,7 @@ class DcaWebsocketMonitor:
 
         execution = get_algo_order_execution(symbol, order_id)
 
-        if not execution.get("query_ok"):
+        if not execution.get("query_ok") or execution.get("ambiguous"):
             return "UNAVAILABLE"
 
         if not self._algo_intent_matches(
@@ -2891,7 +3619,7 @@ class DcaWebsocketMonitor:
                 order.get("triggerPrice") or order.get("stopPrice") or 0
             )
             expected_trigger = float(trigger_price or 0)
-            tolerance = max(abs(expected_trigger) * 1e-9, 1e-12)
+            tolerance = max(abs(expected_trigger) * 1e-12, 1e-12)
 
             if (
                 actual_trigger <= 0 or
@@ -2899,7 +3627,13 @@ class DcaWebsocketMonitor:
             ):
                 return "INVALID"
 
-        return "OPEN" if execution.get("open") else "TERMINAL"
+        if execution.get("open"):
+            return "OPEN"
+
+        if execution.get("terminal") or execution.get("filled"):
+            return "TERMINAL"
+
+        return "UNAVAILABLE"
 
     def _handle_multi_tp_runner(self, symbol, mark_price, state):
         position_state = get_position_state(state, symbol)
@@ -3068,10 +3802,19 @@ class DcaWebsocketMonitor:
                     "TP1_TRIGGER_LATCH",
                 )
 
-            if not trigger_seen and not quantity_reduction_seen:
-                return False
+        transition_expected = bool(
+            stage == RUNNER_PENDING or
+            trigger_seen or
+            trigger_now or
+            quantity_reduction_seen
+        )
+        check_seconds = (
+            getattr(config, "TP1_RUNNER_RETRY_SECONDS", 5)
+            if transition_expected
+            else getattr(config, "TP1_HEALTH_CHECK_SECONDS", 60)
+        )
 
-        if not self._multi_tp_retry_ready(symbol):
+        if not self._multi_tp_retry_ready(symbol, check_seconds):
             return False
 
         lock = get_dca_lock(symbol)
@@ -3119,6 +3862,7 @@ class DcaWebsocketMonitor:
 
                 algo_order = (tp1_execution or {}).get("algo_order") or {}
                 runner_basis = float(
+                    (tp1_execution or {}).get("tp1_average_fill_price") or
                     algo_order.get("actualPrice") or
                     fresh_position_state.get("tp1_price") or
                     mark_price
@@ -4262,6 +5006,19 @@ class DcaWebsocketMonitor:
         if not position_state or not position_state.get("managed_by_bot"):
             return False
 
+        multi_tp_stage = position_state.get("multi_tp_stage")
+
+        if (
+            multi_tp_stage in (RUNNER_PENDING, RUNNER_ACTIVE) or
+            (
+                multi_tp_stage == TP1_PENDING and
+                position_state.get("tp1_trigger_seen_at")
+            )
+        ):
+            # Once TP1 has triggered, TP2 + runner SL exclusively own the
+            # profit-taking route. Early thesis invalidation remains separate.
+            return False
+
         signal_type = str(
             position_state.get("confirmation_type") or
             position_state.get("signal_type") or
@@ -4610,6 +5367,45 @@ def enrich_candidate_market_context(candidate, flow_monitor, breadth_context):
     return candidate
 
 
+def attach_candidate_shadow_order_flow(candidate, shadow_monitor):
+    """Attach observation-only analytics after all decision scores are final."""
+    if shadow_monitor is None:
+        candidate["shadow_order_flow"] = {
+            "shadow_only": True,
+            "decision_effect": False,
+            "ranking_effect": False,
+            "available": False,
+            "reason": "SHADOW_MONITOR_DISABLED",
+        }
+        return candidate
+
+    try:
+        candidate["shadow_order_flow"] = shadow_monitor.snapshot(
+            candidate.get("symbol"),
+            context={
+                "signal_side": candidate.get("signal"),
+                "route": (candidate.get("market_context") or {}).get(
+                    "route"
+                ),
+                "rank_score": candidate.get("rank_score"),
+            },
+        )
+    except Exception as exc:
+        log_warning(
+            f"{candidate.get('symbol')} shadow order-flow snapshot warning: {exc}"
+        )
+        candidate["shadow_order_flow"] = {
+            "shadow_only": True,
+            "decision_effect": False,
+            "ranking_effect": False,
+            "available": False,
+            "reason": "SHADOW_SNAPSHOT_ERROR",
+            "error": str(exc),
+        }
+
+    return candidate
+
+
 def market_flow_hard_veto(candidate):
     if not getattr(config, "MARKET_FLOW_HARD_VETO_ENABLED", False):
         return False, ""
@@ -4788,6 +5584,12 @@ def execute_entry_candidate(
     try:
         if shutdown_event.is_set():
             log_warning(f"{symbol} entry skipped | bot shutdown requested")
+            return position_details, open_positions, False
+
+        if get_pending_execution(trade_state, symbol):
+            log_warning(
+                f"{symbol} entry skipped | unsettled execution is still pending"
+            )
             return position_details, open_positions, False
 
         flow_blocked, flow_reason = market_flow_hard_veto(candidate)
@@ -5215,11 +6017,21 @@ def execute_entry_candidate(
                 f"{symbol} ENTRY EXECUTION UNSETTLED | "
                 "no duplicate fallback will be submitted"
             )
-            fail_safe_close_unprotected_position(
+            persisted = persist_pending_execution(
+                trade_state,
                 symbol,
+                order,
+                side,
+                quantity,
+                0,
                 reference_price=current_price,
-                context="UNSETTLED_ENTRY",
+                context="ENTRY",
+                signal_type=signal_type,
             )
+
+            if not persisted:
+                shutdown_event.set()
+
             return position_details, open_positions, False
 
         filled_quantity = get_reconciled_executed_quantity(order)
@@ -5310,6 +6122,9 @@ def execute_entry_candidate(
         position_state["signal_id"] = signal_id
         position_state["signal_rank_score"] = candidate.get("rank_score")
         position_state["market_context"] = candidate.get("market_context") or {}
+        position_state["shadow_order_flow"] = (
+            candidate.get("shadow_order_flow") or {}
+        )
         position_state["execution"] = reconciliation
         intraday_context = side_analysis.get("intraday_entry") or {}
         setup_context = intraday_context.get("setup") or {}
@@ -5550,8 +6365,26 @@ def finalize_scanned_symbol(
 
 def run_bot():
 
+    install_shutdown_signal_handlers()
     log_info("BOT STARTED")
     sync_client_time()
+
+    if (
+        getattr(config, "REQUIRE_ONE_WAY_POSITION_MODE", True) and
+        not is_one_way_position_mode()
+    ):
+        log_error(
+            "BOT START ABORTED | Binance one-way position mode could not be "
+            "confirmed. This v6 state model is not safe for simultaneous hedge legs."
+        )
+        return
+
+    if not validate_execution_telemetry_path():
+        log_error(
+            "Execution telemetry is unavailable; trading continues with "
+            "reconciliation but VPS telemetry must be repaired"
+        )
+
     scan_symbols = get_scan_symbols()
     log_info(
         f"Scanning {len(scan_symbols)} symbols | "
@@ -5559,14 +6392,45 @@ def run_bot():
         f"THROTTLE={config.REQUEST_THROTTLE_SECONDS}s"
     )
     log_active_dca_config()
-    dca_monitor = DcaWebsocketMonitor()
-    dca_monitor.start()
-    flow_monitor = MarketFlowMonitor(scan_symbols, shutdown_event=shutdown_event)
-    flow_monitor.start()
-    target_margin_monitor = TargetMarginBalanceMonitor()
-    target_margin_monitor.start()
+    dca_monitor = None
+    shadow_flow_monitor = None
+    flow_monitor = None
+    target_margin_monitor = None
 
     try:
+        dca_monitor = DcaWebsocketMonitor()
+        dca_monitor.start()
+
+        try:
+            shadow_flow_monitor = OrderFlowShadowMonitor(
+                scan_symbols,
+                snapshot_provider=get_futures_depth_snapshot,
+                shutdown_event=shutdown_event,
+            )
+            shadow_flow_monitor.start()
+        except Exception as exc:
+            log_warning(
+                "Order-flow shadow startup degraded; core bot continues | "
+                f"ERROR={exc}"
+            )
+
+            if shadow_flow_monitor is not None:
+                try:
+                    shadow_flow_monitor.stop()
+                except Exception:
+                    pass
+
+            shadow_flow_monitor = None
+
+        flow_monitor = MarketFlowMonitor(
+            scan_symbols,
+            shutdown_event=shutdown_event,
+            shadow_monitor=shadow_flow_monitor,
+        )
+        flow_monitor.start()
+        target_margin_monitor = TargetMarginBalanceMonitor()
+        target_margin_monitor.start()
+
         while not shutdown_event.is_set():
             try:
                 position_details = get_open_position_details()
@@ -5577,10 +6441,37 @@ def run_bot():
                     continue
 
                 open_positions = get_open_position_amounts(position_details)
-                trade_state = load_trade_state()
+                try:
+                    trade_state = load_runtime_trade_state(open_positions)
+                except TradeStateLoadError as exc:
+                    log_error(f"BOT STOPPING | TRADE STATE UNSAFE: {exc}")
+                    shutdown_event.set()
+                    break
+
+                if trade_state.get("pending_executions"):
+                    reconcile_pending_executions(trade_state)
+                    refreshed_details = get_open_position_details(force=True)
+
+                    if refreshed_details is None:
+                        log_warning(
+                            "Position refresh unavailable after pending execution "
+                            "reconciliation; skipping this scan"
+                        )
+                        wait_for_next_scan(
+                            "PENDING_EXECUTION_POSITION_REFRESH_UNAVAILABLE"
+                        )
+                        continue
+
+                    position_details = refreshed_details
+                    open_positions = get_open_position_amounts(position_details)
+
                 prune_and_cleanup_closed_positions(trade_state, open_positions)
                 log_closed_trades(open_positions)
                 dca_monitor.sync(position_details)
+                dca_monitor.reconcile_multi_tp_positions(
+                    position_details,
+                    trade_state,
+                )
 
                 btc_trend_df, btc_trend = get_cached_btc_context()
                 log_info(f"BTC TREND: {btc_trend}")
@@ -5807,6 +6698,10 @@ def run_bot():
                         flow_monitor,
                         breadth_context,
                     )
+                    attach_candidate_shadow_order_flow(
+                        candidate,
+                        shadow_flow_monitor,
+                    )
 
                 if config.SIGNAL_RANKING_ENABLED and not shutdown_event.is_set():
                     position_details, open_positions = process_ranked_entry_candidates(
@@ -5828,9 +6723,21 @@ def run_bot():
                 wait_for_next_scan("MAIN_LOOP_ERROR")
 
     finally:
-        target_margin_monitor.stop()
-        flow_monitor.stop()
-        dca_monitor.stop()
+        for monitor_name, monitor in (
+            ("target margin", target_margin_monitor),
+            ("market flow", flow_monitor),
+            ("order-flow shadow", shadow_flow_monitor),
+            ("DCA websocket", dca_monitor),
+        ):
+            if monitor is None:
+                continue
+
+            try:
+                monitor.stop()
+            except Exception as exc:
+                log_warning(f"{monitor_name} monitor stop warning: {exc}")
+
+        flush_execution_telemetry()
 
     log_warning("BOT STOPPED | manual restart required")
 

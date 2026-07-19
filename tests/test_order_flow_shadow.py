@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from order_flow_shadow import OrderFlowShadowMonitor
+from order_flow_shadow import FUTURES_PUBLIC_STREAM_BASE, OrderFlowShadowMonitor
 
 
 class FakeClock:
@@ -71,6 +71,34 @@ def trade_event(clock, trade_id, *, event_type="trade", maker=False, quantity=1)
 
 
 class DepthSequenceTests(unittest.TestCase):
+    def test_snapshot_plus_one_event_waits_for_required_snapshot_overlap(self):
+        clock = FakeClock()
+        provider = SnapshotProvider([snapshot(100)])
+        monitor = OrderFlowShadowMonitor(
+            ["BTCUSDT"],
+            provider,
+            enabled=True,
+            telemetry_enabled=False,
+            clock=clock,
+        )
+
+        monitor.handle_message(depth_event(101, 101, 100))
+        monitor.process_pending()
+        waiting = monitor.snapshot("BTCUSDT", emit_telemetry=False)
+
+        self.assertFalse(waiting["book_synced"])
+        self.assertEqual(waiting["last_update_id"], 100)
+        self.assertIn("SNAPSHOT_BRIDGE_GAP", waiting["last_error"])
+        self.assertEqual(len(provider.calls), 1)
+
+        monitor.handle_message(depth_event(100, 102, 99))
+        monitor.process_pending()
+        recovered = monitor.snapshot("BTCUSDT", emit_telemetry=False)
+
+        self.assertTrue(recovered["book_synced"])
+        self.assertEqual(recovered["last_update_id"], 102)
+        self.assertEqual(len(provider.calls), 1)
+
     def test_callback_is_non_blocking_and_snapshot_bridge_is_validated(self):
         clock = FakeClock()
         provider = SnapshotProvider([snapshot(100)])
@@ -115,7 +143,7 @@ class DepthSequenceTests(unittest.TestCase):
             clock=clock,
         )
 
-        monitor.handle_message(depth_event(101, 101, 100))
+        monitor.handle_message(depth_event(100, 101, 99))
         monitor.handle_message(depth_event(102, 102, 101, bids=[["99.9", "25"]]))
         monitor.process_pending()
         self.assertTrue(
@@ -126,7 +154,8 @@ class DepthSequenceTests(unittest.TestCase):
         monitor.process_pending()
         unsynchronised = monitor.snapshot("BTCUSDT", emit_telemetry=False)
 
-        self.assertFalse(unsynchronised["book_synced"])
+        self.assertTrue(unsynchronised["book_synced"])
+        self.assertEqual(unsynchronised["last_update_id"], 104)
         self.assertEqual(unsynchronised["resync_count"], 1)
         self.assertEqual(unsynchronised["sequence_gaps"], 1)
 
@@ -163,6 +192,52 @@ class DepthSequenceTests(unittest.TestCase):
         self.assertFalse(result["book_synced"])
         self.assertEqual(result["snapshot_errors"], 1)
         self.assertIn("SNAPSHOT_ERROR", result["last_error"])
+
+    def test_snapshot_failure_uses_retry_cooldown(self):
+        clock = FakeClock()
+        calls = []
+
+        def unavailable(symbol, limit=1000):
+            calls.append((symbol, limit))
+            raise RuntimeError("offline")
+
+        monitor = OrderFlowShadowMonitor(
+            ["BTCUSDT"],
+            unavailable,
+            enabled=True,
+            telemetry_enabled=False,
+            clock=clock,
+        )
+
+        with patch(
+            "config.ORDER_FLOW_SHADOW_SNAPSHOT_RETRY_SECONDS",
+            10,
+            create=True,
+        ):
+            monitor.handle_message(depth_event(1, 1, 0))
+            monitor.process_pending()
+            monitor.handle_message(depth_event(2, 2, 1))
+            monitor.process_pending()
+            self.assertEqual(len(calls), 1)
+            clock.advance(10)
+            monitor.handle_message(depth_event(3, 3, 2))
+            monitor.process_pending()
+
+        self.assertEqual(len(calls), 2)
+
+    def test_stop_discards_queued_depth_without_snapshot_request(self):
+        provider = SnapshotProvider([snapshot(100)])
+        monitor = OrderFlowShadowMonitor(
+            ["BTCUSDT"],
+            provider,
+            enabled=True,
+            telemetry_enabled=False,
+        )
+        monitor.handle_message(depth_event(101, 101, 100))
+        monitor.stop(timeout=0)
+
+        self.assertEqual(monitor.health()["queue_size"], 0)
+        self.assertEqual(provider.calls, [])
 
 
 class BoundedStateTests(unittest.TestCase):
@@ -209,8 +284,34 @@ class BoundedStateTests(unittest.TestCase):
         self.assertEqual(result["duplicate_trades"], 1)
         self.assertEqual(result["cumulative_cvd_notional"], 200)
 
+    def test_old_trades_and_duplicate_ids_are_pruned_by_window(self):
+        clock = FakeClock(1_700_000_000)
+        monitor = OrderFlowShadowMonitor(
+            ["BTCUSDT"],
+            enabled=True,
+            window_seconds=5,
+            max_trades_per_symbol=100,
+            telemetry_enabled=False,
+            clock=clock,
+        )
+        monitor.handle_message(trade_event(clock, 7))
+        monitor.process_pending()
+        clock.advance(6)
+        monitor.handle_message(trade_event(clock, 7))
+        monitor.process_pending()
+        result = monitor.snapshot("BTCUSDT", emit_telemetry=False)
+
+        self.assertEqual(result["trade_count"], 1)
+        self.assertEqual(result["duplicate_trades"], 0)
+
 
 class ShadowMetricTests(unittest.TestCase):
+    def test_depth_stream_uses_current_binance_public_route(self):
+        self.assertEqual(
+            FUTURES_PUBLIC_STREAM_BASE,
+            "wss://fstream.binance.com/public/stream?streams=",
+        )
+
     def make_monitor(self, clock):
         provider = SnapshotProvider([
             snapshot(
@@ -230,7 +331,7 @@ class ShadowMetricTests(unittest.TestCase):
             telemetry_enabled=False,
             clock=clock,
         )
-        monitor.handle_message(depth_event(101, 101, 100))
+        monitor.handle_message(depth_event(100, 101, 99))
         monitor.handle_message(trade_event(clock, 1, event_type="trade", quantity=5))
         monitor.handle_message(trade_event(clock, 2, event_type="aggTrade", quantity=5))
         monitor.handle_message(trade_event(clock, 3, maker=True, quantity=1))
@@ -266,7 +367,7 @@ class ShadowMetricTests(unittest.TestCase):
         self.assertFalse(result["book_fresh"])
         self.assertFalse(result["trade_fresh"])
 
-    def test_stream_names_are_chunked_for_external_websocket_owner(self):
+    def test_stream_names_are_chunked_for_internal_websocket_owner(self):
         monitor = OrderFlowShadowMonitor(
             ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
             enabled=True,

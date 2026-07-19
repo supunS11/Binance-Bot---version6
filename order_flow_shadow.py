@@ -14,14 +14,15 @@ or ranking effect.
         "asks": [["100.1", "1.5"], ...],
     }
 
-No network client is created here.  A future integration owns the websocket and
-REST clients and feeds Binance ``depthUpdate``, ``aggTrade``, or raw ``trade``
-messages to :meth:`OrderFlowShadowMonitor.handle_message`.
+The monitor owns observation-only diff-depth websocket threads. Trade messages are
+fed through :meth:`OrderFlowShadowMonitor.handle_message`; the injected provider
+owns REST authentication, rate limiting, and snapshot policy.
 """
 
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import math
 import queue
@@ -39,9 +40,15 @@ import config
 LOGGER = logging.getLogger(__name__)
 
 
+FUTURES_PUBLIC_STREAM_BASE = "wss://fstream.binance.com/public/stream?streams="
+
+
 TELEMETRY_FIELDS = (
     "timestamp_utc",
     "symbol",
+    "signal_side",
+    "route",
+    "rank_score",
     "available",
     "book_synced",
     "shadow_score",
@@ -134,7 +141,7 @@ class _SymbolState:
     bids: dict[float, float] = field(default_factory=dict)
     asks: dict[float, float] = field(default_factory=dict)
     trades: deque[_Trade] = field(init=False)
-    seen_trade_ids: deque[str] = field(init=False)
+    seen_trade_ids: deque[tuple[float, str]] = field(init=False)
     seen_trade_id_set: set[str] = field(default_factory=set)
     last_update_id: int = 0
     snapshot_update_id: int = 0
@@ -156,6 +163,7 @@ class _SymbolState:
     duplicate_trades: int = 0
     dropped_events: int = 0
     last_error: str = ""
+    next_snapshot_attempt_at: float = 0.0
 
     def __post_init__(self) -> None:
         self.trades = deque(maxlen=max(int(self.max_trades), 1))
@@ -317,6 +325,7 @@ class OrderFlowShadowMonitor:
         symbols: Iterable[str],
         snapshot_provider: Optional[Callable[..., Mapping[str, Any]]] = None,
         *,
+        shutdown_event: Optional[threading.Event] = None,
         enabled: Optional[bool] = None,
         max_symbols: Optional[int] = None,
         queue_size: Optional[int] = None,
@@ -355,6 +364,7 @@ class OrderFlowShadowMonitor:
         )
         self.symbols = unique_symbols[:symbol_limit] if symbol_limit else ()
         self.snapshot_provider = snapshot_provider
+        self.shutdown_event = shutdown_event
         self.clock = clock
         self.snapshot_limit = max(
             int(
@@ -434,6 +444,9 @@ class OrderFlowShadowMonitor:
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
+        self.depth_threads: list[threading.Thread] = []
+        self.depth_websockets: dict[int, Any] = {}
+        self.depth_generation = 0
         self.processing_errors = 0
         self.dropped_events = 0
         self.states = {
@@ -487,15 +500,126 @@ class OrderFlowShadowMonitor:
             daemon=True,
         )
         self.worker.start()
+        self._start_depth_streams()
         return True
 
     def stop(self, timeout: float = 2.0) -> None:
         self.stop_event.set()
 
+        with self.lock:
+            self.depth_generation += 1
+            websockets = list(self.depth_websockets.values())
+            self.depth_websockets = {}
+
+        for websocket in websockets:
+            try:
+                websocket.close()
+            except Exception:
+                pass
+
         if self.worker and self.worker.is_alive():
             self.worker.join(max(float(timeout), 0.0))
 
+        # Observation-only events are disposable on shutdown. Do not let a
+        # large queue continue CPU/REST work after the bot has stopped.
+        while True:
+            try:
+                self.event_queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                self.event_queue.task_done()
+
+        for thread in list(self.depth_threads):
+            if thread.is_alive():
+                thread.join(min(max(float(timeout), 0.0), 1.0))
+
         self.telemetry.stop(timeout=timeout)
+
+    def _start_depth_streams(self) -> None:
+        try:
+            from websockets.sync.client import connect  # noqa: F401
+        except Exception as exc:
+            LOGGER.warning("order-flow shadow websocket unavailable: %s", exc)
+            return
+
+        with self.lock:
+            self.depth_generation += 1
+            generation = self.depth_generation
+
+        threads = []
+
+        for index, streams in enumerate(self.depth_stream_chunks(), start=1):
+            thread = threading.Thread(
+                target=self._depth_stream_loop,
+                args=(streams, generation),
+                name=f"order-flow-shadow-depth-{index}",
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+
+        with self.lock:
+            if generation == self.depth_generation:
+                self.depth_threads = threads
+
+    def _depth_worker_active(self, generation: int) -> bool:
+        if self.stop_event.is_set():
+            return False
+
+        if self.shutdown_event is not None and self.shutdown_event.is_set():
+            return False
+
+        with self.lock:
+            return generation == self.depth_generation
+
+    def _depth_stream_loop(
+        self,
+        streams: tuple[str, ...],
+        generation: int,
+    ) -> None:
+        from websockets.sync.client import connect
+
+        url = FUTURES_PUBLIC_STREAM_BASE + "/".join(streams)
+        worker_id = threading.get_ident()
+
+        while self._depth_worker_active(generation):
+            websocket = None
+
+            try:
+                with connect(
+                    url,
+                    open_timeout=10,
+                    close_timeout=2,
+                    ping_interval=20,
+                    ping_timeout=20,
+                ) as websocket:
+                    with self.lock:
+                        if generation != self.depth_generation:
+                            return
+                        self.depth_websockets[worker_id] = websocket
+
+                    while self._depth_worker_active(generation):
+                        try:
+                            message = websocket.recv(timeout=2)
+                        except TimeoutError:
+                            continue
+
+                        self.handle_message(json.loads(message))
+
+            except Exception as exc:
+                if self._depth_worker_active(generation):
+                    LOGGER.warning(
+                        "order-flow shadow depth websocket reconnecting: %s",
+                        exc,
+                    )
+                    self.stop_event.wait(3)
+            finally:
+                with self.lock:
+                    current = self.depth_websockets.get(worker_id)
+
+                    if current is websocket:
+                        self.depth_websockets.pop(worker_id, None)
 
     def handle_message(self, message: Any) -> bool:
         """Enqueue a supported Binance message without blocking the caller."""
@@ -580,6 +704,10 @@ class OrderFlowShadowMonitor:
                 "enabled": self.enabled,
                 "running": bool(self.worker and self.worker.is_alive()),
                 "symbols": len(self.symbols),
+                "depth_threads_alive": sum(
+                    thread.is_alive() for thread in self.depth_threads
+                ),
+                "depth_sockets_connected": len(self.depth_websockets),
                 "queue_size": self.event_queue.qsize(),
                 "queue_capacity": self.event_queue.maxsize,
                 "dropped_events": self.dropped_events,
@@ -588,7 +716,13 @@ class OrderFlowShadowMonitor:
                 "telemetry_write_errors": self.telemetry.write_errors,
             }
 
-    def snapshot(self, symbol: str, *, emit_telemetry: bool = True) -> dict[str, Any]:
+    def snapshot(
+        self,
+        symbol: str,
+        *,
+        emit_telemetry: bool = True,
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
         symbol = str(symbol or "").upper()
         now = self.clock()
 
@@ -600,7 +734,11 @@ class OrderFlowShadowMonitor:
 
             bids = dict(state.bids)
             asks = dict(state.asks)
-            trades = list(state.trades)
+            trades = [
+                trade
+                for trade in state.trades
+                if trade.timestamp >= now - self.window_seconds
+            ]
             state_values = {
                 "book_synced": state.book_synced,
                 "last_update_id": state.last_update_id,
@@ -704,6 +842,12 @@ class OrderFlowShadowMonitor:
             "queue_size": self.event_queue.qsize(),
             "global_dropped_events": self.dropped_events,
         }
+        context = context or {}
+        payload.update({
+            "signal_side": str(context.get("signal_side") or "").upper(),
+            "route": str(context.get("route") or ""),
+            "rank_score": context.get("rank_score"),
+        })
 
         if emit_telemetry:
             self.telemetry.submit(payload)
@@ -746,7 +890,7 @@ class OrderFlowShadowMonitor:
                 return False
 
     def _worker_loop(self) -> None:
-        while not self.stop_event.is_set() or not self.event_queue.empty():
+        while not self.stop_event.is_set():
             try:
                 kind, data = self.event_queue.get(timeout=0.2)
             except queue.Empty:
@@ -793,11 +937,11 @@ class OrderFlowShadowMonitor:
 
             if not state.book_synced:
                 if state.bids and state.asks and state.awaiting_bridge:
-                    if final_update_id <= state.last_update_id:
+                    if final_update_id < state.last_update_id:
                         state.stale_depth_events += 1
                         return
 
-                    expected_id = state.last_update_id + 1
+                    expected_id = state.last_update_id
 
                     if first_update_id <= expected_id <= final_update_id:
                         self._apply_depth_levels_locked(state, data)
@@ -854,6 +998,29 @@ class OrderFlowShadowMonitor:
             state.last_error = ""
 
     def _synchronise_book(self, symbol: str, event: Mapping[str, Any]) -> None:
+        if self.stop_event.is_set():
+            return
+
+        now = self.clock()
+        retry_seconds = max(
+            float(
+                getattr(
+                    config,
+                    "ORDER_FLOW_SHADOW_SNAPSHOT_RETRY_SECONDS",
+                    10,
+                )
+            ),
+            0.1,
+        )
+
+        with self.lock:
+            state = self.states[symbol]
+
+            if now < state.next_snapshot_attempt_at:
+                return
+
+            state.next_snapshot_attempt_at = now + retry_seconds
+
         try:
             snapshot = self._request_snapshot(symbol)
             snapshot_id = _safe_int(snapshot.get("lastUpdateId"), -1)
@@ -890,12 +1057,14 @@ class OrderFlowShadowMonitor:
             state.depth_updated_at = self.clock()
             self._trim_book_locked(state)
 
-            if final_update_id <= snapshot_id:
+            if final_update_id < snapshot_id:
                 state.stale_depth_events += 1
                 state.last_error = "AWAITING_DEPTH_BRIDGE"
                 return
 
-            expected_id = snapshot_id + 1
+            # Binance USD-M requires the first applied diff event to overlap
+            # the snapshot's lastUpdateId (U <= lastUpdateId <= u).
+            expected_id = snapshot_id
 
             if not first_update_id <= expected_id <= final_update_id:
                 state.sequence_gaps += 1
@@ -909,6 +1078,7 @@ class OrderFlowShadowMonitor:
             state.last_update_id = final_update_id
             state.book_synced = True
             state.awaiting_bridge = False
+            state.next_snapshot_attempt_at = 0.0
             state.depth_updates += 1
             state.depth_updated_at = self.clock()
             state.last_error = ""
@@ -995,6 +1165,17 @@ class OrderFlowShadowMonitor:
 
         with self.lock:
             state = self.states[symbol]
+            cutoff = received_at - self.window_seconds
+
+            while state.trades and state.trades[0].timestamp < cutoff:
+                state.trades.popleft()
+
+            while (
+                state.seen_trade_ids and
+                state.seen_trade_ids[0][0] < cutoff
+            ):
+                _, expired = state.seen_trade_ids.popleft()
+                state.seen_trade_id_set.discard(expired)
 
             if trade_key and trade_key in state.seen_trade_id_set:
                 state.duplicate_trades += 1
@@ -1002,10 +1183,10 @@ class OrderFlowShadowMonitor:
 
             if trade_key:
                 if len(state.seen_trade_ids) >= state.seen_trade_ids.maxlen:
-                    expired = state.seen_trade_ids.popleft()
+                    _, expired = state.seen_trade_ids.popleft()
                     state.seen_trade_id_set.discard(expired)
 
-                state.seen_trade_ids.append(trade_key)
+                state.seen_trade_ids.append((received_at, trade_key))
                 state.seen_trade_id_set.add(trade_key)
 
             state.trades.append(_Trade(

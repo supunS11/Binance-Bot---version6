@@ -9,6 +9,10 @@ import config
 from logger import log_error, log_info, log_warning
 
 
+FUTURES_MARKET_STREAM_BASE = "wss://fstream.binance.com/market/stream?streams="
+FUTURES_PUBLIC_STREAM_BASE = "wss://fstream.binance.com/public/stream?streams="
+
+
 def _safe_float(value, default=0.0):
     try:
         return float(value)
@@ -180,8 +184,8 @@ class MarketFlowMonitor:
     def _trade_stream_loop(self, symbols, generation):
         from websockets.sync.client import connect
 
-        streams = "/".join(f"{symbol.lower()}@trade" for symbol in symbols)
-        url = f"wss://fstream.binance.com/stream?streams={streams}"
+        streams = "/".join(f"{symbol.lower()}@aggTrade" for symbol in symbols)
+        url = f"{FUTURES_MARKET_STREAM_BASE}{streams}"
         worker_id = threading.get_ident()
 
         while self._trade_worker_active(generation):
@@ -259,7 +263,7 @@ class MarketFlowMonitor:
             f"{symbol.lower()}@bookTicker"
             for symbol in symbols
         )
-        url = f"wss://fstream.binance.com/stream?streams={streams}"
+        url = f"{FUTURES_PUBLIC_STREAM_BASE}{streams}"
 
         while not self.stop_event.is_set():
             if self.shutdown_event is not None and self.shutdown_event.is_set():

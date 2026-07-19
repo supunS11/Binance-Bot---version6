@@ -19,7 +19,7 @@ logs/
 *.log
 
 # Runtime bot state
-data/open_trades.json
+data/open_trades*.json
 data/signal_journal.csv
 data/signal_journal.bak_*.csv
 data/signal_outcomes*.csv

@@ -5,6 +5,8 @@ from unittest.mock import Mock, patch
 import pandas as pd
 
 from market_intelligence import (
+    FUTURES_MARKET_STREAM_BASE,
+    FUTURES_PUBLIC_STREAM_BASE,
     MarketFlowMonitor,
     build_breadth_sample,
     calculate_market_breadth,
@@ -13,6 +15,16 @@ from market_intelligence import (
 
 
 class MarketFlowTests(unittest.TestCase):
+    def test_stream_routes_match_current_binance_futures_split(self):
+        self.assertEqual(
+            FUTURES_MARKET_STREAM_BASE,
+            "wss://fstream.binance.com/market/stream?streams=",
+        )
+        self.assertEqual(
+            FUTURES_PUBLIC_STREAM_BASE,
+            "wss://fstream.binance.com/public/stream?streams=",
+        )
+
     def test_start_uses_independent_direct_stream_workers(self):
         monitor = MarketFlowMonitor(["BTCUSDT"])
 

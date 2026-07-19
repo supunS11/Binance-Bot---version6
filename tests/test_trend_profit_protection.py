@@ -174,6 +174,35 @@ class TrendProfitProtectionTests(unittest.TestCase):
         ]
         self.assertEqual(len(submitted_updates), 1)
 
+    def test_runner_active_owns_profit_exit_and_blocks_retrace_overlay(self):
+        monitor = main.DcaWebsocketMonitor()
+        state = {
+            "positions": {
+                "BTCUSDT": {
+                    "symbol": "BTCUSDT",
+                    "managed_by_bot": True,
+                    "side": "BUY",
+                    "confirmation_type": "TREND",
+                    "avg_entry": 100,
+                    "trend_peak_roi": 20,
+                    "multi_tp_stage": main.RUNNER_ACTIVE,
+                }
+            }
+        }
+
+        with patch("main.close_position_market") as close, patch(
+            "main.get_open_position_details",
+        ) as positions:
+            handled = monitor._handle_trend_profit_protection(
+                "BTCUSDT",
+                101,
+                state,
+            )
+
+        self.assertFalse(handled)
+        close.assert_not_called()
+        positions.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

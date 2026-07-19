@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -15,9 +16,17 @@ _MULTI_TP_FIELDS = {
     "multi_tp_stage",
     "tp1_price",
     "tp1_close_pct",
+    "tp1_requested_close_pct",
     "tp1_quantity",
+    "tp1_order_quantity",
     "tp1_base_quantity",
     "tp1_order_id",
+    "tp1_accounted_order_ids",
+    "tp1_executed_quantity",
+    "tp1_executed_quote",
+    "tp1_repair_count",
+    "tp1_original_price",
+    "tp1_rearmed_from_price",
     "initial_sl_order_id",
     "tp1_trigger_seen_at",
     "tp1_order_status",
@@ -34,6 +43,10 @@ _MULTI_TP_FIELDS = {
     "runner_sl_order_id",
     "runner_protection_error",
 }
+
+
+class TradeStateLoadError(RuntimeError):
+    """Raised when existing runtime state cannot be read safely."""
 
 
 def apply_multi_tp_protection_state(item, tp_info):
@@ -56,6 +69,16 @@ def _state_path():
 def _lock_path():
     path = _state_path()
     return path.with_name(f"{path.name}.lock")
+
+
+def _backup_path():
+    path = _state_path()
+    return path.with_name(f"{path.stem}.bak{path.suffix}")
+
+
+def trade_state_file_exists():
+    """Return whether primary state or its recoverable backup exists."""
+    return _state_path().exists() or _backup_path().exists()
 
 
 @contextmanager
@@ -107,24 +130,79 @@ def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _state_write_retry_settings():
+    return (
+        max(int(getattr(config, "STATE_UPSERT_RETRY_ATTEMPTS", 3)), 1),
+        max(
+            float(getattr(config, "STATE_UPSERT_RETRY_DELAY_SECONDS", 0.25)),
+            0,
+        ),
+    )
+
+
 def _load_trade_state_unlocked():
     path = _state_path()
 
     if not path.exists():
-        return {"positions": {}}
+        backup_path = _backup_path()
+
+        if backup_path.exists():
+            try:
+                with backup_path.open("r", encoding="utf-8") as file:
+                    state = json.load(file)
+
+                if not isinstance(state, dict):
+                    raise ValueError("backup state root is not an object")
+
+                positions = state.setdefault("positions", {})
+                pending = state.setdefault("pending_executions", {})
+
+                if not isinstance(positions, dict) or not isinstance(
+                    pending,
+                    dict,
+                ):
+                    raise ValueError("backup state collections are invalid")
+
+                log_warning(
+                    "trade state primary file missing; recovered previous "
+                    f"state from backup: {backup_path}"
+                )
+                return state
+
+            except Exception as e:
+                log_error(f"trade state backup load error: {e}")
+                raise TradeStateLoadError(
+                    f"runtime state backup is unreadable: {backup_path}"
+                ) from e
+
+        return {"positions": {}, "pending_executions": {}}
 
     try:
         with path.open("r", encoding="utf-8") as file:
             state = json.load(file)
 
-        if "positions" not in state:
-            state["positions"] = {}
+        if not isinstance(state, dict):
+            raise ValueError("state root is not an object")
+
+        positions = state.setdefault("positions", {})
+        pending = state.setdefault("pending_executions", {})
+
+        if not isinstance(positions, dict) or not isinstance(pending, dict):
+            raise ValueError("state collections are invalid")
 
         return state
 
     except Exception as e:
         log_error(f"trade state load error: {e}")
-        return {"positions": {}}
+        backup_path = _backup_path()
+        backup_hint = (
+            f"; previous backup is available at {backup_path}"
+            if backup_path.exists()
+            else ""
+        )
+        raise TradeStateLoadError(
+            f"runtime state is unreadable: {path}{backup_hint}"
+        ) from e
 
 
 def load_trade_state():
@@ -134,12 +212,40 @@ def load_trade_state():
 def _save_trade_state_unlocked(state):
     path = _state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
+    backup_path = _backup_path()
+    backup_temp_path = path.with_name(
+        f"{path.stem}.bak.tmp{path.suffix}"
+    )
 
     with temp_path.open("w", encoding="utf-8") as file:
         json.dump(state, file, indent=2, sort_keys=True, default=str)
+        file.flush()
+        os.fsync(file.fileno())
+
+    if path.exists():
+        shutil.copyfile(path, backup_temp_path)
+
+        with backup_temp_path.open("r+b") as backup_file:
+            backup_file.flush()
+            os.fsync(backup_file.fileno())
+
+        os.replace(backup_temp_path, backup_path)
 
     os.replace(temp_path, path)
+
+    if os.name != "nt":
+        directory_fd = None
+
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_fd = os.open(str(path.parent), flags)
+            os.fsync(directory_fd)
+        except OSError as exc:
+            log_warning(f"trade state directory fsync warning: {exc}")
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
 
 
 def save_trade_state(state):
@@ -155,6 +261,69 @@ def save_trade_state(state):
 
 def get_position_state(state, symbol):
     return state.get("positions", {}).get(symbol)
+
+
+def get_pending_execution(state, symbol):
+    return state.get("pending_executions", {}).get(symbol)
+
+
+def upsert_pending_execution(state, symbol, data):
+    attempts = max(
+        int(getattr(config, "STATE_UPSERT_RETRY_ATTEMPTS", 3)),
+        1,
+    )
+    retry_delay = max(
+        float(getattr(config, "STATE_UPSERT_RETRY_DELAY_SECONDS", 0.25)),
+        0,
+    )
+
+    for attempt in range(1, attempts + 1):
+        try:
+            with _state_file_lock():
+                latest_state = _load_trade_state_unlocked()
+                latest_state.setdefault("pending_executions", {})[symbol] = data
+                _save_trade_state_unlocked(latest_state)
+                state["pending_executions"] = latest_state.get(
+                    "pending_executions",
+                    {},
+                )
+            return True
+
+        except Exception as e:
+            log_error(
+                f"{symbol} pending execution upsert error | "
+                f"ATTEMPT={attempt}/{attempts}: {e}"
+            )
+
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+
+    return False
+
+
+def remove_pending_execution(state, symbol):
+    attempts, retry_delay = _state_write_retry_settings()
+
+    for attempt in range(1, attempts + 1):
+        try:
+            with _state_file_lock():
+                latest_state = _load_trade_state_unlocked()
+                pending = latest_state.setdefault("pending_executions", {})
+                pending.pop(symbol, None)
+                _save_trade_state_unlocked(latest_state)
+                state["pending_executions"] = pending
+            return True
+
+        except Exception as e:
+            log_error(
+                f"{symbol} pending execution remove error | "
+                f"ATTEMPT={attempt}/{attempts}: {e}"
+            )
+
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+
+    return False
 
 
 def upsert_position_state(state, symbol, data):
@@ -207,61 +376,85 @@ def remove_position_state(state, symbol):
 
 
 def update_position_tp_status(state, symbol, tp_info, context=""):
-    try:
-        with _state_file_lock():
-            latest_state = _load_trade_state_unlocked()
-            item = get_position_state(latest_state, symbol)
+    attempts, retry_delay = _state_write_retry_settings()
 
-            if not item:
-                return
+    for attempt in range(1, attempts + 1):
+        try:
+            with _state_file_lock():
+                latest_state = _load_trade_state_unlocked()
+                item = get_position_state(latest_state, symbol)
 
-            tp_info = tp_info or {}
-            ok = bool(tp_info.get("ok"))
-            item["tp_status"] = "CREATED" if ok else "FAILED"
-            item["tp_price"] = tp_info.get("tp_price")
-            item["tp_mode"] = tp_info.get("tp_mode")
-            item["tp_context"] = context
-            item["tp_updated_at"] = now_iso()
+                if not item:
+                    return False
 
-            if "sl_created" in tp_info or "sl_enabled" in tp_info:
-                sl_created = bool(tp_info.get("sl_created"))
-                item["sl_status"] = "CREATED" if sl_created else "DISABLED"
-                item["sl_enabled"] = sl_created
-                item["sl_price"] = tp_info.get("sl_price")
-                item["sl_source"] = context
+                tp_info = tp_info or {}
+                ok = bool(tp_info.get("ok"))
+                item["tp_status"] = "CREATED" if ok else "FAILED"
+                item["tp_price"] = tp_info.get("tp_price")
+                item["tp_mode"] = tp_info.get("tp_mode")
+                item["tp_context"] = context
+                item["tp_updated_at"] = now_iso()
 
-            apply_multi_tp_protection_state(item, tp_info)
+                if "sl_created" in tp_info or "sl_enabled" in tp_info:
+                    sl_created = bool(tp_info.get("sl_created"))
+                    item["sl_status"] = (
+                        "CREATED" if sl_created else "DISABLED"
+                    )
+                    item["sl_enabled"] = sl_created
+                    item["sl_price"] = tp_info.get("sl_price")
+                    item["sl_source"] = context
 
-            latest_state.setdefault("positions", {})[symbol] = item
-            _save_trade_state_unlocked(latest_state)
-            state["positions"] = latest_state.get("positions", {})
+                apply_multi_tp_protection_state(item, tp_info)
 
-    except Exception as e:
-        log_error(f"{symbol} TP status update error: {e}")
+                latest_state.setdefault("positions", {})[symbol] = item
+                _save_trade_state_unlocked(latest_state)
+                state["positions"] = latest_state.get("positions", {})
+            return True
+
+        except Exception as e:
+            log_error(
+                f"{symbol} TP status update error | "
+                f"ATTEMPT={attempt}/{attempts}: {e}"
+            )
+
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+
+    return False
 
 
 def update_position_runtime_fields(state, symbol, updates):
     if not updates:
         return False
 
-    try:
-        with _state_file_lock():
-            latest_state = _load_trade_state_unlocked()
-            item = get_position_state(latest_state, symbol)
+    attempts, retry_delay = _state_write_retry_settings()
 
-            if not item:
-                return False
+    for attempt in range(1, attempts + 1):
+        try:
+            with _state_file_lock():
+                latest_state = _load_trade_state_unlocked()
+                item = get_position_state(latest_state, symbol)
 
-            item.update(updates)
-            item["updated_at"] = now_iso()
-            latest_state.setdefault("positions", {})[symbol] = item
-            _save_trade_state_unlocked(latest_state)
-            state["positions"] = latest_state.get("positions", {})
+                if not item:
+                    return False
+
+                item.update(updates)
+                item["updated_at"] = now_iso()
+                latest_state.setdefault("positions", {})[symbol] = item
+                _save_trade_state_unlocked(latest_state)
+                state["positions"] = latest_state.get("positions", {})
             return True
 
-    except Exception as e:
-        log_error(f"{symbol} runtime state update error: {e}")
-        return False
+        except Exception as e:
+            log_error(
+                f"{symbol} runtime state update error | "
+                f"ATTEMPT={attempt}/{attempts}: {e}"
+            )
+
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+
+    return False
 
 
 def prune_closed_positions(state, open_positions):
@@ -330,7 +523,7 @@ def create_position_state(
     }
 
 
-def record_dca_fill(
+def _record_dca_fill_once(
     state,
     symbol,
     avg_entry,
@@ -401,6 +594,37 @@ def record_dca_fill(
         return False
 
 
+def record_dca_fill(
+    state,
+    symbol,
+    avg_entry,
+    quantity,
+    used_margin,
+    dca_price,
+    level_info=None,
+    dca_count_increment=1,
+):
+    attempts, retry_delay = _state_write_retry_settings()
+
+    for attempt in range(1, attempts + 1):
+        if _record_dca_fill_once(
+            state,
+            symbol,
+            avg_entry,
+            quantity,
+            used_margin,
+            dca_price,
+            level_info=level_info,
+            dca_count_increment=dca_count_increment,
+        ):
+            return True
+
+        if attempt < attempts and retry_delay > 0:
+            time.sleep(retry_delay)
+
+    return False
+
+
 def _pending_dca_is_active(pending):
     if not pending:
         return False
@@ -469,27 +693,42 @@ def reserve_dca_level(state, symbol, expected_dca_count, level_info=None):
 
 
 def clear_dca_reservation(state, symbol, level=None):
-    try:
-        with _state_file_lock():
-            latest_state = _load_trade_state_unlocked()
-            item = get_position_state(latest_state, symbol)
+    attempts, retry_delay = _state_write_retry_settings()
 
-            if not item:
-                return
+    for attempt in range(1, attempts + 1):
+        try:
+            with _state_file_lock():
+                latest_state = _load_trade_state_unlocked()
+                item = get_position_state(latest_state, symbol)
 
-            pending = item.get("pending_dca")
+                if not item:
+                    return True
 
-            if not pending:
-                return
+                pending = item.get("pending_dca")
 
-            if level is not None and int(pending.get("level", 0) or 0) != int(level):
-                return
+                if not pending:
+                    return True
 
-            item.pop("pending_dca", None)
-            item["updated_at"] = now_iso()
-            latest_state.setdefault("positions", {})[symbol] = item
-            _save_trade_state_unlocked(latest_state)
-            state["positions"] = latest_state.get("positions", {})
+                if (
+                    level is not None and
+                    int(pending.get("level", 0) or 0) != int(level)
+                ):
+                    return False
 
-    except Exception as e:
-        log_error(f"{symbol} DCA reservation clear error: {e}")
+                item.pop("pending_dca", None)
+                item["updated_at"] = now_iso()
+                latest_state.setdefault("positions", {})[symbol] = item
+                _save_trade_state_unlocked(latest_state)
+                state["positions"] = latest_state.get("positions", {})
+            return True
+
+        except Exception as e:
+            log_error(
+                f"{symbol} DCA reservation clear error | "
+                f"ATTEMPT={attempt}/{attempts}: {e}"
+            )
+
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+
+    return False

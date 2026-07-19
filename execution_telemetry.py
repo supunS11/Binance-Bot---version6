@@ -1,4 +1,6 @@
+import atexit
 import csv
+import queue
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +11,8 @@ from logger import log_error
 
 EXECUTION_FIELDS = (
     "timestamp_utc",
+    "record_type",
+    "execution_id",
     "context",
     "execution_mode",
     "fallback_used",
@@ -18,6 +22,8 @@ EXECUTION_FIELDS = (
     "requested_quantity",
     "submitted_quantity",
     "executed_quantity",
+    "observed_position_increase_quantity",
+    "observed_position_reduction_quantity",
     "residual_quantity",
     "fallback_quantity",
     "fill_ratio_pct",
@@ -46,6 +52,18 @@ EXECUTION_FIELDS = (
 
 
 _journal_lock = threading.Lock()
+_worker_lock = threading.Lock()
+_stop_event = threading.Event()
+_telemetry_queue = queue.Queue(
+    maxsize=max(
+        int(getattr(config, "EXECUTION_TELEMETRY_QUEUE_SIZE", 2000)),
+        1,
+    )
+)
+_worker_thread = None
+_dropped_records = 0
+_write_errors = 0
+_last_write_error = ""
 
 
 def _safe_float(value, default=0.0):
@@ -144,7 +162,10 @@ def aggregate_order_execution(orders):
                 ),
                 12,
             )
-            if any(item["commission"] is not None for item in values)
+            if (
+                len(commission_assets) <= 1 and
+                any(item["commission"] is not None for item in values)
+            )
             else None
         ),
         "commission_asset": (
@@ -179,36 +200,165 @@ def _telemetry_path():
     return path
 
 
-def append_execution_telemetry(record):
-    if not bool(getattr(config, "EXECUTION_TELEMETRY_ENABLED", True)):
-        return False
-
+def _build_row(record):
     path = _telemetry_path()
     row = {field: "" for field in EXECUTION_FIELDS}
     row.update(record or {})
     row["timestamp_utc"] = row.get("timestamp_utc") or datetime.now(
         timezone.utc
     ).isoformat()
+    row["record_type"] = row.get("record_type") or "AGGREGATE"
+    return path, row
+
+
+def _write_row(path, row):
+    with _journal_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not path.exists() or path.stat().st_size == 0
+
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=EXECUTION_FIELDS,
+                extrasaction="ignore",
+            )
+
+            if write_header:
+                writer.writeheader()
+
+            writer.writerow(row)
+
+
+def _record_write_error(error):
+    global _write_errors, _last_write_error
+    _write_errors += 1
+    _last_write_error = str(error)
+
+
+def validate_execution_telemetry_path():
+    """Verify that the configured telemetry destination is writable."""
+    if not bool(getattr(config, "EXECUTION_TELEMETRY_ENABLED", True)):
+        return True
+
+    path = _telemetry_path()
 
     try:
-        with _journal_lock:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            write_header = not path.exists() or path.stat().st_size == 0
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-            with path.open("a", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(
-                    handle,
-                    fieldnames=EXECUTION_FIELDS,
-                    extrasaction="ignore",
-                )
-
-                if write_header:
-                    writer.writeheader()
-
-                writer.writerow(row)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.flush()
 
         return True
 
     except Exception as exc:
-        log_error(f"Execution telemetry write error: {exc}")
+        _record_write_error(exc)
+        log_error(f"Execution telemetry path is not writable: {exc}")
         return False
+
+
+def execution_telemetry_health():
+    path = _telemetry_path()
+    return {
+        "enabled": bool(
+            getattr(config, "EXECUTION_TELEMETRY_ENABLED", True)
+        ),
+        "path": str(path),
+        "queue_size": _telemetry_queue.qsize(),
+        "queue_capacity": _telemetry_queue.maxsize,
+        "dropped_records": _dropped_records,
+        "write_errors": _write_errors,
+        "last_write_error": _last_write_error,
+        "worker_running": bool(
+            _worker_thread and _worker_thread.is_alive()
+        ),
+    }
+
+
+def _telemetry_worker():
+    while not _stop_event.is_set() or not _telemetry_queue.empty():
+        try:
+            path, row = _telemetry_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+
+        try:
+            _write_row(path, row)
+        except Exception as exc:
+            _record_write_error(exc)
+            log_error(f"Execution telemetry write error: {exc}")
+        finally:
+            _telemetry_queue.task_done()
+
+
+def _ensure_worker():
+    global _worker_thread
+
+    with _worker_lock:
+        if _worker_thread and _worker_thread.is_alive():
+            return
+
+        _stop_event.clear()
+        _worker_thread = threading.Thread(
+            target=_telemetry_worker,
+            name="execution-telemetry-writer",
+            daemon=True,
+        )
+        _worker_thread.start()
+
+
+def append_execution_telemetry(record):
+    global _dropped_records
+
+    if not bool(getattr(config, "EXECUTION_TELEMETRY_ENABLED", True)):
+        return False
+
+    path, row = _build_row(record)
+    _ensure_worker()
+
+    try:
+        _telemetry_queue.put_nowait((path, row))
+        return True
+
+    except queue.Full:
+        try:
+            _telemetry_queue.get_nowait()
+            _telemetry_queue.task_done()
+        except queue.Empty:
+            pass
+
+        _dropped_records += 1
+
+        try:
+            _telemetry_queue.put_nowait((path, row))
+            return True
+        except queue.Full:
+            _dropped_records += 1
+            return False
+
+
+def flush_execution_telemetry(timeout=2.0):
+    global _worker_thread
+
+    _stop_event.set()
+
+    if _worker_thread and _worker_thread.is_alive():
+        _worker_thread.join(max(float(timeout), 0.0))
+
+    while True:
+        try:
+            path, row = _telemetry_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        try:
+            _write_row(path, row)
+        except Exception as exc:
+            _record_write_error(exc)
+            log_error(f"Execution telemetry flush error: {exc}")
+        finally:
+            _telemetry_queue.task_done()
+
+    _worker_thread = None
+
+
+atexit.register(flush_execution_telemetry)
