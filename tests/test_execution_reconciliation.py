@@ -1,7 +1,7 @@
 import copy
 import unittest
 from contextlib import ExitStack
-from unittest.mock import ANY, Mock, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import config
 
@@ -469,6 +469,67 @@ class ExchangeRuleTests(OfflineExecutionCase):
             )
 
         self.assertEqual(used, 200)
+
+    def test_shadow_depth_budget_warning_uses_one_global_throttle_key(self):
+        self._patch(
+            exchange,
+            "get_public_rest_backoff_remaining",
+            return_value=0,
+        )
+        reserve = self._patch(
+            exchange,
+            "_try_reserve_shadow_public_weight",
+            return_value=False,
+        )
+        log_allowed = self._patch(
+            exchange,
+            "_public_rest_log_allowed",
+            side_effect=[True, False],
+        )
+        warning = self._patch(exchange, "log_warning")
+
+        self.assertIsNone(exchange.get_futures_depth_snapshot("LINKUSDT"))
+        self.assertIsNone(exchange.get_futures_depth_snapshot("DOTUSDT"))
+
+        self.assertEqual(reserve.call_count, 2)
+        self.assertEqual(
+            log_allowed.call_args_list,
+            [call("shadow_depth_budget"), call("shadow_depth_budget")],
+        )
+        warning.assert_called_once_with(
+            "Shadow depth snapshots deferred | "
+            "core public REST reserve protected"
+        )
+
+    def test_known_futures_symbol_uses_complete_nonempty_catalog(self):
+        self._patch(
+            exchange,
+            "get_exchange_info",
+            return_value={
+                "symbols": [
+                    {"symbol": SYMBOL, "status": "TRADING"},
+                    {"symbol": "PAUSEDUSDT", "status": "SETTLING"},
+                ],
+            },
+        )
+
+        self.assertTrue(exchange.is_known_futures_symbol(SYMBOL))
+        self.assertTrue(exchange.is_known_futures_symbol("pausedusdt"))
+        self.assertFalse(exchange.is_known_futures_symbol("UNKNOWNUSDT"))
+
+    def test_known_futures_symbol_is_unknown_when_catalog_is_unavailable(self):
+        self._patch(exchange, "get_exchange_info", return_value={"symbols": []})
+
+        self.assertIsNone(exchange.is_known_futures_symbol(SYMBOL))
+
+    def test_known_futures_symbol_rejects_catalog_without_valid_symbols(self):
+        self._patch(
+            exchange,
+            "get_exchange_info",
+            return_value={"symbols": [{}, {"status": "TRADING"}]},
+        )
+
+        self.assertIsNone(exchange.is_known_futures_symbol(SYMBOL))
 
     def test_market_quantity_uses_market_lot_size(self):
         self._patch(

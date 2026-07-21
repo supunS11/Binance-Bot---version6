@@ -789,6 +789,42 @@ def get_supported_symbols():
         return set()
 
 
+def is_known_futures_symbol(symbol):
+    """Return whether *symbol* exists in a complete futures catalog.
+
+    ``None`` deliberately means that exchangeInfo was unavailable or malformed.
+    Callers must not treat an unavailable catalog as proof that a symbol is
+    invalid.
+    """
+    try:
+        info = get_exchange_info()
+        symbols = info.get("symbols") if isinstance(info, dict) else None
+
+        if not isinstance(symbols, list) or not symbols:
+            return None
+
+        known_symbols = {
+            str(item.get("symbol") or "").strip().upper()
+            for item in symbols
+            if isinstance(item, dict) and item.get("symbol")
+        }
+
+        if not known_symbols:
+            return None
+
+        normalized_symbol = str(symbol or "").strip().upper()
+
+        if not normalized_symbol:
+            return False
+
+        return normalized_symbol in known_symbols
+
+    except Exception as e:
+        if _public_rest_log_allowed("futures_symbol_catalog_validation"):
+            log_warning(f"Futures symbol catalog validation unavailable: {e}")
+        return None
+
+
 def _to_float(value, default=None):
     try:
         if value in (None, ""):
@@ -1122,9 +1158,9 @@ def get_futures_depth_snapshot(symbol, limit=None):
         return None
 
     if not _try_reserve_shadow_public_weight(weight):
-        if _public_rest_log_allowed(f"shadow_depth_budget:{symbol}"):
+        if _public_rest_log_allowed("shadow_depth_budget"):
             log_warning(
-                f"{symbol} shadow depth snapshot deferred | "
+                "Shadow depth snapshots deferred | "
                 "core public REST reserve protected"
             )
         return None

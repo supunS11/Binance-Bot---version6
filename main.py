@@ -20,6 +20,7 @@ from exchange import (
     get_open_position_detail_rows,
     get_open_position_counts,
     get_supported_symbols,
+    is_known_futures_symbol,
     get_futures_participation,
     get_mark_price,
     get_open_take_profit_info,
@@ -1795,10 +1796,118 @@ def _secure_pending_execution_protection(state, symbol, pending, detail):
     return upsert_pending_execution(state, symbol, pending)
 
 
-def reconcile_pending_executions(state):
+def _preflight_pending_execution_symbol(
+    state,
+    symbol,
+    pending,
+    position_details,
+):
+    """Classify a pending symbol before any symbol-private REST request.
+
+    Returns ``RECONCILE`` only when the complete exchange catalog confirms the
+    symbol. Unknown flat symbols are safe to remove from the durable pending
+    topology. Every unavailable or contradictory observation remains blocked.
+    """
+    known_symbol = is_known_futures_symbol(symbol)
+
+    if known_symbol is None:
+        entry_quarantined_symbols.add(symbol)
+        log_error(
+            f"{symbol} pending execution preflight deferred | "
+            "futures symbol catalog unavailable"
+        )
+        return "DEFERRED"
+
+    if known_symbol:
+        return "RECONCILE"
+
+    if not isinstance(position_details, dict):
+        entry_quarantined_symbols.add(symbol)
+        log_error(
+            f"{symbol} pending execution preflight deferred | "
+            "authoritative all-position snapshot unavailable"
+        )
+        return "DEFERRED"
+
+    normalized_symbol = str(symbol or "").upper()
+    live_symbols = {
+        str(live_symbol or "").upper()
+        for live_symbol in position_details
+    }
+
+    if normalized_symbol in live_symbols:
+        entry_quarantined_symbols.add(symbol)
+        log_error(
+            f"{symbol} pending execution retained | symbol is absent from "
+            "exchangeInfo but an authoritative live position row exists"
+        )
+        return "DEFERRED"
+
+    try:
+        dca_level = int(pending.get("dca_level") or 0)
+    except (TypeError, ValueError):
+        dca_level = 0
+
+    pending_dca_reservation = bool(
+        (get_position_state(state, symbol) or {}).get("pending_dca")
+    )
+
+    if dca_level <= 0 and pending_dca_reservation:
+        entry_quarantined_symbols.add(symbol)
+        log_error(
+            f"{symbol} invalid-symbol pending cleanup deferred | "
+            "DCA reservation exists but its pending execution level is missing"
+        )
+        return "DEFERRED"
+
+    if dca_level > 0:
+        reservation_result = clear_dca_reservation(
+            state,
+            symbol,
+            dca_level,
+        )
+
+        if reservation_result is False:
+            entry_quarantined_symbols.add(symbol)
+            log_error(
+                f"{symbol} invalid-symbol pending cleanup deferred | "
+                "DCA reservation could not be cleared"
+            )
+            return "DEFERRED"
+
+    if remove_pending_execution(state, symbol) is False:
+        entry_quarantined_symbols.add(symbol)
+        log_error(
+            f"{symbol} invalid-symbol pending cleanup deferred | "
+            "durable pending marker could not be removed"
+        )
+        return "DEFERRED"
+
+    entry_quarantined_symbols.discard(symbol)
+    log_warning(
+        f"{symbol} stale pending execution cleared | symbol is absent from "
+        "the complete futures catalog and no live position exists"
+    )
+    return "CLEARED"
+
+
+def reconcile_pending_executions(state, position_details=None):
+    if position_details is None:
+        position_details = get_open_position_details(force=True)
+
     pending_items = dict(state.get("pending_executions") or {})
 
     for symbol, pending in pending_items.items():
+        preflight = _preflight_pending_execution_symbol(
+            state,
+            symbol,
+            pending,
+            position_details,
+        )
+
+        if preflight != "RECONCILE":
+            continue
+
         client_ids = pending.get("client_order_ids") or ""
         result = reconcile_execution_client_orders(
             symbol,
@@ -9814,7 +9923,10 @@ def run_bot():
                     break
 
                 if trade_state.get("pending_executions"):
-                    reconcile_pending_executions(trade_state)
+                    reconcile_pending_executions(
+                        trade_state,
+                        position_details=position_details,
+                    )
                     refreshed_details = get_open_position_details(force=True)
 
                     if refreshed_details is None:

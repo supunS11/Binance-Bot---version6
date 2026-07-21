@@ -61,6 +61,22 @@ def remove_in_memory(state, symbol):
 
 
 class PendingExecutionRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self._state_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._state_directory.cleanup)
+        state_path = Path(self._state_directory.name) / "trade_state.json"
+        state_path_patch = patch.object(config, "DCA_STATE_PATH", str(state_path))
+        state_path_patch.start()
+        self.addCleanup(state_path_patch.stop)
+        known_symbol_patch = patch(
+            "main.is_known_futures_symbol",
+            return_value=True,
+        )
+        known_symbol_patch.start()
+        self.addCleanup(known_symbol_patch.stop)
+        main.entry_quarantined_symbols.discard(SYMBOL)
+        self.addCleanup(main.entry_quarantined_symbols.discard, SYMBOL)
+
     def test_nonterminal_no_fill_stays_pending_without_close_or_new_order(self):
         state = {
             "positions": {},
@@ -83,7 +99,7 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         ) as fail_safe_close, patch(
             "main.place_market_order",
         ) as new_order, patch("main.log_error"):
-            main.reconcile_pending_executions(state)
+            main.reconcile_pending_executions(state, position_details={})
 
         reconcile.assert_called_once_with(
             SYMBOL,
@@ -139,7 +155,10 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         ) as fail_safe_close, patch(
             "main.place_market_order",
         ) as new_order, patch("main.log_error"):
-            main.reconcile_pending_executions(state)
+            main.reconcile_pending_executions(
+                state,
+                position_details={SYMBOL: live_detail},
+            )
 
         place_protection.assert_called_once()
         args = place_protection.call_args.args
@@ -210,7 +229,10 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         ) as remove_pending, patch(
             "main.fail_safe_close_unprotected_position",
         ) as fail_safe_close, patch("main.log_warning"):
-            main.reconcile_pending_executions(state)
+            main.reconcile_pending_executions(
+                state,
+                position_details={SYMBOL: unchanged_position},
+            )
 
         secure_protection.assert_called_once_with(
             state,
@@ -252,7 +274,10 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         ) as remove_pending, patch(
             "main._secure_pending_execution_protection",
         ) as protect, patch("main.log_warning"):
-            main.reconcile_pending_executions(state)
+            main.reconcile_pending_executions(
+                state,
+                position_details={SYMBOL: late_position},
+            )
 
         fail_safe_close.assert_called_once_with(
             SYMBOL,
@@ -263,6 +288,274 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         remove_pending.assert_called_once_with(state, SYMBOL)
         protect.assert_not_called()
         self.assertNotIn(SYMBOL, state["pending_executions"])
+
+    def test_unknown_flat_symbol_clears_reservation_then_pending_without_rest(self):
+        pending = pending_execution(
+            context="DCA_LEVEL_2",
+            dca_level=2,
+            pre_position_amount=1.0,
+        )
+        state = {
+            "positions": {
+                SYMBOL: {
+                    "managed_by_bot": True,
+                    "pending_dca": {"level": 2, "execution_unsettled": True},
+                },
+            },
+            "pending_executions": {SYMBOL: pending},
+        }
+
+        events = []
+
+        def clear_reservation(current_state, symbol, level=None):
+            events.append(("clear", symbol, level))
+            current_state["positions"][symbol].pop("pending_dca", None)
+            return True
+
+        def remove_pending(current_state, symbol):
+            events.append(("remove", symbol))
+            return remove_in_memory(current_state, symbol)
+
+        with patch(
+            "main.is_known_futures_symbol",
+            return_value=False,
+        ), patch(
+            "main.clear_dca_reservation",
+            side_effect=clear_reservation,
+        ), patch(
+            "main.remove_pending_execution",
+            side_effect=remove_pending,
+        ), patch(
+            "main.reconcile_execution_client_orders",
+        ) as reconcile, patch(
+            "main._pending_execution_live_detail",
+        ) as live_detail, patch(
+            "main._secure_pending_execution_protection",
+        ) as protect, patch(
+            "main.cancel_open_protection_orders",
+        ) as cancel_protection, patch("main.log_warning"):
+            main.reconcile_pending_executions(state, position_details={})
+
+        self.assertEqual(
+            events,
+            [("clear", SYMBOL, 2), ("remove", SYMBOL)],
+        )
+        self.assertNotIn(SYMBOL, state["pending_executions"])
+        self.assertNotIn("pending_dca", state["positions"][SYMBOL])
+        self.assertNotIn(SYMBOL, main.entry_quarantined_symbols)
+        reconcile.assert_not_called()
+        live_detail.assert_not_called()
+        protect.assert_not_called()
+        cancel_protection.assert_not_called()
+
+    def test_catalog_unavailable_retains_and_quarantines_without_private_rest(self):
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending_execution()},
+        }
+
+        with patch(
+            "main.is_known_futures_symbol",
+            return_value=None,
+        ), patch(
+            "main.remove_pending_execution",
+        ) as remove_pending, patch(
+            "main.reconcile_execution_client_orders",
+        ) as reconcile, patch(
+            "main._pending_execution_live_detail",
+        ) as live_detail, patch("main.log_error"):
+            main.reconcile_pending_executions(state, position_details={})
+
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertIn(SYMBOL, main.entry_quarantined_symbols)
+        remove_pending.assert_not_called()
+        reconcile.assert_not_called()
+        live_detail.assert_not_called()
+
+    def test_unknown_symbol_with_live_global_row_is_retained_without_private_rest(self):
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending_execution()},
+        }
+        global_detail = {"symbol": SYMBOL, "amount": 1.0}
+
+        with patch(
+            "main.is_known_futures_symbol",
+            return_value=False,
+        ), patch(
+            "main.remove_pending_execution",
+        ) as remove_pending, patch(
+            "main.reconcile_execution_client_orders",
+        ) as reconcile, patch(
+            "main._pending_execution_live_detail",
+        ) as live_detail, patch("main.log_error"):
+            main.reconcile_pending_executions(
+                state,
+                position_details={SYMBOL: global_detail},
+            )
+
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertIn(SYMBOL, main.entry_quarantined_symbols)
+        remove_pending.assert_not_called()
+        reconcile.assert_not_called()
+        live_detail.assert_not_called()
+
+    def test_unknown_symbol_matches_normalized_global_snapshot_key(self):
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending_execution()},
+        }
+
+        with patch(
+            "main.is_known_futures_symbol",
+            return_value=False,
+        ), patch(
+            "main.remove_pending_execution",
+        ) as remove_pending, patch(
+            "main.reconcile_execution_client_orders",
+        ) as reconcile, patch("main.log_error"):
+            main.reconcile_pending_executions(
+                state,
+                position_details={SYMBOL.lower(): {"amount": 1.0}},
+            )
+
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertIn(SYMBOL, main.entry_quarantined_symbols)
+        remove_pending.assert_not_called()
+        reconcile.assert_not_called()
+
+    def test_unknown_symbol_retains_when_global_snapshot_is_unavailable(self):
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending_execution()},
+        }
+
+        with patch(
+            "main.get_open_position_details",
+            return_value=None,
+        ) as snapshot, patch(
+            "main.is_known_futures_symbol",
+            return_value=False,
+        ) as known_symbol, patch(
+            "main.remove_pending_execution",
+        ) as remove_pending, patch(
+            "main.reconcile_execution_client_orders",
+        ) as reconcile, patch("main.log_error"):
+            main.reconcile_pending_executions(state)
+
+        snapshot.assert_called_once_with(force=True)
+        known_symbol.assert_called_once_with(SYMBOL)
+        remove_pending.assert_not_called()
+        reconcile.assert_not_called()
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertIn(SYMBOL, main.entry_quarantined_symbols)
+
+    def test_unknown_dca_symbol_retains_when_reservation_cleanup_fails(self):
+        state = {
+            "positions": {},
+            "pending_executions": {
+                SYMBOL: pending_execution(context="DCA_LEVEL_2", dca_level=2),
+            },
+        }
+
+        with patch(
+            "main.is_known_futures_symbol",
+            return_value=False,
+        ), patch(
+            "main.clear_dca_reservation",
+            return_value=False,
+        ) as clear_reservation, patch(
+            "main.remove_pending_execution",
+        ) as remove_pending, patch(
+            "main.reconcile_execution_client_orders",
+        ) as reconcile, patch("main.log_error"):
+            main.reconcile_pending_executions(state, position_details={})
+
+        clear_reservation.assert_called_once_with(state, SYMBOL, 2)
+        remove_pending.assert_not_called()
+        reconcile.assert_not_called()
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertIn(SYMBOL, main.entry_quarantined_symbols)
+
+    def test_unknown_dca_with_missing_level_never_clears_existing_reservation(self):
+        state = {
+            "positions": {
+                SYMBOL: {
+                    "managed_by_bot": True,
+                    "pending_dca": {"level": 2, "execution_unsettled": True},
+                },
+            },
+            "pending_executions": {
+                SYMBOL: pending_execution(context="DCA_RECOVERY", dca_level=None),
+            },
+        }
+
+        with patch(
+            "main.is_known_futures_symbol",
+            return_value=False,
+        ), patch(
+            "main.clear_dca_reservation",
+        ) as clear_reservation, patch(
+            "main.remove_pending_execution",
+        ) as remove_pending, patch(
+            "main.reconcile_execution_client_orders",
+        ) as reconcile, patch("main.log_error"):
+            main.reconcile_pending_executions(state, position_details={})
+
+        clear_reservation.assert_not_called()
+        remove_pending.assert_not_called()
+        reconcile.assert_not_called()
+        self.assertIn("pending_dca", state["positions"][SYMBOL])
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertIn(SYMBOL, main.entry_quarantined_symbols)
+
+    def test_unknown_dca_without_level_or_reservation_removes_only_pending_marker(self):
+        state = {
+            "positions": {},
+            "pending_executions": {
+                SYMBOL: pending_execution(context="DCA_RECOVERY", dca_level=None),
+            },
+        }
+
+        with patch(
+            "main.is_known_futures_symbol",
+            return_value=False,
+        ), patch(
+            "main.clear_dca_reservation",
+        ) as clear_reservation, patch(
+            "main.remove_pending_execution",
+            side_effect=remove_in_memory,
+        ) as remove_pending, patch(
+            "main.reconcile_execution_client_orders",
+        ) as reconcile, patch("main.log_warning"):
+            main.reconcile_pending_executions(state, position_details={})
+
+        clear_reservation.assert_not_called()
+        remove_pending.assert_called_once_with(state, SYMBOL)
+        reconcile.assert_not_called()
+        self.assertNotIn(SYMBOL, state["pending_executions"])
+
+    def test_unknown_symbol_retains_when_pending_remove_is_not_durable(self):
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending_execution()},
+        }
+
+        with patch(
+            "main.is_known_futures_symbol",
+            return_value=False,
+        ), patch(
+            "main.remove_pending_execution",
+            return_value=False,
+        ) as remove_pending, patch(
+            "main.reconcile_execution_client_orders",
+        ) as reconcile, patch("main.log_error"):
+            main.reconcile_pending_executions(state, position_details={})
+
+        remove_pending.assert_called_once_with(state, SYMBOL)
+        reconcile.assert_not_called()
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertIn(SYMBOL, main.entry_quarantined_symbols)
 
     def test_entry_guard_blocks_symbol_with_pending_execution(self):
         pending = pending_execution()

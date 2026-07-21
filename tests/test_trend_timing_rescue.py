@@ -142,12 +142,17 @@ class TrendTimingRescueTests(unittest.TestCase):
             {**neutral, "supports_direction": False},
         ]
 
-        allowed, _ = validate_live_entry_guard(
-            "BUY",
-            object(),
-            object(),
-            100,
-        )
+        with patch.object(
+            config,
+            "LIVE_ENTRY_REQUIRE_BOTH_TIMEFRAMES",
+            False,
+        ):
+            allowed, _ = validate_live_entry_guard(
+                "BUY",
+                object(),
+                object(),
+                100,
+            )
         self.assertTrue(allowed)
 
         timeframe_check.side_effect = [
