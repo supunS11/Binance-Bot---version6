@@ -1117,6 +1117,135 @@ def validate_live_entry_guard(
     }
 
 
+def validate_dca_recovery_confirmation(side, fast_df, slow_df, mark_price):
+    """Require a real V6 live-frame recovery before the one recovery add."""
+    if not getattr(config, "DCA_RECOVERY_CONFIRMATION_ENABLED", True):
+        return True, {"reason": "DCA_RECOVERY_CONFIRMATION_DISABLED"}
+
+    if fast_df is None or slow_df is None or mark_price is None:
+        allowed = not getattr(config, "DCA_RECOVERY_REQUIRE_DATA", True)
+        return allowed, {
+            "reason": (
+                "DCA_RECOVERY_DATA_UNAVAILABLE_ALLOWED"
+                if allowed
+                else "DCA_RECOVERY_DATA_UNAVAILABLE"
+            )
+        }
+
+    # V6 deliberately retains its existing 5m/15m live confirmation frames;
+    # this recovery check never substitutes V7's entry/strategy timeframes.
+    fast = _live_entry_timeframe_check(
+        side,
+        fast_df,
+        mark_price,
+        config.LIVE_ENTRY_FAST_TIMEFRAME,
+    )
+    slow = _live_entry_timeframe_check(
+        side,
+        slow_df,
+        mark_price,
+        config.LIVE_ENTRY_SLOW_TIMEFRAME,
+    )
+    support_count = int(fast.get("supports_direction", False)) + int(
+        slow.get("supports_direction", False)
+    )
+    opposition_count = int(fast.get("opposes_direction", False)) + int(
+        slow.get("opposes_direction", False)
+    )
+    hard_block = bool(
+        fast.get("structure_break") or
+        slow.get("structure_break") or
+        fast.get("opposite_reversal") or
+        slow.get("opposite_reversal") or
+        opposition_count > 0
+    )
+    require_both = bool(
+        getattr(config, "DCA_RECOVERY_REQUIRE_BOTH_TIMEFRAMES", True)
+    )
+    required_support = 2 if require_both else 1
+    allowed = not hard_block and support_count >= required_support
+
+    return allowed, {
+        "reason": (
+            "DCA_RECOVERY_CONFIRMED"
+            if allowed
+            else "DCA_RECOVERY_NOT_CONFIRMED"
+        ),
+        "fast": fast,
+        "slow": slow,
+        "support_count": support_count,
+        "required_support": required_support,
+        "opposition_count": opposition_count,
+        "hard_block": hard_block,
+    }
+
+
+def evaluate_time_exit_weakness(side, trend_df, confirm_df):
+    """Score V6 confirmation deterioration with trend-frame evidence."""
+    unavailable = {
+        "should_exit": False,
+        "reason": "TIME_EXIT_DATA_UNAVAILABLE",
+        "weakness_score": 0,
+        "evidence": [],
+    }
+
+    try:
+        if trend_df is None or confirm_df is None:
+            return unavailable
+
+        trend = latest_closed(trend_df)
+        confirm = latest_closed(confirm_df)
+        confirm_previous = previous_closed(confirm_df)
+        evidence = []
+        confirm_weak = False
+        confirm_label = str(config.CONFIRMATION_TIMEFRAME).upper()
+        trend_label = str(config.TREND_TIMEFRAME).upper()
+
+        if side == "BUY":
+            checks = (
+                (f"{confirm_label}_CLOSE_BELOW_EMA20", confirm["close"] < confirm["ema20"], True),
+                (f"{confirm_label}_EMA20_BELOW_EMA50", confirm["ema20"] < confirm["ema50"], True),
+                (f"{confirm_label}_MACD_BEARISH", confirm["macd"] < confirm["macd_signal"], True),
+                (f"{confirm_label}_STRUCTURE_BREAK", confirm["close"] < confirm_previous["low"], True),
+                (f"{trend_label}_CLOSE_BELOW_EMA50", trend["close"] < trend["ema50"], False),
+                (f"{trend_label}_MACD_BEARISH", trend["macd"] < trend["macd_signal"], False),
+            )
+        else:
+            checks = (
+                (f"{confirm_label}_CLOSE_ABOVE_EMA20", confirm["close"] > confirm["ema20"], True),
+                (f"{confirm_label}_EMA20_ABOVE_EMA50", confirm["ema20"] > confirm["ema50"], True),
+                (f"{confirm_label}_MACD_BULLISH", confirm["macd"] > confirm["macd_signal"], True),
+                (f"{confirm_label}_STRUCTURE_BREAK", confirm["close"] > confirm_previous["high"], True),
+                (f"{trend_label}_CLOSE_ABOVE_EMA50", trend["close"] > trend["ema50"], False),
+                (f"{trend_label}_MACD_BULLISH", trend["macd"] > trend["macd_signal"], False),
+            )
+
+        for label, active, confirmation_evidence in checks:
+            if active:
+                evidence.append(label)
+                confirm_weak = confirm_weak or confirmation_evidence
+
+        score = len(evidence)
+        required_score = max(
+            get_config_float("TIME_EXIT_MIN_WEAKNESS_SCORE", 2),
+            1,
+        )
+        should_exit = bool(confirm_weak and score >= required_score)
+        return {
+            "should_exit": should_exit,
+            "reason": (
+                "TIME_EXIT_TREND_WEAKENED"
+                if should_exit
+                else "TIME_EXIT_WEAKNESS_INCOMPLETE"
+            ),
+            "weakness_score": score,
+            "required_score": required_score,
+            "evidence": evidence,
+        }
+    except Exception:
+        return unavailable
+
+
 def evaluate_route_early_invalidation(
     side,
     fast_df,

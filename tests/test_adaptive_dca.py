@@ -357,6 +357,14 @@ class AdaptiveDcaLiveManagerTests(unittest.TestCase):
 
         with patch.object(config, "DCA_ENABLED", True), patch.object(
             config,
+            "DCA_FIXED_RISK_ENABLED",
+            False,
+        ), patch.object(
+            config,
+            "POSITION_MANAGEMENT_LEGACY_ENABLED",
+            True,
+        ), patch.object(
+            config,
             "LEVERAGE",
             5,
         ), patch.object(config, "TP1_RUNNER_DISABLE_DCA", True), patch.object(

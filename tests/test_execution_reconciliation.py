@@ -72,6 +72,60 @@ def reconciled_market_order(
     }
 
 
+class ExecutionSettlementSafetyTests(unittest.TestCase):
+    def test_positive_fill_requires_verified_position_snapshot(self):
+        self.assertFalse(
+            exchange.is_reconciled_execution_settled(
+                reconciled_market_order(1.0, position_verified=False)
+            )
+        )
+        self.assertTrue(
+            exchange.is_reconciled_execution_settled(
+                reconciled_market_order(1.0, position_verified=True)
+            )
+        )
+
+    def test_terminal_zero_fill_does_not_require_position_snapshot(self):
+        self.assertTrue(
+            exchange.is_reconciled_execution_settled(
+                reconciled_market_order(0.0, position_verified=False)
+            )
+        )
+
+    def test_rejected_standalone_stop_is_not_marked_protected(self):
+        with patch.object(
+            exchange,
+            "is_stop_loss_enabled_for_signal",
+            return_value=True,
+        ), patch.object(
+            exchange,
+            "get_price_precision",
+            return_value=2,
+        ), patch.object(
+            exchange,
+            "get_mark_price",
+            return_value=100.0,
+        ), patch.object(
+            exchange,
+            "normalize_trigger_price",
+            return_value=95.0,
+        ), patch.object(
+            exchange,
+            "place_close_position_protection",
+            return_value={"algoId": "rejected-stop", "algoStatus": "REJECTED"},
+        ):
+            result = exchange.place_stop_loss_only(
+                SYMBOL,
+                "BUY",
+                100.0,
+                confirm_df=None,
+                signal_type="TREND",
+                sl_price_override=95.0,
+            )
+
+        self.assertFalse(result["ok"])
+
+
 class PositionModeVerificationTests(unittest.TestCase):
     def test_one_way_mode_requires_an_explicit_false_value(self):
         responses = (

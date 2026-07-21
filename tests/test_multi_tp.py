@@ -321,7 +321,7 @@ class MultiTpExchangeTests(unittest.TestCase):
         self.assertIn("partial rejected", result["multi_tp_fallback_reason"])
         full_order.assert_called_once()
 
-    def test_accepted_partial_tp_is_cancelled_when_later_protection_fails(self):
+    def test_failed_hard_stop_blocks_partial_tp_submission(self):
         with patch.object(config, "MULTI_TP_ENABLED", True), patch.object(
             config,
             "STATIC_TP_ENABLED",
@@ -340,8 +340,7 @@ class MultiTpExchangeTests(unittest.TestCase):
             return_value=100,
         ), patch(
             "exchange.place_partial_take_profit",
-            return_value=({"algoId": 123}, 0.5),
-        ), patch(
+        ) as partial_tp, patch(
             "exchange.place_close_position_protection",
             side_effect=RuntimeError("SL endpoint unavailable"),
         ), patch(
@@ -362,9 +361,10 @@ class MultiTpExchangeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["multi_tp_active"])
         self.assertIsNone(result["tp_order"])
-        cancel.assert_called_once_with("BTCUSDT", 123)
+        partial_tp.assert_not_called()
+        cancel.assert_not_called()
 
-    def test_uncancelled_partial_tp_remains_tracked_and_blocks_retry(self):
+    def test_rejected_hard_stop_blocks_partial_tp_submission(self):
         with patch.object(config, "MULTI_TP_ENABLED", True), patch.object(
             config,
             "STATIC_TP_ENABLED",
@@ -383,13 +383,9 @@ class MultiTpExchangeTests(unittest.TestCase):
             return_value=100,
         ), patch(
             "exchange.place_partial_take_profit",
-            return_value=({"algoId": 123}, 0.5),
-        ), patch(
+        ) as partial_tp, patch(
             "exchange.place_close_position_protection",
-            side_effect=RuntimeError("SL endpoint unavailable"),
-        ), patch(
-            "exchange.cancel_algo_order",
-            return_value=False,
+            return_value={"algoId": 123, "algoStatus": "REJECTED"},
         ):
             result = exchange.place_tp_sl(
                 "BTCUSDT",
@@ -403,10 +399,10 @@ class MultiTpExchangeTests(unittest.TestCase):
             )
 
         self.assertFalse(result["ok"])
-        self.assertTrue(result["multi_tp_active"])
-        self.assertTrue(result["protection_cleanup_failed"])
-        self.assertEqual(result["uncancelled_tp_order_id"], 123)
-        self.assertEqual(result["tp_order"]["algoId"], 123)
+        self.assertFalse(result["multi_tp_active"])
+        self.assertFalse(result["sl_created"])
+        self.assertEqual(result["sl_order"]["algoId"], 123)
+        partial_tp.assert_not_called()
 
 
 class MultiTpMonitorTests(unittest.TestCase):

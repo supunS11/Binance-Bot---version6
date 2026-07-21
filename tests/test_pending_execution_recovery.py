@@ -199,6 +199,9 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
             "main._pending_execution_live_detail",
             return_value=(True, unchanged_position),
         ), patch(
+            "main._secure_pending_execution_protection",
+            return_value=True,
+        ) as secure_protection, patch(
             "main.clear_dca_reservation",
             side_effect=clear_reservation,
         ) as clear_dca, patch(
@@ -209,6 +212,12 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         ) as fail_safe_close, patch("main.log_warning"):
             main.reconcile_pending_executions(state)
 
+        secure_protection.assert_called_once_with(
+            state,
+            SYMBOL,
+            pending,
+            unchanged_position,
+        )
         clear_dca.assert_called_once_with(state, SYMBOL, 2)
         remove_pending.assert_called_once_with(state, SYMBOL)
         fail_safe_close.assert_not_called()
@@ -317,6 +326,14 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         }
 
         with patch.object(config, "DCA_ENABLED", True), patch.object(
+            config,
+            "DCA_FIXED_RISK_ENABLED",
+            False,
+        ), patch.object(
+            config,
+            "POSITION_MANAGEMENT_LEGACY_ENABLED",
+            True,
+        ), patch.object(
             main.shutdown_event,
             "is_set",
             return_value=False,

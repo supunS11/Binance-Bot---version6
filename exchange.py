@@ -1816,6 +1816,94 @@ def get_open_stop_loss_info(symbol):
         return {}
 
 
+def find_matching_close_position_stop(
+    symbol,
+    side,
+    stop_price,
+    position_side=None,
+):
+    """Find the exact immutable close-all MARK_PRICE stop for a campaign."""
+    try:
+        expected_close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
+        expected_position_side = str(position_side or "BOTH").upper()
+        precision = get_price_precision(symbol)
+        tolerance = max((10 ** -max(precision, 0)) * 0.51, 1e-12)
+
+        def match(order, source):
+            order_type = str(
+                order.get("orderType") or order.get("type") or ""
+            ).upper()
+            order_side = str(order.get("side") or "").upper()
+            order_position_side = str(order.get("positionSide") or "").upper()
+            working_type = str(order.get("workingType") or "").upper()
+            close_position = str(
+                order.get("closePosition", "")
+            ).lower() == "true"
+            trigger = _order_trigger_price(order)
+
+            if order_type != "STOP_MARKET":
+                return None
+
+            if order_side != expected_close_side or not close_position:
+                return None
+
+            if working_type != "MARK_PRICE":
+                return None
+
+            if order_position_side != expected_position_side:
+                return None
+
+            if trigger is None or abs(float(trigger) - float(stop_price)) > tolerance:
+                return None
+
+            order_id = (
+                order.get("algoId")
+                if source == "algo"
+                else order.get("orderId")
+            )
+
+            if not order_id:
+                return None
+
+            return {
+                "sl_price": float(trigger),
+                "price": float(trigger),
+                "type": order_type,
+                "source": source,
+                "order_id": order_id,
+                "side": order_side,
+                "position_side": order_position_side,
+                "working_type": working_type,
+                "close_position": True,
+            }
+
+        orders = _private_rest_call(
+            f"futures_get_open_orders:{symbol}",
+            client.futures_get_open_orders,
+            symbol=symbol,
+        )
+
+        for order in orders:
+            matched = match(order, "order")
+
+            if matched:
+                return matched
+
+        for order in _normalise_algo_orders(_get_open_algo_orders(symbol)):
+            matched = match(order, "algo")
+
+            if matched:
+                return matched
+
+        return {}
+    except Exception as e:
+        log_warning(f"{symbol} exact hard-stop lookup error: {e}")
+        # None means the exchange query itself was unavailable. Callers must
+        # not interpret that as proof that the stop is missing and create a
+        # duplicate close-all order.
+        return None
+
+
 def cancel_open_protection_orders(symbol):
 
     try:
@@ -1877,6 +1965,101 @@ def cancel_open_protection_orders(symbol):
 
     except Exception as e:
         log_error(f"{symbol} protection cancel error: {e}")
+        return False
+
+
+def cancel_open_take_profit_orders(symbol):
+    """Cancel take-profit orders while leaving every stop order untouched."""
+    try:
+        tp_types = {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}
+        orders = _private_rest_call(
+            f"futures_get_open_orders:{symbol}",
+            client.futures_get_open_orders,
+            symbol=symbol,
+        )
+        cancelled = 0
+
+        for order in orders:
+            order_type = str(order.get("type") or "").upper()
+
+            if order_type not in tp_types:
+                continue
+
+            _private_rest_call(
+                f"futures_cancel_order:{symbol}",
+                client.futures_cancel_order,
+                symbol=symbol,
+                orderId=order["orderId"],
+            )
+            cancelled += 1
+
+        algo_cancelled = 0
+
+        for order in _normalise_algo_orders(_get_open_algo_orders(symbol)):
+            order_type = str(
+                order.get("orderType") or order.get("type") or ""
+            ).upper()
+
+            if order_type not in tp_types:
+                continue
+
+            algo_id = order.get("algoId")
+
+            if not algo_id:
+                log_warning(
+                    f"{symbol} algo take profit missing algoId; cancel unsafe"
+                )
+                return False
+
+            _cancel_algo_order(symbol, algo_id)
+            algo_cancelled += 1
+
+        if cancelled or algo_cancelled:
+            log_info(
+                f"{symbol} cancelled {cancelled + algo_cancelled} "
+                "take-profit order(s); stop preserved"
+            )
+
+        verify_attempts = max(
+            int(getattr(config, "EXECUTION_VERIFY_ATTEMPTS", 3)),
+            1,
+        )
+        verify_delay = max(
+            float(getattr(config, "EXECUTION_VERIFY_DELAY_SECONDS", 0.25)),
+            0,
+        )
+
+        for attempt in range(1, verify_attempts + 1):
+            remaining_normal = _private_rest_call(
+                f"futures_get_open_orders:{symbol}",
+                client.futures_get_open_orders,
+                symbol=symbol,
+            )
+            remaining_algo = _normalise_algo_orders(
+                _get_open_algo_orders(symbol)
+            )
+            remaining_tp = [
+                order
+                for order in list(remaining_normal) + list(remaining_algo)
+                if str(
+                    order.get("orderType") or order.get("type") or ""
+                ).upper() in tp_types
+            ]
+
+            if not remaining_tp:
+                return True
+
+            if attempt < verify_attempts and verify_delay > 0:
+                time.sleep(verify_delay)
+
+        log_error(
+            f"{symbol} take-profit cancellation was not confirmed | "
+            f"REMAINING={len(remaining_tp)}"
+        )
+        return False
+
+    except Exception as e:
+        log_error(f"{symbol} take-profit cancel error: {e}")
         return False
 
 
@@ -2271,7 +2454,21 @@ def is_reconciled_execution_settled(order):
     if not isinstance(reconciliation, dict):
         return True
 
-    return bool(reconciliation.get("order_terminal", True))
+    if not bool(reconciliation.get("order_terminal", True)):
+        return False
+
+    executed_quantity = _execution_quantity(
+        reconciliation.get("executed_quantity")
+    )
+
+    # A terminal zero-fill is settled without a position. Any positive fill is
+    # not safe to hand to position management until the post-order position
+    # snapshot was explicitly verified; exchange order and position endpoints
+    # can briefly disagree after a fill.
+    if executed_quantity <= 0:
+        return True
+
+    return reconciliation.get("position_verified") is True
 
 
 _TERMINAL_EXECUTION_ORDER_STATUSES = {
@@ -4365,6 +4562,7 @@ def place_stop_loss_only(
     confirm_df,
     signal_type=None,
     position_side=None,
+    sl_price_override=None,
 ):
     signal_type = str(signal_type or "").upper().strip()
     details = {
@@ -4386,12 +4584,16 @@ def place_stop_loss_only(
         if market_price is None:
             return details
 
-        sl_price = get_signal_stop_loss(
-            side,
-            entry_price,
-            confirm_df,
-            signal_type,
-            precision,
+        sl_price = (
+            float(sl_price_override)
+            if sl_price_override is not None
+            else get_signal_stop_loss(
+                side,
+                entry_price,
+                confirm_df,
+                signal_type,
+                precision,
+            )
         )
         sl_price = normalize_trigger_price(
             symbol,
@@ -4427,10 +4629,7 @@ def place_stop_loss_only(
             position_side=position_side,
         )
         details["sl_order"] = sl_order
-        details["ok"] = bool(
-            sl_order and
-            (sl_order.get("algoId") or sl_order.get("orderId"))
-        )
+        details["ok"] = bool(_accepted_order_id(sl_order))
 
         if details["ok"]:
             log_info(
@@ -4460,7 +4659,9 @@ def place_tp_sl(
     signal_type=None,
     enable_multi_tp=False,
     position_side=None,
-    return_details=False
+    sl_price_override=None,
+    preserve_existing_sl=False,
+    return_details=False,
 ):
     signal_type = str(signal_type or "").upper().strip()
     sl_enabled = is_stop_loss_enabled_for_signal(signal_type)
@@ -4493,7 +4694,36 @@ def place_tp_sl(
         if market_price is None:
             return details if return_details else False
 
-        if side == SIDE_BUY:
+        existing_sl_info = {}
+
+        if sl_enabled and preserve_existing_sl:
+            if sl_price_override is not None:
+                existing_sl_info = find_matching_close_position_stop(
+                    symbol,
+                    side,
+                    sl_price_override,
+                    position_side=position_side,
+                )
+
+                if existing_sl_info is None:
+                    raise RuntimeError(
+                        f"{symbol} existing hard stop could not be verified; "
+                        "TP reprice blocked"
+                    )
+            else:
+                existing_sl_info = get_open_stop_loss_info(symbol) or {}
+
+            sl_price = existing_sl_info.get("sl_price")
+
+            if sl_price in (None, ""):
+                raise RuntimeError(
+                    f"{symbol} existing hard stop was not found; TP reprice blocked"
+                )
+
+            sl_price = float(sl_price)
+        elif sl_price_override is not None:
+            sl_price = float(sl_price_override)
+        elif side == SIDE_BUY:
             sl_price = get_signal_stop_loss(
                 SIDE_BUY,
                 entry_price,
@@ -4689,6 +4919,61 @@ def place_tp_sl(
             f"TYPE={signal_type or 'UNKNOWN'}"
         )
 
+        # Establish the exchange hard stop before creating any take-profit
+        # order. A later TP failure therefore cannot leave the live position
+        # without downside protection.
+        if sl_enabled:
+            if preserve_existing_sl:
+                existing_order_id = existing_sl_info.get("order_id")
+                details["sl_order"] = {
+                    (
+                        "algoId"
+                        if existing_sl_info.get("source") == "algo"
+                        else "orderId"
+                    ): existing_order_id,
+                }
+                details["sl_created"] = bool(existing_order_id)
+                details["sl_preserved"] = details["sl_created"]
+
+                if not details["sl_created"]:
+                    raise RuntimeError(
+                        f"{symbol} existing hard stop has no accepted order id"
+                    )
+
+                log_info(
+                    f"{symbol} existing hard stop preserved | SL={sl_price}"
+                )
+            else:
+                sl_order = place_close_position_protection(
+                    symbol,
+                    side,
+                    "STOP_MARKET",
+                    sl_price,
+                    position_side=position_side,
+                )
+                details["sl_order"] = sl_order
+                details["sl_created"] = bool(_accepted_order_id(sl_order))
+
+                if not details["sl_created"]:
+                    raise RuntimeError(
+                        f"{symbol} SL order was not accepted | RESPONSE={sl_order}"
+                    )
+
+                log_info(
+                    f"{symbol} SL order response | "
+                    f"ALGO_ID={sl_order.get('algoId')} | "
+                    f"STATUS={sl_order.get('algoStatus')} | "
+                    f"TRIGGER={sl_order.get('triggerPrice')} | "
+                    f"TYPE={sl_order.get('orderType')}"
+                )
+        else:
+            log_warning(
+                f"{symbol} SL DISABLED | TYPE={signal_type or 'UNKNOWN'}"
+            )
+
+        if sl_enabled and not preserve_existing_sl:
+            time.sleep(config.PROTECTION_ORDER_DELAY_SECONDS)
+
         # TAKE PROFIT
         tp_order = None
         partial_quantity = 0.0
@@ -4760,37 +5045,6 @@ def place_tp_sl(
             f"TYPE={tp_order.get('orderType')}"
         )
         details["tp_order"] = tp_order
-
-        if sl_enabled:
-            time.sleep(config.PROTECTION_ORDER_DELAY_SECONDS)
-
-            # STOP LOSS
-            sl_order = place_close_position_protection(
-                symbol,
-                side,
-                "STOP_MARKET",
-                sl_price,
-                position_side=position_side,
-            )
-            details["sl_order"] = sl_order
-            details["sl_created"] = bool(_accepted_order_id(sl_order))
-
-            if not details["sl_created"]:
-                raise RuntimeError(
-                    f"{symbol} SL order was not accepted | RESPONSE={sl_order}"
-                )
-
-            log_info(
-                f"{symbol} SL order response | "
-                f"ALGO_ID={sl_order.get('algoId')} | "
-                f"STATUS={sl_order.get('algoStatus')} | "
-                f"TRIGGER={sl_order.get('triggerPrice')} | "
-                f"TYPE={sl_order.get('orderType')}"
-            )
-        else:
-            log_warning(
-                f"{symbol} SL DISABLED | TYPE={signal_type or 'UNKNOWN'}"
-            )
 
         log_info(f"{symbol} TP CREATED")
         details["ok"] = True
