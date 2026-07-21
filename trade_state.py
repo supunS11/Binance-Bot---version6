@@ -326,6 +326,164 @@ def remove_pending_execution(state, symbol):
     return False
 
 
+def _normalized_client_order_ids(value):
+    if isinstance(value, str):
+        values = value.split(",")
+    else:
+        values = value or []
+
+    return tuple(
+        str(item or "").strip()
+        for item in values
+        if str(item or "").strip()
+    )
+
+
+def clear_confirmed_absent_entry_execution(
+    state,
+    symbol,
+    expected_client_order_ids,
+):
+    """Atomically clear a proven-zero-fill ENTRY and its safe submit marker."""
+    expected_ids = _normalized_client_order_ids(expected_client_order_ids)
+
+    if not expected_ids:
+        return False
+
+    attempts, retry_delay = _state_write_retry_settings()
+
+    for attempt in range(1, attempts + 1):
+        try:
+            with _state_file_lock():
+                latest_state = _load_trade_state_unlocked()
+                pending_executions = latest_state.setdefault(
+                    "pending_executions",
+                    {},
+                )
+                pending = pending_executions.get(symbol)
+
+                if not pending:
+                    return False
+
+                persisted_ids = _normalized_client_order_ids(
+                    pending.get("client_order_ids")
+                )
+
+                if persisted_ids != expected_ids:
+                    log_error(
+                        f"{symbol} confirmed-absence cleanup blocked | "
+                        "pending client IDs changed"
+                    )
+                    return False
+
+                if (
+                    str(pending.get("symbol") or "").strip().upper() !=
+                    str(symbol or "").strip().upper()
+                ):
+                    log_error(
+                        f"{symbol} confirmed-absence cleanup blocked | "
+                        "pending symbol identity changed"
+                    )
+                    return False
+
+                if str(pending.get("context") or "").upper() != "ENTRY":
+                    log_error(
+                        f"{symbol} confirmed-absence cleanup blocked | "
+                        "pending context is not ENTRY"
+                    )
+                    return False
+
+                try:
+                    pre_position_amount = abs(
+                        float(pending.get("pre_position_amount", 0) or 0)
+                    )
+                    max_executed_quantity = max(
+                        float(pending.get("max_executed_quantity", 0) or 0),
+                        0,
+                    )
+                    absence_streak = int(
+                        pending.get("absence_evidence_streak", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    log_error(
+                        f"{symbol} confirmed-absence cleanup blocked | "
+                        "pending evidence is malformed"
+                    )
+                    return False
+
+                required_confirmations = max(
+                    int(
+                        getattr(
+                            config,
+                            "PENDING_EXECUTION_ABSENCE_CONFIRMATIONS",
+                            3,
+                        )
+                    ),
+                    3,
+                )
+
+                if (
+                    pre_position_amount > 1e-12 or
+                    pending.get("order_seen") or
+                    max_executed_quantity > 0 or
+                    pending.get("order_ids") or
+                    absence_streak < required_confirmations
+                ):
+                    log_error(
+                        f"{symbol} confirmed-absence cleanup blocked | "
+                        "durable zero-fill evidence is incomplete"
+                    )
+                    return False
+
+                positions = latest_state.setdefault("positions", {})
+                position_state = positions.get(symbol)
+
+                if position_state:
+                    pending_submission = position_state.get(
+                        "pending_submission"
+                    ) or {}
+                    safe_submit_marker = bool(
+                        position_state.get("managed_by_bot") is True and
+                        str(
+                            position_state.get("position_management_status") or ""
+                        ).upper() == "ENTRY_READY_TO_SUBMIT" and
+                        abs(
+                            float(position_state.get("initial_quantity", 0) or 0)
+                        ) <= 1e-12 and
+                        str(pending_submission.get("context") or "").upper()
+                        == "ENTRY" and
+                        str(
+                            pending_submission.get("submission_phase") or ""
+                        ).upper() == "READY_TO_SUBMIT"
+                    )
+
+                    if not safe_submit_marker:
+                        log_error(
+                            f"{symbol} confirmed-absence cleanup blocked | "
+                            "position state is not a safe zero-quantity entry marker"
+                        )
+                        return False
+
+                    positions.pop(symbol, None)
+
+                pending_executions.pop(symbol, None)
+                _save_trade_state_unlocked(latest_state)
+                state["pending_executions"] = pending_executions
+                state["positions"] = positions
+            return True
+
+        except Exception as e:
+            log_error(
+                f"{symbol} confirmed-absence cleanup error | "
+                f"ATTEMPT={attempt}/{attempts}: {e}"
+            )
+
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+
+    return False
+
+
 def upsert_position_state(state, symbol, data):
     attempts = max(
         int(getattr(config, "STATE_UPSERT_RETRY_ATTEMPTS", 3)),

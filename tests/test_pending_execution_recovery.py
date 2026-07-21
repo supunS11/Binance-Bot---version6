@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -48,6 +49,59 @@ def terminal_result(terminal):
         "verification_attempts": 1,
         "error": "" if terminal else "status unavailable",
     }
+
+
+def confirmed_absence_result():
+    result = terminal_result(False)
+    result.update({
+        "order_seen": False,
+        "max_executed_quantity": 0.0,
+        "client_outcomes": [
+            {
+                "client_order_id": "cid-ioc",
+                "state": "ABSENT_CONFIRMED_CYCLE",
+                "terminal": False,
+                "order_seen": False,
+                "absence_confirmed": True,
+            },
+            {
+                "client_order_id": "cid-market",
+                "state": "ABSENT_CONFIRMED_CYCLE",
+                "terminal": False,
+                "order_seen": False,
+                "absence_confirmed": True,
+            },
+        ],
+        "absence_evidence": {
+            "confirmed": True,
+            "confirmed_client_order_ids": ["cid-ioc", "cid-market"],
+            "required_client_order_ids": ["cid-ioc", "cid-market"],
+            "open_orders_available": True,
+            "all_orders_available": True,
+            "open_order_matches": [],
+            "history_order_matches": [],
+            "errors": [],
+        },
+    })
+    return result
+
+
+def old_pending_execution(**updates):
+    values = {
+        "created_at": (datetime.now() - timedelta(seconds=90)).isoformat(
+            timespec="seconds"
+        ),
+        "order_seen": False,
+        "max_executed_quantity": 0.0,
+        "absence_evidence_streak": 0,
+        "reconciliation": {
+            "executed_quantity": 0.0,
+            "order_ids": "",
+            "order_seen": False,
+        },
+    }
+    values.update(updates)
+    return pending_execution(**values)
 
 
 def persist_in_memory(state, symbol, data):
@@ -179,6 +233,205 @@ class PendingExecutionRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(recovered["emergency_tp_price"], 111.0)
         self.assertEqual(recovered["emergency_sl_price"], 96.0)
+
+    def test_confirmed_absence_requires_three_durable_cycles_then_clears(self):
+        pending = old_pending_execution()
+        state = {
+            "positions": {
+                SYMBOL: {
+                    "managed_by_bot": True,
+                    "position_management_status": "ENTRY_READY_TO_SUBMIT",
+                    "initial_quantity": 0.0,
+                    "pending_submission": {
+                        "context": "ENTRY",
+                        "submission_phase": "READY_TO_SUBMIT",
+                    },
+                },
+            },
+            "pending_executions": {SYMBOL: pending},
+        }
+
+        def clear_confirmed(current_state, symbol, expected_ids):
+            current_state["pending_executions"].pop(symbol, None)
+            current_state["positions"].pop(symbol, None)
+            return True
+
+        with patch.object(
+            config,
+            "PENDING_EXECUTION_ABSENCE_GRACE_SECONDS",
+            60,
+        ), patch.object(
+            config,
+            "PENDING_EXECUTION_ABSENCE_CONFIRMATIONS",
+            3,
+        ), patch(
+            "main.reconcile_execution_client_orders",
+            side_effect=lambda *args, **kwargs: confirmed_absence_result(),
+        ) as reconcile, patch(
+            "main._pending_execution_live_detail",
+            return_value=(True, None),
+        ), patch(
+            "main.upsert_pending_execution",
+            side_effect=persist_in_memory,
+        ) as upsert, patch(
+            "main.clear_confirmed_absent_entry_execution",
+            side_effect=clear_confirmed,
+        ) as clear_confirmed_entry, patch(
+            "main.cancel_open_protection_orders",
+        ) as cancel_protection, patch(
+            "main.fail_safe_close_unprotected_position",
+        ) as fail_safe_close, patch("main.log_error"), patch("main.log_warning"):
+            main.reconcile_pending_executions(state, position_details={})
+            self.assertEqual(pending["absence_evidence_streak"], 1)
+            self.assertIn(SYMBOL, state["pending_executions"])
+            main.reconcile_pending_executions(state, position_details={})
+            self.assertEqual(pending["absence_evidence_streak"], 2)
+            self.assertIn(SYMBOL, state["pending_executions"])
+            main.reconcile_pending_executions(state, position_details={})
+
+        self.assertEqual(reconcile.call_count, 3)
+        self.assertEqual(upsert.call_count, 3)
+        clear_confirmed_entry.assert_called_once_with(
+            state,
+            SYMBOL,
+            ("cid-ioc", "cid-market"),
+        )
+        self.assertNotIn(SYMBOL, state["pending_executions"])
+        self.assertNotIn(SYMBOL, state["positions"])
+        cancel_protection.assert_not_called()
+        fail_safe_close.assert_not_called()
+
+    def test_absence_uncertainty_resets_streak_and_prevents_cleanup(self):
+        pending = old_pending_execution()
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending},
+        }
+        uncertain = terminal_result(False)
+
+        with patch.object(
+            config,
+            "PENDING_EXECUTION_ABSENCE_GRACE_SECONDS",
+            60,
+        ), patch.object(
+            config,
+            "PENDING_EXECUTION_ABSENCE_CONFIRMATIONS",
+            3,
+        ), patch(
+            "main.reconcile_execution_client_orders",
+            side_effect=[
+                confirmed_absence_result(),
+                uncertain,
+                confirmed_absence_result(),
+            ],
+        ), patch(
+            "main._pending_execution_live_detail",
+            return_value=(True, None),
+        ), patch(
+            "main.upsert_pending_execution",
+            side_effect=persist_in_memory,
+        ), patch(
+            "main.clear_confirmed_absent_entry_execution",
+        ) as clear_confirmed_entry, patch("main.log_error"):
+            main.reconcile_pending_executions(state, position_details={})
+            self.assertEqual(pending["absence_evidence_streak"], 1)
+            main.reconcile_pending_executions(state, position_details={})
+            self.assertEqual(pending["absence_evidence_streak"], 0)
+            main.reconcile_pending_executions(state, position_details={})
+
+        self.assertEqual(pending["absence_evidence_streak"], 1)
+        clear_confirmed_entry.assert_not_called()
+        self.assertIn(SYMBOL, state["pending_executions"])
+
+    def test_order_seen_and_executed_quantity_are_monotonic_and_block_absence(self):
+        pending = old_pending_execution()
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending},
+        }
+        order_seen_result = terminal_result(False)
+        order_seen_result.update({
+            "order_seen": True,
+            "executed_quantity": 0.25,
+            "order_ids": "123",
+            "orders": [{"orderId": 123, "status": "NEW"}],
+        })
+
+        with patch(
+            "main.reconcile_execution_client_orders",
+            side_effect=[
+                order_seen_result,
+                confirmed_absence_result(),
+                confirmed_absence_result(),
+                confirmed_absence_result(),
+            ],
+        ), patch(
+            "main._pending_execution_live_detail",
+            return_value=(True, None),
+        ), patch(
+            "main.upsert_pending_execution",
+            side_effect=persist_in_memory,
+        ), patch(
+            "main.clear_confirmed_absent_entry_execution",
+        ) as clear_confirmed_entry, patch("main.log_error"):
+            for _ in range(4):
+                main.reconcile_pending_executions(state, position_details={})
+
+        self.assertTrue(pending["order_seen"])
+        self.assertEqual(pending["max_executed_quantity"], 0.25)
+        self.assertEqual(pending["absence_evidence_streak"], 0)
+        clear_confirmed_entry.assert_not_called()
+
+    def test_nonterminal_fail_safe_close_retains_origin_pending_marker(self):
+        pending = old_pending_execution()
+        state = {
+            "positions": {},
+            "pending_executions": {SYMBOL: pending},
+        }
+        live_detail = {
+            "amount": 0.4,
+            "side": "BUY",
+            "position_side": "BOTH",
+            "entry_price": 101.0,
+            "mark_price": 102.0,
+        }
+        unresolved_fill = terminal_result(False)
+        unresolved_fill["executed_quantity"] = 0.4
+        unresolved_fill["order_seen"] = True
+        unresolved_fill["orders"] = [{"orderId": 123, "status": "NEW"}]
+
+        with patch(
+            "main.reconcile_execution_client_orders",
+            return_value=unresolved_fill,
+        ), patch(
+            "main._pending_execution_live_detail",
+            return_value=(True, live_detail),
+        ), patch(
+            "main._secure_pending_execution_protection",
+            return_value=False,
+        ), patch(
+            "main.fail_safe_close_unprotected_position",
+            return_value=True,
+        ) as fail_safe_close, patch(
+            "main.upsert_pending_execution",
+            side_effect=persist_in_memory,
+        ) as upsert, patch(
+            "main.remove_pending_execution",
+        ) as remove_pending, patch("main.log_error"):
+            main.reconcile_pending_executions(
+                state,
+                position_details={SYMBOL: live_detail},
+            )
+
+        fail_safe_close.assert_called_once()
+        upsert.assert_called_once()
+        remove_pending.assert_not_called()
+        self.assertIn(SYMBOL, state["pending_executions"])
+        self.assertTrue(pending["unsettled_exposure_closed"])
+        self.assertEqual(
+            pending["emergency_protection_error"],
+            "EXPOSURE_CLOSED_ORIGIN_ORDER_STILL_UNSETTLED",
+        )
 
     def test_terminal_no_new_fill_clears_pending_and_dca_reservation(self):
         pending = pending_execution(
@@ -687,6 +940,77 @@ class PendingExecutionStatePersistenceTests(unittest.TestCase):
                 )
                 persisted = trade_state.load_trade_state()
                 self.assertNotIn(SYMBOL, persisted["pending_executions"])
+
+    def test_confirmed_absence_cleanup_atomically_removes_safe_entry_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "trade_state.json"
+            state = {
+                "positions": {
+                    SYMBOL: {
+                        "managed_by_bot": True,
+                        "position_management_status": "ENTRY_READY_TO_SUBMIT",
+                        "initial_quantity": 0.0,
+                        "pending_submission": {
+                            "context": "ENTRY",
+                            "submission_phase": "READY_TO_SUBMIT",
+                        },
+                    },
+                },
+                "pending_executions": {
+                    SYMBOL: old_pending_execution(absence_evidence_streak=3),
+                },
+            }
+
+            with patch.object(config, "DCA_STATE_PATH", str(state_path)):
+                self.assertTrue(trade_state.save_trade_state(state))
+                self.assertTrue(
+                    trade_state.clear_confirmed_absent_entry_execution(
+                        state,
+                        SYMBOL,
+                        ("cid-ioc", "cid-market"),
+                    )
+                )
+                persisted = trade_state.load_trade_state()
+
+            self.assertNotIn(SYMBOL, persisted["pending_executions"])
+            self.assertNotIn(SYMBOL, persisted["positions"])
+
+    def test_confirmed_absence_cleanup_rejects_changed_ids_or_live_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "trade_state.json"
+            base_state = {
+                "positions": {
+                    SYMBOL: {
+                        "managed_by_bot": True,
+                        "position_management_status": "ACTIVE",
+                        "initial_quantity": 1.0,
+                    },
+                },
+                "pending_executions": {
+                    SYMBOL: old_pending_execution(absence_evidence_streak=3),
+                },
+            }
+
+            with patch.object(config, "DCA_STATE_PATH", str(state_path)):
+                self.assertTrue(trade_state.save_trade_state(base_state))
+                self.assertFalse(
+                    trade_state.clear_confirmed_absent_entry_execution(
+                        base_state,
+                        SYMBOL,
+                        ("different-id",),
+                    )
+                )
+                self.assertFalse(
+                    trade_state.clear_confirmed_absent_entry_execution(
+                        base_state,
+                        SYMBOL,
+                        ("cid-ioc", "cid-market"),
+                    )
+                )
+                persisted = trade_state.load_trade_state()
+
+            self.assertIn(SYMBOL, persisted["pending_executions"])
+            self.assertIn(SYMBOL, persisted["positions"])
 
 
 if __name__ == "__main__":

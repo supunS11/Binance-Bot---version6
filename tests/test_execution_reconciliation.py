@@ -230,6 +230,174 @@ class OfflineExecutionCase(unittest.TestCase):
         return submit, fallback
 
 
+class PendingOrderEvidenceTests(OfflineExecutionCase):
+    @staticmethod
+    def _query_absent():
+        return ["APIError(code=-2013): Order does not exist."]
+
+    def test_deterministic_absence_requires_both_successful_sweeps(self):
+        self._patch(
+            exchange,
+            "_resolve_entry_order",
+            side_effect=[
+                (None, False, 1, self._query_absent()),
+                (None, False, 1, self._query_absent()),
+            ],
+        )
+        self._patch(
+            exchange,
+            "_cancel_unsettled_entry_order",
+            return_value=(
+                None,
+                "APIError(code=-2011): Unknown order sent.",
+            ),
+        )
+        sweep = self._patch(
+            exchange,
+            "_sweep_execution_order_evidence",
+            return_value={
+                "open_orders_available": True,
+                "all_orders_available": True,
+                "open_order_matches": [],
+                "history_order_matches": [],
+                "errors": [],
+            },
+        )
+
+        result = exchange.reconcile_execution_client_orders(
+            SYMBOL,
+            "cid-ioc",
+            cancel_unsettled=True,
+        )
+
+        sweep.assert_called_once_with(SYMBOL, ["cid-ioc"])
+        self.assertFalse(result["order_terminal"])
+        self.assertFalse(result["order_seen"])
+        self.assertTrue(result["absence_evidence"]["confirmed"])
+        self.assertEqual(
+            result["client_outcomes"][0]["state"],
+            "ABSENT_CONFIRMED_CYCLE",
+        )
+
+    def test_transient_query_error_never_becomes_absence_evidence(self):
+        self._patch(
+            exchange,
+            "_resolve_entry_order",
+            side_effect=[
+                (None, False, 1, ["read timeout"]),
+                (None, False, 1, self._query_absent()),
+            ],
+        )
+        self._patch(
+            exchange,
+            "_cancel_unsettled_entry_order",
+            return_value=(
+                None,
+                "APIError(code=-2011): Unknown order sent.",
+            ),
+        )
+        sweep = self._patch(exchange, "_sweep_execution_order_evidence")
+
+        result = exchange.reconcile_execution_client_orders(
+            SYMBOL,
+            "cid-ioc",
+            cancel_unsettled=True,
+        )
+
+        sweep.assert_not_called()
+        self.assertFalse(result["absence_evidence"]["confirmed"])
+        self.assertEqual(
+            result["client_outcomes"][0]["state"],
+            "OPEN_OR_UNKNOWN",
+        )
+
+    def test_history_match_resolves_provisional_absence_normally(self):
+        self._patch(
+            exchange,
+            "_resolve_entry_order",
+            side_effect=[
+                (None, False, 1, self._query_absent()),
+                (None, False, 1, self._query_absent()),
+            ],
+        )
+        self._patch(
+            exchange,
+            "_cancel_unsettled_entry_order",
+            return_value=(
+                None,
+                "APIError(code=-2013): Order does not exist.",
+            ),
+        )
+        self._patch(
+            exchange,
+            "_sweep_execution_order_evidence",
+            return_value={
+                "open_orders_available": True,
+                "all_orders_available": True,
+                "open_order_matches": [],
+                "history_order_matches": [{
+                    "clientOrderId": "cid-ioc",
+                    "orderId": 123,
+                    "status": "FILLED",
+                    "executedQty": "1",
+                    "avgPrice": "100",
+                }],
+                "errors": [],
+            },
+        )
+
+        result = exchange.reconcile_execution_client_orders(
+            SYMBOL,
+            "cid-ioc",
+            cancel_unsettled=True,
+        )
+
+        self.assertTrue(result["order_terminal"])
+        self.assertTrue(result["order_seen"])
+        self.assertEqual(result["executed_quantity"], 1)
+        self.assertFalse(result["absence_evidence"]["confirmed"])
+        self.assertTrue(
+            result["client_outcomes"][0]["resolved_by_sweep"]
+        )
+
+    def test_evidence_sweep_filters_unrelated_client_ids(self):
+        private_call = self._patch(
+            exchange,
+            "_private_rest_call",
+            side_effect=[
+                [
+                    {"clientOrderId": "unrelated-open", "status": "NEW"},
+                    {"clientOrderId": "cid-ioc", "status": "NEW"},
+                ],
+                [
+                    {"clientOrderId": "unrelated-history", "status": "FILLED"},
+                    {"clientOrderId": "cid-market", "status": "EXPIRED"},
+                ],
+            ],
+        )
+
+        evidence = exchange._sweep_execution_order_evidence(
+            SYMBOL,
+            ["cid-ioc", "cid-market"],
+        )
+
+        self.assertEqual(private_call.call_count, 2)
+        self.assertEqual(
+            [
+                item["clientOrderId"]
+                for item in evidence["open_order_matches"]
+            ],
+            ["cid-ioc"],
+        )
+        self.assertEqual(
+            [
+                item["clientOrderId"]
+                for item in evidence["history_order_matches"]
+            ],
+            ["cid-market"],
+        )
+
+
 class SmartIocReconciliationTests(OfflineExecutionCase):
     def test_full_ioc_fill_never_uses_market_fallback(self):
         submit, fallback = self._smart_harness(

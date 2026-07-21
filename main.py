@@ -1,3 +1,4 @@
+import re
 import signal
 import threading
 import time
@@ -99,6 +100,7 @@ from trade_state import (
     TradeStateLoadError,
     apply_multi_tp_protection_state,
     clear_dca_reservation,
+    clear_confirmed_absent_entry_execution,
     create_position_state,
     get_position_state,
     get_pending_execution,
@@ -727,6 +729,20 @@ def validate_position_management_config():
     fixed_risk_enabled = bool(
         getattr(config, "DCA_FIXED_RISK_ENABLED", False)
     )
+
+    if float(
+        getattr(config, "PENDING_EXECUTION_ABSENCE_GRACE_SECONDS", 60)
+    ) < 60:
+        errors.append(
+            "PENDING_EXECUTION_ABSENCE_GRACE_SECONDS must be at least 60"
+        )
+
+    if int(
+        getattr(config, "PENDING_EXECUTION_ABSENCE_CONFIRMATIONS", 3)
+    ) < 3:
+        errors.append(
+            "PENDING_EXECUTION_ABSENCE_CONFIRMATIONS must be at least 3"
+        )
 
     if risk_sizing_enabled:
         if not getattr(config, "TREND_SL_ENABLED", False):
@@ -1642,6 +1658,16 @@ def persist_pending_execution(
     pre_average_price=None,
 ):
     reconciliation = get_execution_reconciliation(order)
+    initial_executed_quantity = max(
+        float(reconciliation.get("executed_quantity", 0) or 0),
+        0,
+    )
+    initial_order_seen = bool(
+        reconciliation.get("order_seen") or
+        reconciliation.get("orders") or
+        reconciliation.get("order_ids") or
+        initial_executed_quantity > 0
+    )
     pending = {
         "symbol": symbol,
         "side": str(side or "").upper(),
@@ -1660,6 +1686,9 @@ def persist_pending_execution(
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "last_reconciled_at": None,
         "emergency_protection_secured": False,
+        "order_seen": initial_order_seen,
+        "max_executed_quantity": initial_executed_quantity,
+        "absence_evidence_streak": 0,
         "reconciliation": reconciliation,
     }
 
@@ -1891,6 +1920,153 @@ def _preflight_pending_execution_symbol(
     return "CLEARED"
 
 
+_PENDING_CLIENT_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+
+def _pending_client_order_ids(value):
+    if isinstance(value, str):
+        values = value.split(",")
+    else:
+        values = value or []
+
+    return tuple(
+        str(item or "").strip()
+        for item in values
+        if str(item or "").strip()
+    )
+
+
+def _valid_pending_client_order_ids(client_order_ids):
+    return bool(
+        client_order_ids and
+        len(client_order_ids) == len(set(client_order_ids)) and
+        all(
+            len(client_order_id) <= 36 and
+            _PENDING_CLIENT_ORDER_ID_RE.fullmatch(client_order_id)
+            for client_order_id in client_order_ids
+        )
+    )
+
+
+def _pending_execution_age_seconds(pending):
+    try:
+        created_at = datetime.fromisoformat(str(pending.get("created_at") or ""))
+        now = (
+            datetime.now(created_at.tzinfo)
+            if created_at.tzinfo is not None
+            else datetime.now()
+        )
+        return max((now - created_at).total_seconds(), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _update_pending_absence_evidence(
+    symbol,
+    pending,
+    result,
+    snapshot_available,
+    detail,
+    global_position_details,
+):
+    original_reconciliation = pending.get("reconciliation") or {}
+    cycle_executed_quantity = max(
+        float(result.get("executed_quantity", 0) or 0),
+        0,
+    )
+    original_executed_quantity = max(
+        float(original_reconciliation.get("executed_quantity", 0) or 0),
+        0,
+    )
+    pending["max_executed_quantity"] = max(
+        float(pending.get("max_executed_quantity", 0) or 0),
+        cycle_executed_quantity,
+        original_executed_quantity,
+    )
+    pending["order_seen"] = bool(
+        pending.get("order_seen") or
+        result.get("order_seen") or
+        result.get("orders") or
+        result.get("order_ids") or
+        original_reconciliation.get("order_seen") or
+        original_reconciliation.get("orders") or
+        original_reconciliation.get("order_ids") or
+        pending["max_executed_quantity"] > 0
+    )
+
+    absence_evidence = result.get("absence_evidence") or {}
+    pending["last_absence_evidence"] = absence_evidence
+    client_order_ids = _pending_client_order_ids(
+        pending.get("client_order_ids")
+    )
+    evidence_client_order_ids = _pending_client_order_ids(
+        absence_evidence.get("required_client_order_ids")
+    )
+    normalized_symbol = str(symbol or "").strip().upper()
+    pending_symbol_matches = bool(
+        normalized_symbol and
+        str(pending.get("symbol") or "").strip().upper() == normalized_symbol
+    )
+    global_snapshot_available = isinstance(global_position_details, dict)
+    global_live_symbols = {
+        str(symbol or "").upper()
+        for symbol in (global_position_details or {})
+    } if global_snapshot_available else set()
+    grace_seconds = max(
+        float(
+            getattr(
+                config,
+                "PENDING_EXECUTION_ABSENCE_GRACE_SECONDS",
+                60,
+            )
+        ),
+        60,
+    )
+    age_seconds = _pending_execution_age_seconds(pending)
+    pending["absence_age_seconds"] = (
+        round(age_seconds, 3) if age_seconds is not None else None
+    )
+    eligible = bool(
+        str(pending.get("context") or "").upper() == "ENTRY" and
+        pending_symbol_matches and
+        abs(float(pending.get("pre_position_amount", 0) or 0)) <= 1e-12 and
+        _valid_pending_client_order_ids(client_order_ids) and
+        evidence_client_order_ids == client_order_ids and
+        absence_evidence.get("confirmed") is True and
+        absence_evidence.get("open_orders_available") is True and
+        absence_evidence.get("all_orders_available") is True and
+        not absence_evidence.get("open_order_matches") and
+        not absence_evidence.get("history_order_matches") and
+        not pending.get("order_seen") and
+        float(pending.get("max_executed_quantity", 0) or 0) <= 0 and
+        not pending.get("order_ids") and
+        snapshot_available is True and
+        detail is None and
+        global_snapshot_available and
+        normalized_symbol not in global_live_symbols and
+        age_seconds is not None and
+        age_seconds >= grace_seconds
+    )
+
+    if eligible:
+        pending["absence_evidence_streak"] = int(
+            pending.get("absence_evidence_streak", 0) or 0
+        ) + 1
+        pending.setdefault(
+            "absence_first_confirmed_at",
+            datetime.now().isoformat(timespec="seconds"),
+        )
+        pending["absence_last_confirmed_at"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+    else:
+        pending["absence_evidence_streak"] = 0
+        pending.pop("absence_first_confirmed_at", None)
+        pending.pop("absence_last_confirmed_at", None)
+
+    return eligible, client_order_ids
+
+
 def reconcile_pending_executions(state, position_details=None):
     if position_details is None:
         position_details = get_open_position_details(force=True)
@@ -1922,6 +2098,57 @@ def reconcile_pending_executions(state, position_details=None):
             symbol,
             pending,
         )
+        absence_eligible, pending_client_ids = _update_pending_absence_evidence(
+            symbol,
+            pending,
+            result,
+            snapshot_available,
+            detail,
+            position_details,
+        )
+
+        required_absence_confirmations = max(
+            int(
+                getattr(
+                    config,
+                    "PENDING_EXECUTION_ABSENCE_CONFIRMATIONS",
+                    3,
+                )
+            ),
+            3,
+        )
+
+        if (
+            absence_eligible and
+            int(pending.get("absence_evidence_streak", 0) or 0) >=
+            required_absence_confirmations
+        ):
+            if not upsert_pending_execution(state, symbol, pending):
+                entry_quarantined_symbols.add(symbol)
+                log_error(
+                    f"{symbol} confirmed-absence evidence could not be "
+                    "persisted; pending execution remains blocked"
+                )
+                continue
+
+            if clear_confirmed_absent_entry_execution(
+                state,
+                symbol,
+                pending_client_ids,
+            ):
+                entry_quarantined_symbols.discard(symbol)
+                log_warning(
+                    f"{symbol} pending ENTRY resolved as confirmed zero fill | "
+                    f"CLIENT_IDS={','.join(pending_client_ids)} | "
+                    f"CONFIRMATIONS={required_absence_confirmations}"
+                )
+            else:
+                entry_quarantined_symbols.add(symbol)
+                log_error(
+                    f"{symbol} confirmed zero-fill cleanup was not persisted; "
+                    "pending execution remains blocked"
+                )
+            continue
 
         if not snapshot_available:
             if not upsert_pending_execution(state, symbol, pending):
@@ -2003,8 +2230,20 @@ def reconcile_pending_executions(state, position_details=None):
                         context=f"{pending.get('context')}_UNSETTLED_UNPROTECTED",
                     )
                     if closed:
-                        if remove_pending_execution(state, symbol) is False:
+                        pending["unsettled_exposure_closed"] = True
+                        pending["unsettled_exposure_closed_at"] = (
+                            datetime.now().isoformat(timespec="seconds")
+                        )
+                        pending["emergency_protection_error"] = (
+                            "EXPOSURE_CLOSED_ORIGIN_ORDER_STILL_UNSETTLED"
+                        )
+                        entry_quarantined_symbols.add(symbol)
+                        if not upsert_pending_execution(state, symbol, pending):
                             shutdown_event.set()
+                            log_error(
+                                f"{symbol} CRITICAL: unsettled origin ownership "
+                                "could not be retained after fail-safe close"
+                            )
                     elif not upsert_pending_execution(state, symbol, pending):
                         log_error(
                             f"{symbol} CRITICAL: unprotected unsettled "

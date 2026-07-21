@@ -2516,6 +2516,148 @@ _TERMINAL_EXECUTION_ORDER_STATUSES = {
     "REJECTED",
 }
 
+_EXECUTION_ERROR_CODE_RE = re.compile(r"code\s*=\s*(-?\d+)", re.IGNORECASE)
+_QUERY_ORDER_ABSENT_CODES = {-2013}
+_CANCEL_ORDER_ABSENT_CODES = {-2011, -2013}
+
+
+def _execution_error_code(error):
+    code = getattr(error, "code", None)
+
+    try:
+        if code is not None:
+            return int(code)
+    except (TypeError, ValueError):
+        pass
+
+    match = _EXECUTION_ERROR_CODE_RE.search(str(error or ""))
+
+    if not match:
+        return None
+
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _all_execution_errors_match(errors, accepted_codes):
+    errors = list(errors or [])
+    return bool(errors) and all(
+        _execution_error_code(error) in accepted_codes
+        for error in errors
+    )
+
+
+def _execution_order_client_id(order):
+    if not isinstance(order, dict):
+        return ""
+
+    return str(
+        order.get("clientOrderId") or
+        order.get("origClientOrderId") or
+        ""
+    ).strip()
+
+
+def _dedupe_execution_orders(orders):
+    deduped = []
+    identities = set()
+
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+
+        order_id = str(order.get("orderId") or "").strip()
+        client_order_id = _execution_order_client_id(order)
+        identity = (
+            f"ORDER:{order_id}"
+            if order_id
+            else f"CLIENT:{client_order_id}"
+            if client_order_id
+            else f"OBJECT:{len(deduped)}"
+        )
+
+        if identity in identities:
+            continue
+
+        identities.add(identity)
+        deduped.append(order)
+
+    return deduped
+
+
+def _sweep_execution_order_evidence(symbol, client_order_ids):
+    requested_ids = {
+        str(client_order_id or "").strip()
+        for client_order_id in (client_order_ids or [])
+        if str(client_order_id or "").strip()
+    }
+    evidence = {
+        "open_orders_available": False,
+        "all_orders_available": False,
+        "open_order_matches": [],
+        "history_order_matches": [],
+        "errors": [],
+    }
+
+    try:
+        open_orders = _private_rest_call(
+            f"futures_get_open_orders:{symbol}",
+            client.futures_get_open_orders,
+            symbol=symbol,
+        )
+
+        if not isinstance(open_orders, list):
+            raise ValueError("open-order sweep returned a non-list response")
+
+        evidence["open_orders_available"] = True
+        evidence["open_order_matches"] = [
+            dict(order)
+            for order in open_orders
+            if isinstance(order, dict) and
+            _execution_order_client_id(order) in requested_ids
+        ]
+    except Exception as exc:
+        evidence["errors"].append(f"OPEN_ORDERS:{exc}")
+
+    history_limit = min(
+        max(
+            int(
+                getattr(
+                    config,
+                    "PENDING_EXECUTION_ORDER_HISTORY_LIMIT",
+                    100,
+                )
+            ),
+            1,
+        ),
+        1000,
+    )
+
+    try:
+        history_orders = _private_rest_call(
+            f"futures_get_all_orders:{symbol}",
+            client.futures_get_all_orders,
+            symbol=symbol,
+            limit=history_limit,
+        )
+
+        if not isinstance(history_orders, list):
+            raise ValueError("order-history sweep returned a non-list response")
+
+        evidence["all_orders_available"] = True
+        evidence["history_order_matches"] = [
+            dict(order)
+            for order in history_orders
+            if isinstance(order, dict) and
+            _execution_order_client_id(order) in requested_ids
+        ]
+    except Exception as exc:
+        evidence["errors"].append(f"ALL_ORDERS:{exc}")
+
+    return evidence
+
 
 def _new_execution_client_order_id(label="m"):
     timestamp = int(time.time() * 1000)
@@ -2605,16 +2747,20 @@ def reconcile_execution_client_orders(
 
     orders = []
     errors = []
-    all_terminal = bool(client_order_ids)
+    client_outcomes = []
+    provisional_absent_ids = []
     verification_attempts = 0
 
     for client_order_id in client_order_ids:
-        order, terminal, attempts, status_errors = _resolve_entry_order(
+        order, terminal, attempts, initial_query_errors = _resolve_entry_order(
             symbol,
             client_order_id,
         )
         verification_attempts += attempts
-        errors.extend(status_errors)
+        errors.extend(initial_query_errors)
+        cancel_error = ""
+        post_cancel_errors = []
+        cancel_order = None
 
         if not terminal and cancel_unsettled:
             cancel_order, cancel_error = _cancel_unsettled_entry_order(
@@ -2625,30 +2771,140 @@ def reconcile_execution_client_orders(
             if cancel_error:
                 errors.append(cancel_error)
 
-            order, terminal, attempts, status_errors = _resolve_entry_order(
+            order, terminal, attempts, post_cancel_errors = _resolve_entry_order(
                 symbol,
                 client_order_id,
                 initial_order=cancel_order or order,
             )
             verification_attempts += attempts
-            errors.extend(status_errors)
+            errors.extend(post_cancel_errors)
 
         if order:
             orders.append(order)
 
-        if not terminal:
-            all_terminal = False
+        order_seen = bool(order or cancel_order)
+        deterministic_absence = bool(
+            not terminal and
+            not order_seen and
+            _all_execution_errors_match(
+                initial_query_errors,
+                _QUERY_ORDER_ABSENT_CODES,
+            ) and
+            _execution_error_code(cancel_error) in _CANCEL_ORDER_ABSENT_CODES and
+            _all_execution_errors_match(
+                post_cancel_errors,
+                _QUERY_ORDER_ABSENT_CODES,
+            )
+        )
+        state = (
+            "TERMINAL"
+            if terminal
+            else "ABSENT_PROVISIONAL"
+            if deterministic_absence
+            else "OPEN_OR_UNKNOWN"
+        )
+
+        if deterministic_absence:
+            provisional_absent_ids.append(client_order_id)
+
+        client_outcomes.append({
+            "client_order_id": client_order_id,
+            "state": state,
+            "terminal": bool(terminal),
+            "order_seen": order_seen,
+            "status": str((order or {}).get("status") or "").upper(),
+            "query_errors": [str(error) for error in initial_query_errors],
+            "cancel_error": str(cancel_error or ""),
+            "post_cancel_query_errors": [
+                str(error) for error in post_cancel_errors
+            ],
+        })
+
+    sweep_evidence = {
+        "open_orders_available": False,
+        "all_orders_available": False,
+        "open_order_matches": [],
+        "history_order_matches": [],
+        "errors": [],
+    }
+
+    if provisional_absent_ids:
+        sweep_evidence = _sweep_execution_order_evidence(
+            symbol,
+            provisional_absent_ids,
+        )
+        errors.extend(sweep_evidence.get("errors") or [])
+        swept_matches = _dedupe_execution_orders(
+            list(sweep_evidence.get("open_order_matches") or []) +
+            list(sweep_evidence.get("history_order_matches") or [])
+        )
+        matches_by_client_id = {
+            _execution_order_client_id(order): order
+            for order in swept_matches
+            if _execution_order_client_id(order)
+        }
+        sweep_complete = bool(
+            sweep_evidence.get("open_orders_available") and
+            sweep_evidence.get("all_orders_available")
+        )
+
+        for outcome in client_outcomes:
+            if outcome.get("state") != "ABSENT_PROVISIONAL":
+                continue
+
+            client_order_id = outcome.get("client_order_id") or ""
+            matched_order = matches_by_client_id.get(client_order_id)
+
+            if matched_order:
+                orders.append(matched_order)
+                terminal = _execution_order_is_terminal(matched_order)
+                outcome.update({
+                    "state": "TERMINAL" if terminal else "OPEN_OR_UNKNOWN",
+                    "terminal": terminal,
+                    "order_seen": True,
+                    "status": str(matched_order.get("status") or "").upper(),
+                    "resolved_by_sweep": True,
+                })
+            elif sweep_complete:
+                outcome["state"] = "ABSENT_CONFIRMED_CYCLE"
+                outcome["absence_confirmed"] = True
+            else:
+                outcome["state"] = "UNKNOWN"
+
+    orders = _dedupe_execution_orders(orders)
+    all_terminal = bool(client_order_ids) and all(
+        outcome.get("state") == "TERMINAL"
+        for outcome in client_outcomes
+    )
+    absence_confirmed = bool(client_order_ids) and all(
+        outcome.get("state") == "ABSENT_CONFIRMED_CYCLE"
+        for outcome in client_outcomes
+    )
+    confirmed_absent_ids = [
+        outcome.get("client_order_id")
+        for outcome in client_outcomes
+        if outcome.get("state") == "ABSENT_CONFIRMED_CYCLE"
+    ]
 
     aggregate = aggregate_order_execution(orders)
     return {
         "order_terminal": all_terminal,
         "orders": orders,
         "executed_quantity": aggregate["executed_quantity"],
+        "max_executed_quantity": aggregate["executed_quantity"],
         "average_fill_price": aggregate["average_fill_price"],
         "order_ids": aggregate["order_ids"],
         "client_order_ids": ",".join(client_order_ids),
         "verification_attempts": verification_attempts,
         "error": " | ".join(errors),
+        "order_seen": bool(orders),
+        "client_outcomes": client_outcomes,
+        "absence_evidence": {
+            "confirmed": absence_confirmed,
+            "confirmed_client_order_ids": confirmed_absent_ids,
+            "required_client_order_ids": list(client_order_ids),
+            **sweep_evidence,
+        },
     }
 
 
